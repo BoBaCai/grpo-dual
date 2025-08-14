@@ -1,0 +1,10 @@
+# Example training config
+base_model: "meta-llama/Meta-Llama-3-8B"
+adapter: "lora"                  # lora or qlora
+rank: 16
+learning_rate: 1e-5
+train_batch_size: 2
+grad_accum_steps: 8
+num_epochs: 1
+offline_rewards_file: "judgments/example_judgments.csv"
+output_dir: "runs/example"

@@ -1,0 +1,6 @@
+# Example judge config
+judge_model: "gpt-4o-mini"   # or a local model
+template_version: "factuality_v1"
+batch_size: 4
+input_file: "judgments/example_inputs.csv"
+output_file: "judgments/example_judgments.csv"
