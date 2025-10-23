@@ -2311,7 +2311,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 halu_q = quick_eval_fast(model, tokenizer, device, judge, dataset, "hallucination",
                                         n_samples=config.PARETO_PRINT_SAMPLES, provider_hint="openai",
                                         use_sampling=False)  # 固定greedy
+            # 打印奖励分数和关键指标
             print(f"\n[QuickEval@{step+1}] mode=greedy fairness={fair_q:.3f}  hallucination={halu_q:.3f}")
+            print(f"  截断率: F={trunc_f:.1%}  H={trunc_h:.1%}  |  生成长度: F={gen_len_f:.1f}  H={gen_len_h:.1f}")
+            print(f"  KL散度: F={kl_f_val:.3f}  H={kl_h_val:.3f}  |  β值: F={beta_f:.4f}  H={beta_h:.4f}")
 
         # 正式 Pareto 存盘（低频），也使用greedy
         if (step + 1) % config.PARETO_EVAL_FREQ == 0:
