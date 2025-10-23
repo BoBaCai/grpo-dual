@@ -1594,22 +1594,32 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
         response_tokens = out[i, src_lens[i]:]
         decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
         texts.append(decoded)
-        actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
-        # 【安全检查】确保长度不超过max_new_tokens
+
+        # §3修复: 正确计算长度和检测截断
+        # 找到第一个EOS/EOT的位置（如果有的话）
+        eos_position = None
+        for pos, token_id in enumerate(response_tokens):
+            if int(token_id.item()) in eos_ids:
+                eos_position = pos
+                break
+
+        # 如果找到了EOS，实际长度就是到EOS的位置+1
+        # 否则就是整个序列的长度（去除padding）
+        if eos_position is not None:
+            actual_len = eos_position + 1
+            hit_eos = True
+        else:
+            # 没有EOS，计算非padding的token数量
+            actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
+            hit_eos = False
+
+        # 确保长度不超过max_new_tokens
         actual_len = min(actual_len, max_new_tokens)
         lengths.append(actual_len)
         prompt_lens.append(int(src_lens[i].item()))
 
-        # §3: 准确检测截断（长度达到上限且最后token不是EOS/EOT）
-        is_truncated = False
-        if actual_len >= max_new_tokens:
-            # 检查最后一个有效token
-            valid_tokens = response_tokens[response_tokens != tokenizer.pad_token_id]
-            if len(valid_tokens) > 0:
-                last_token = int(valid_tokens[-1].item())
-                # 如果最后token不在EOS列表中，说明被截断了
-                if last_token not in eos_ids:
-                    is_truncated = True
+        # 截断定义：达到max_new_tokens且没有命中EOS/EOT
+        is_truncated = (actual_len >= max_new_tokens) and not hit_eos
         truncated_flags.append(is_truncated)
 
     grouped_texts, grouped_lengths, grouped_truncated = [], [], []
