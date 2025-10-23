@@ -14,9 +14,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import List, Dict
 from collections import defaultdict
 
-# 添加项目路径
-sys.path.insert(0, str(Path(__file__).parent / "grpo-dual" / "scripts"))
-
 # 设置环境变量
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 os.environ.setdefault("GLOG_minloglevel", "2")
