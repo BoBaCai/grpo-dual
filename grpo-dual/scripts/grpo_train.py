@@ -174,11 +174,11 @@ class Config:
     SFT_BATCH_SIZE = 4
     SFT_MAXLEN = 1024
 
-    # GRPO（默认低耗档）
+    # GRPO（修复后的稳定配置）
     GRPO_STEPS = 500
-    GRPO_LR = 1e-5
-    GRPO_BATCH_SIZE = 2
-    K_ROLLOUTS = 2
+    GRPO_LR = 5e-6          # 从1e-5降到5e-6（降低50%，更稳定）
+    GRPO_BATCH_SIZE = 4     # 从2增到4（增大batch，减少方差）
+    K_ROLLOUTS = 4          # 从2增到4（每个样本4条候选）
     MU_UPDATES = 1
 
     # LoRA
@@ -378,43 +378,51 @@ class RewardNormalizer:
         """更新 EMA 统计量并标准化奖励"""
         if not config.REWARD_NORMALIZE:
             return rewards
-        
+
         normalized = rewards.clone()
-        
+
         for task in set(tasks):
             mask = torch.tensor([t == task for t in tasks], device=rewards.device)
             if not mask.any():
                 continue
-            
+
             task_rewards = rewards[mask]
-            
+
             # 先做winsorize去除极端值
             task_rewards_clean = self._winsorize(task_rewards)
-            
+
             batch_mean = task_rewards_clean.mean().item()
             batch_var = task_rewards_clean.var().item() if mask.sum() > 1 else 1.0
-            
+
             # 初始化或更新 EMA
             if task not in self.stats:
                 self.stats[task] = {
                     "mean": batch_mean,
-                    "var": batch_var,
+                    "var": max(batch_var, 0.01),  # 【修复】最小方差0.01，防止爆炸
                     "count": mask.sum().item()
                 }
             else:
                 old_mean = self.stats[task]["mean"]
                 old_var = self.stats[task]["var"]
-                
+
                 # EMA 更新
                 self.stats[task]["mean"] = self.decay * old_mean + (1 - self.decay) * batch_mean
-                self.stats[task]["var"] = self.decay * old_var + (1 - self.decay) * batch_var
+                self.stats[task]["var"] = max(
+                    self.decay * old_var + (1 - self.decay) * batch_var,
+                    0.01  # 【修复】最小方差0.01
+                )
                 self.stats[task]["count"] += mask.sum().item()
-            
+
             # Z-score 标准化
             ema_mean = self.stats[task]["mean"]
-            ema_std = np.sqrt(max(self.stats[task]["var"], 1e-6))
-            normalized[mask] = (task_rewards - ema_mean) / ema_std
-        
+            ema_std = np.sqrt(max(self.stats[task]["var"], 0.01))  # 【修复】最小std=0.1
+            normalized_task = (task_rewards - ema_mean) / ema_std
+
+            # 【修复】裁剪标准化后的奖励到合理范围 [-10, 10]
+            normalized_task = torch.clamp(normalized_task, -10.0, 10.0)
+
+            normalized[mask] = normalized_task
+
         return normalized
     
     def get_stats(self) -> Dict:
@@ -2007,8 +2015,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     
     # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
     kl_controller = BranchedKLController(
-        beta_f_init=0.02,  # Fairness: 低β保持可用性
-        beta_h_init=0.10,  # Hallucination: 高β保证安全性
+        beta_f_init=0.10,  # 从0.02增到0.10（5倍），更强的KL约束
+        beta_h_init=0.30,  # 从0.10增到0.30（3倍），保证安全性
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
