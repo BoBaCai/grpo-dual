@@ -490,67 +490,103 @@ class GradientConflictMonitor:
         }
 
 # =============================================================================
-# 【修改】统一KL控制器（老师Q13建议：单一路径）
+# §7: 分支化KL控制器（恢复原设计，拒绝"老师Q13建议"）
 # =============================================================================
-class UnifiedKLController:
+class BranchedKLController:
     """
-    统一的KL自适应控制器（老师建议：单一路径，用于整体策略分布）
-    不再分fairness/hallucination独立控制beta
-    而是监控整体KL，统一调整
+    分支化KL自适应控制器
+
+    §7修复说明：
+    - Fairness分支：低β (0.02)，保持可用性，目标KL∈[0.02, 0.06]
+    - Hallucination分支：高β (0.10)，保证安全性，目标KL∈[0.08, 0.15]
+
+    两个分支有不同的KL需求，必须独立控制！
     """
-    def __init__(self, initial_beta: float = 0.025, window_size: int = 20):
-        self.beta = initial_beta
-        self.kl_history = deque(maxlen=window_size)
+    def __init__(self,
+                 beta_f_init: float = 0.02,    # Fairness初始β
+                 beta_h_init: float = 0.10,    # Hallucination初始β
+                 window_size: int = 20):
+        self.beta_f = beta_f_init
+        self.beta_h = beta_h_init
         self.window_size = window_size
+
+        # 独立的KL历史
+        self.kl_f_history = deque(maxlen=window_size)
+        self.kl_h_history = deque(maxlen=window_size)
+
+        # 分支目标
+        self.target_kl_f_min = 0.02
+        self.target_kl_f_max = 0.06
+        self.target_kl_h_min = 0.08
+        self.target_kl_h_max = 0.15
+
         self.adjustment_log = []
-    
-    def update(self, kl_overall: float):
-        """记录本步的整体KL值"""
-        self.kl_history.append(kl_overall)
-    
-    def get_beta(self) -> float:
-        """获取当前统一的beta值"""
-        return self.beta
-    
+
+    def update(self, kl_f: float, kl_h: float):
+        """记录本步的分支KL值"""
+        self.kl_f_history.append(kl_f)
+        self.kl_h_history.append(kl_h)
+
+    def get_beta_f(self) -> float:
+        """获取Fairness的β"""
+        return self.beta_f
+
+    def get_beta_h(self) -> float:
+        """获取Hallucination的β"""
+        return self.beta_h
+
     def should_adjust(self) -> bool:
         """是否应该触发调整检查"""
-        return len(self.kl_history) >= self.window_size
-    
+        return len(self.kl_f_history) >= self.window_size
+
     def auto_adjust(self, step: int) -> Optional[str]:
         """
-        自动调整统一的KL beta
+        自动调整两个分支的β
         返回调整建议
         """
         if not config.KL_ADAPTIVE_CONTROL or not self.should_adjust():
             return None
-        
-        kl_median = float(np.median(list(self.kl_history)))
-        old_beta = self.beta
-        action = None
-        
-        # KL过高：增大beta（更强约束）
-        if kl_median > config.KL_TARGET_MAX:
-            self.beta = old_beta * config.KL_ADJUST_RATIO_HIGH
-            action = f"整体KL过高({kl_median:.3f}>0.5)，统一β↑15%: {old_beta:.4f}→{self.beta:.4f}"
-        
-        # KL过低：减小beta（放松约束）
-        elif kl_median < config.KL_TARGET_MIN:
-            self.beta = old_beta * config.KL_ADJUST_RATIO_LOW
-            action = f"整体KL过低({kl_median:.3f}<0.05)，统一β↓15%: {old_beta:.4f}→{self.beta:.4f}"
-        
-        if action:
+
+        kl_f_median = float(np.median(list(self.kl_f_history)))
+        kl_h_median = float(np.median(list(self.kl_h_history)))
+
+        old_beta_f = self.beta_f
+        old_beta_h = self.beta_h
+        actions = []
+
+        # Fairness分支调整
+        if kl_f_median > self.target_kl_f_max:
+            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_HIGH
+            actions.append(f"Fairness KL过高({kl_f_median:.3f}>{self.target_kl_f_max:.2f})，β_f↑15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+        elif kl_f_median < self.target_kl_f_min:
+            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_LOW
+            actions.append(f"Fairness KL过低({kl_f_median:.3f}<{self.target_kl_f_min:.2f})，β_f↓15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+
+        # Hallucination分支调整
+        if kl_h_median > self.target_kl_h_max:
+            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_HIGH
+            actions.append(f"Hallucination KL过高({kl_h_median:.3f}>{self.target_kl_h_max:.2f})，β_h↑15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+        elif kl_h_median < self.target_kl_h_min:
+            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_LOW
+            actions.append(f"Hallucination KL过低({kl_h_median:.3f}<{self.target_kl_h_min:.2f})，β_h↓15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+
+        if actions:
             log_entry = {
                 "step": step,
-                "kl_median": kl_median,
-                "old_beta": old_beta,
-                "new_beta": self.beta,
-                "action": action
+                "kl_f_median": kl_f_median,
+                "kl_h_median": kl_h_median,
+                "old_beta_f": old_beta_f,
+                "old_beta_h": old_beta_h,
+                "new_beta_f": self.beta_f,
+                "new_beta_h": self.beta_h,
+                "actions": actions
             }
             self.adjustment_log.append(log_entry)
-            print(f"\n[UnifiedKL@{step}] {action}")
-        
-        return action
-    
+            print(f"\n[BranchedKL@{step}] " + "; ".join(actions))
+            return "; ".join(actions)
+
+        return None
+
     def get_adjustment_history(self) -> List[Dict]:
         """获取调整历史"""
         return self.adjustment_log
@@ -570,9 +606,9 @@ class TrainingMetrics:
         self._init_csv()
     
     def _init_csv(self):
-        """初始化 CSV 文件头（包含统一KL和梯度冲突监控）"""
+        """初始化 CSV 文件头（§7: 分支化KL控制）"""
         headers = [
-            "step", "loss", "kl_f", "kl_h", "kl_overall", "beta_unified", "grad_cosine_sim",
+            "step", "loss", "kl_f", "kl_h", "kl_overall", "beta_f", "beta_h", "grad_cosine_sim",
             "reward_f_mean", "reward_h_mean", "reward_f_std", "reward_h_std",
             "clip_frac", "gen_len_f_mean", "gen_len_h_mean",
             "trunc_frac_f", "trunc_frac_h",  # 【新增】截断率
@@ -606,7 +642,7 @@ class TrainingMetrics:
             row = [
                 step, metrics.get("loss", 0),
                 metrics.get("kl_f", 0), metrics.get("kl_h", 0),
-                metrics.get("kl_overall", 0), metrics.get("beta_unified", 0),
+                metrics.get("kl_overall", 0), metrics.get("beta_f", 0), metrics.get("beta_h", 0),
                 metrics.get("grad_cosine_sim", 0),
                 metrics.get("reward_f_mean", 0), metrics.get("reward_h_mean", 0),
                 metrics.get("reward_f_std", 0), metrics.get("reward_h_std", 0),
@@ -950,8 +986,13 @@ class BBQAdapter:
         return ck
 
     def _build_prompt(self, it: Dict) -> str:
+        """
+        §1修复: 返回原始内容prompt，后续会在generate时统一应用聊天模板
+        不在这里拼接模板，避免重复套用
+        """
         ctx, q = it.get("context",""), it.get("question","")
         a0, a1, a2 = it.get("ans0",""), it.get("ans1",""), it.get("ans2","")
+        # 返回纯文本内容，不添加chat template
         return (f"Context: {ctx}\nQuestion: {q}\nOptions:\nA) {a0}\nB) {a1}\nC) {a2}\n\n"
                 f"Pick A, B, or C, then give a one-sentence justification that cites only the context.")
 
@@ -1505,18 +1546,28 @@ def temporary_no_checkpointing(model):
                 model.enable_input_require_grads()
 
 # 训练用：批量生成（一次生成 B×K）
-def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None) -> Tuple[List[List[str]], List[List[int]], List[int]]:
-    """批量生成，返回文本、长度和每个prompt的实际token长度"""
+def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]]]:
+    """
+    批量生成，返回文本、长度和每个prompt的实际token长度
+    §1&§2修复: 应用聊天模板 + 多终止符
+    """
     if max_new_tokens is None:
         max_new_tokens = config.MAX_NEW_TOKENS_TRAIN
-    
+
+    # §1: 对所有prompts应用聊天模板
+    system_msg = "You are a helpful, accurate, and unbiased assistant."
+    formatted_prompts = [apply_chat_template(tokenizer, p, system_msg) for p in prompts]
+
+    # §2: 获取多终止符
+    eos_ids = get_eos_token_ids(tokenizer)
+
     processors = build_safe_logits_processors()  # 【修正】移除参数
     batch_prompts = []
-    for p in prompts:
+    for p in formatted_prompts:  # 使用格式化后的prompts
         batch_prompts.extend([p]*k)
     inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True,
                        truncation=True, max_length=config.SFT_MAXLEN).to(device)
-    
+
     # 【关键】所有采样参数明确传递，不通过logits_processor
     with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
         out = model.generate(
@@ -1532,37 +1583,61 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
             logits_processor=processors,  # 只包含自定义的processor
             num_return_sequences=1,
             pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_ids,  # §2: 多终止符
             use_cache=True,
             return_dict_in_generate=False,
         )
-    # 拆回每个 prompt 的 k 条
+    # §3: 拆回每个 prompt 的 k 条，并准确检测截断
     src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)
-    texts, lengths, prompt_lens = [], [], []
+    texts, lengths, prompt_lens, truncated_flags = [], [], [], []
     for i in range(out.shape[0]):
-        decoded = tokenizer.decode(out[i, src_lens[i]:], skip_special_tokens=True)
+        response_tokens = out[i, src_lens[i]:]
+        decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
         texts.append(decoded)
-        actual_len = int((out[i, src_lens[i]:] != tokenizer.pad_token_id).sum())
-        # 【安全检查】确保长度不超过max_new_tokens（理论上不应该超过，但以防万一）
+        actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
+        # 【安全检查】确保长度不超过max_new_tokens
         actual_len = min(actual_len, max_new_tokens)
         lengths.append(actual_len)
         prompt_lens.append(int(src_lens[i].item()))
-    
-    grouped_texts, grouped_lengths = [], []
+
+        # §3: 准确检测截断（长度达到上限且最后token不是EOS/EOT）
+        is_truncated = False
+        if actual_len >= max_new_tokens:
+            # 检查最后一个有效token
+            valid_tokens = response_tokens[response_tokens != tokenizer.pad_token_id]
+            if len(valid_tokens) > 0:
+                last_token = int(valid_tokens[-1].item())
+                # 如果最后token不在EOS列表中，说明被截断了
+                if last_token not in eos_ids:
+                    is_truncated = True
+        truncated_flags.append(is_truncated)
+
+    grouped_texts, grouped_lengths, grouped_truncated = [], [], []
     for i in range(0, len(texts), k):
         grouped_texts.append(texts[i:i+k])
         grouped_lengths.append(lengths[i:i+k])
-    
-    # 返回每个原始prompt的长度（去重，因为同一个prompt重复k次）
+        grouped_truncated.append(truncated_flags[i:i+k])
+
+    # 返回每个原始prompt的长度（去重）
     unique_prompt_lens = [prompt_lens[i] for i in range(0, len(prompt_lens), k)]
-    
-    return grouped_texts, grouped_lengths, unique_prompt_lens
+
+    return grouped_texts, grouped_lengths, unique_prompt_lens, grouped_truncated
 
 # 评估用：支持贪心和采样两种模式
 def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: bool = False) -> str:
-    """统一的生成函数，支持贪心和采样"""
-    inputs = tokenizer([prompt], return_tensors="pt", padding=True, truncation=True, max_length=config.SFT_MAXLEN).to(device)
-    
+    """
+    统一的生成函数，支持贪心和采样
+    §1&§2修复: 应用聊天模板 + 多终止符
+    """
+    # §1: 应用聊天模板
+    system_msg = "You are a helpful, accurate, and unbiased assistant."
+    formatted_prompt = apply_chat_template(tokenizer, prompt, system_msg)
+
+    # §2: 获取多终止符
+    eos_ids = get_eos_token_ids(tokenizer)
+
+    inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True, truncation=True, max_length=config.SFT_MAXLEN).to(device)
+
     with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
         if use_sampling:
             # 采样模式：使用与训练相同的配置
@@ -1579,7 +1654,7 @@ def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: b
                 # 【移除】length_penalty（只对beam search有效）
                 logits_processor=processors,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=eos_ids,  # §2: 多终止符
                 use_cache=True,
             )
         else:
@@ -1589,16 +1664,73 @@ def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: b
                 max_new_tokens=config.MAX_NEW_TOKENS_EVAL,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=eos_ids,  # §2: 多终止符
                 use_cache=True,
             )
-    
+
     src_len = inputs["input_ids"].shape[1]
     return tokenizer.decode(out[0, src_len:], skip_special_tokens=True)
 
 # 向后兼容的贪心版本
 def generate_one_greedy(model, tokenizer, device, prompt: str) -> str:
     return generate_one_response(model, tokenizer, device, prompt, use_sampling=False)
+
+# =============================================================================
+# §1 & §2: 聊天模板与多终止符支持（P0 - 修复截断率100%）
+# =============================================================================
+def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> str:
+    """
+    §1: 为LLaMA-3-Instruct应用正确的聊天模板
+    避免手拼字符串导致模型不知道何时停止
+    """
+    messages = []
+    if system_message:
+        messages.append({"role": "system", "content": system_message})
+    messages.append({"role": "user", "content": prompt})
+
+    # 使用tokenizer的聊天模板
+    try:
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        return formatted
+    except Exception as e:
+        # 兜底：如果tokenizer不支持chat_template，返回原始prompt
+        print(f"⚠️ 聊天模板应用失败: {e}，使用原始prompt")
+        return prompt
+
+def get_eos_token_ids(tokenizer) -> List[int]:
+    """
+    §2: 获取所有终止符ID（包括EOS和EOT）
+    LLaMA-3-Instruct需要 [128001(EOS), 128009(EOT)]
+    """
+    eos_ids = []
+
+    # 1. 标准EOS token
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(tokenizer.eos_token_id)
+
+    # 2. EOT token（LLaMA-3特有）
+    if hasattr(tokenizer, 'eot_token_id') and tokenizer.eot_token_id is not None:
+        eos_ids.append(tokenizer.eot_token_id)
+    elif '<|eot_id|>' in tokenizer.get_vocab():
+        eot_id = tokenizer.convert_tokens_to_ids('<|eot_id|>')
+        eos_ids.append(eot_id)
+
+    # 3. 去重
+    eos_ids = list(set(eos_ids))
+
+    if len(eos_ids) > 1:
+        print(f"✅ 多终止符已启用: {eos_ids}")
+    elif len(eos_ids) == 1:
+        print(f"⚠️ 仅检测到单个终止符: {eos_ids}")
+    else:
+        print(f"❌ 未检测到任何终止符，使用默认值2")
+        eos_ids = [2]  # 兜底
+
+    return eos_ids
 
 # =============================================================================
 # 模型加载（dtorch：用 dtype，不用 torch_dtype）
@@ -1846,9 +1978,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     reward_normalizer = RewardNormalizer(decay=config.REWARD_EMA_DECAY, 
                                         winsorize_quantile=config.REWARD_WINSORIZE_QUANTILE)
     
-    # 【修改】初始化统一KL控制器（老师建议：单一路径）
-    kl_controller = UnifiedKLController(
-        initial_beta=config.KL_BETA_INIT,
+    # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
+    kl_controller = BranchedKLController(
+        beta_f_init=0.02,  # Fairness: 低β保持可用性
+        beta_h_init=0.10,  # Hallucination: 高β保证安全性
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
@@ -1876,16 +2009,17 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # ——生成（批量）——
         t_gen0 = _t.time()
-        cand_by_sample, lengths_by_sample, _ = generate_candidates_batch(
+        cand_by_sample, lengths_by_sample, _, truncated_by_sample = generate_candidates_batch(
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
             max_new_tokens=current_max_new_tokens_train  # 【修正】传入动态调整的max_new_tokens
         )
         # flatten
-        all_prompts, all_resps, all_lengths, idx_map = [], [], [], []
+        all_prompts, all_resps, all_lengths, all_truncated, idx_map = [], [], [], [], []
         for i, s in enumerate(batch):
             all_prompts += [s.prompt]*config.K_ROLLOUTS
             all_resps   += cand_by_sample[i]
             all_lengths += lengths_by_sample[i]  # 这个是response的实际token长度
+            all_truncated += truncated_by_sample[i]  # §3: 截断标记
             idx_map     += [i]*config.K_ROLLOUTS
         t_gen = _t.time() - t_gen0
 
@@ -1987,18 +2121,19 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             delta = (ref_lp - cur_lp).clamp(-10, 10)
             kl = torch.exp(delta) - delta - 1.0
 
-            # 【修改】使用统一KL控制器的beta值
-            beta_unified = kl_controller.get_beta()
+            # §7: 使用分支化β值（不同的KL约束）
+            beta_f = kl_controller.get_beta_f()  # Fairness: 低β
+            beta_h = kl_controller.get_beta_h()  # Hallucination: 高β
 
             _anchor_zero = sum((p.sum() * 0.0) for p in trainable)
 
             if task_mask_f.any():
-                loss_fair = -(surr[task_mask_f].mean()) + beta_unified * kl[task_mask_f].mean()
+                loss_fair = -(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean()
             else:
                 loss_fair = _anchor_zero
 
             if task_mask_h.any():
-                loss_halu = -(surr[task_mask_h].mean()) + beta_unified * kl[task_mask_h].mean()
+                loss_halu = -(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean()
             else:
                 loss_halu = _anchor_zero
 
@@ -2067,11 +2202,12 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             lengths_h = [gen_lengths[i] for i in range(len(gen_lengths)) if task_mask_h[i]]
             gen_len_f = np.mean(lengths_f) if lengths_f else 0
             gen_len_h = np.mean(lengths_h) if lengths_h else 0
-            
-            # 【新增】截断率统计
-            # 截断定义：达到max_new_tokens且未遇到EOS（comp_mask最后位置仍为1）
-            trunc_f = sum(1 for l in lengths_f if l >= current_max_new_tokens_train) / max(1, len(lengths_f))
-            trunc_h = sum(1 for l in lengths_h if l >= current_max_new_tokens_train) / max(1, len(lengths_h))
+
+            # §3: 准确的截断率统计（基于EOS/EOT检测）
+            truncated_f = [all_truncated[i] for i in range(len(all_truncated)) if task_mask_f[i]]
+            truncated_h = [all_truncated[i] for i in range(len(all_truncated)) if task_mask_h[i]]
+            trunc_f = sum(truncated_f) / max(1, len(truncated_f))
+            trunc_h = sum(truncated_h) / max(1, len(truncated_h))
             
             # 零长度比例
             zero_len_f = sum(1 for l in lengths_f if l == 0) / max(1, len(lengths_f))
@@ -2081,10 +2217,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             adv_abs_mean = adv.abs().mean().item()
             delta_mean = delta.mean().item()
         
-        # 【新增】更新统一KL控制器
-        kl_controller.update(kl_overall)
-        
-        # 【新增】KL自适应调整（每N步触发一次）
+        # §7: 更新分支化KL控制器
+        kl_controller.update(kl_f_val, kl_h_val)
+
+        # §7: KL自适应调整（每N步触发一次）
         if (step + 1) % config.KL_ADAPTIVE_WINDOW == 0:
             kl_controller.auto_adjust(step + 1)
         
@@ -2101,7 +2237,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             "kl_f": kl_f_val,
             "kl_h": kl_h_val,
             "kl_overall": kl_overall,
-            "beta_unified": beta_unified,  # 统一beta
+            "beta_f": beta_f,  # §7: Fairness分支β
+            "beta_h": beta_h,  # §7: Hallucination分支β
             "grad_cosine_sim": grad_cosine_sim,  # 梯度余弦相似度
             "reward_f_mean": reward_f_mean,
             "reward_h_mean": reward_h_mean,
@@ -2131,7 +2268,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         progress.set_postfix({
             "loss": f"{loss_total.item():.4f}",
             "kl": f"{kl_overall:.3f}",
-            "β": f"{beta_unified:.3f}",
+            "β_f": f"{beta_f:.3f}",  # §7: 显示两个β值
+            "β_h": f"{beta_h:.3f}",
             "cos": f"{grad_cosine_sim:.2f}",
             "t": f"{t_step:.1f}s"
         })
