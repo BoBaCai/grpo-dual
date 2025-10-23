@@ -1717,28 +1717,45 @@ def get_eos_token_ids(tokenizer) -> List[int]:
     LLaMA-3-Instruct需要 [128001(EOS), 128009(EOT)]
     """
     eos_ids = []
+    vocab = tokenizer.get_vocab()
 
-    # 1. 标准EOS token
-    if tokenizer.eos_token_id is not None:
+    # 1. 查找 <|end_of_text|> (标准EOS，通常是128001)
+    if '<|end_of_text|>' in vocab:
+        end_of_text_id = tokenizer.convert_tokens_to_ids('<|end_of_text|>')
+        eos_ids.append(end_of_text_id)
+    elif tokenizer.eos_token_id is not None:
+        # 如果没有找到 <|end_of_text|>，用默认的eos_token_id
         eos_ids.append(tokenizer.eos_token_id)
 
-    # 2. EOT token（LLaMA-3特有）
-    if hasattr(tokenizer, 'eot_token_id') and tokenizer.eot_token_id is not None:
-        eos_ids.append(tokenizer.eot_token_id)
-    elif '<|eot_id|>' in tokenizer.get_vocab():
+    # 2. 查找 <|eot_id|> (EOT，LLaMA-3特有，通常是128009)
+    if '<|eot_id|>' in vocab:
         eot_id = tokenizer.convert_tokens_to_ids('<|eot_id|>')
         eos_ids.append(eot_id)
+    elif hasattr(tokenizer, 'eot_token_id') and tokenizer.eot_token_id is not None:
+        eos_ids.append(tokenizer.eot_token_id)
 
     # 3. 去重
     eos_ids = list(set(eos_ids))
 
-    if len(eos_ids) > 1:
-        print(f"✅ 多终止符已启用: {eos_ids}")
-    elif len(eos_ids) == 1:
-        print(f"⚠️ 仅检测到单个终止符: {eos_ids}")
-    else:
-        print(f"❌ 未检测到任何终止符，使用默认值2")
-        eos_ids = [2]  # 兜底
+    # 4. 打印检测结果（只打印一次）
+    if not hasattr(get_eos_token_ids, '_printed'):
+        get_eos_token_ids._printed = True
+        if len(eos_ids) > 1:
+            print(f"✅ 多终止符已启用: {eos_ids}")
+            # 打印token名称帮助调试
+            token_names = []
+            for tid in eos_ids:
+                token_str = tokenizer.decode([tid])
+                token_names.append(f"{tid}({token_str})")
+            print(f"   终止符详情: {token_names}")
+        elif len(eos_ids) == 1:
+            print(f"⚠️ 仅检测到单个终止符: {eos_ids}")
+            token_str = tokenizer.decode([eos_ids[0]])
+            print(f"   Token详情: {eos_ids[0]}({token_str})")
+            print(f"   这可能导致截断率偏高，建议检查tokenizer配置")
+        else:
+            print(f"❌ 未检测到任何终止符，使用默认值2")
+            eos_ids = [2]
 
     return eos_ids
 
