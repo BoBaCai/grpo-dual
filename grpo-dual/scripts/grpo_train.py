@@ -2174,7 +2174,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             # 【修复】KL散度计算：使用标准的log概率差值，不使用指数爆炸公式
             # 原公式 kl=exp(delta)-delta-1 会导致数值爆炸（delta=3时kl=16）
             # 标准 KL penalty: E[log(pi_ref/pi_new)] = E[log_pi_ref - log_pi_new]
-            kl = (ref_lp - cur_lp).clamp(0, 10)  # KL非负，且限制上界防止极端值
+            delta = (ref_lp - cur_lp).clamp(-10, 10)  # 保留 delta 用于指标记录
+            kl = delta.clamp(0, 10)  # KL非负，且限制上界防止极端值
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
