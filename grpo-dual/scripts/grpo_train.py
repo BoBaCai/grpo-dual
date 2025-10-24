@@ -1841,7 +1841,6 @@ def load_model_and_tokenizer():
     # 【加速优化】torch.compile() 加速（可选）
     if config.USE_TORCH_COMPILE:
         try:
-            import torch
             if hasattr(torch, 'compile'):
                 print(f"🚀 启用 torch.compile() 加速（mode={config.COMPILE_MODE}）...")
                 model = torch.compile(model, mode=config.COMPILE_MODE)
