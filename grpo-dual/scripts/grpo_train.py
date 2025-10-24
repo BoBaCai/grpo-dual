@@ -2193,14 +2193,16 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         nan_inf_hits = 0
         grad_cosine_sim = 0.0  # 记录梯度余弦相似度
 
-        # 【显存优化】仅在累积周期开始时清零梯度
+        # 【修复梯度累积】梯度累积逻辑移到 MU_UPDATES 循环外部
         accumulation_counter += 1
-        is_accumulation_start = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 1)
-        is_accumulation_end = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 0)
+        should_zero_grad = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 1)
+        should_update = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 0)
+
+        # 在累积周期开始时清零梯度
+        if should_zero_grad:
+            opt.zero_grad(set_to_none=True)
 
         for _ in range(config.MU_UPDATES):
-            if is_accumulation_start:
-                opt.zero_grad(set_to_none=True)
 
             out_cur = model(input_ids=full_tok["input_ids"],
                             attention_mask=full_tok.get("attention_mask"),
@@ -2267,14 +2269,15 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             else:
                 _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h))
 
-            # 【显存优化】仅在累积周期结束时更新参数
-            if is_accumulation_end:
-                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-                opt.step()
+        # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
+        # 在累积周期结束时更新参数
+        if should_update:
+            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+            opt.step()
 
-                # 【显存优化】参数更新后清理显存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # 【显存优化】参数更新后清理显存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         t_mu = _t.time() - t_mu0
 
         # 收集指标
