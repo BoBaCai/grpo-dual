@@ -192,6 +192,8 @@ class Config:
     # 数值/加速
     USE_BF16 = True
     USE_GRADIENT_CHECKPOINTING = True
+    USE_TORCH_COMPILE = False    # 【加速】可选：torch.compile() 加速（需要 PyTorch 2.0+）
+    COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
     # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
     MAX_NEW_TOKENS_TRAIN = 96      # 【显存优化】从128降到96，减少显存占用
@@ -240,19 +242,19 @@ class Config:
     USE_CAGRAD = True
     CAGRAD_C = 0.2
 
-    # Pareto（【修改】评测样本量提升）
+    # Pareto（【加速】减少评测样本）
     PARETO_EVAL_FREQ = 50
     N_PARETO_CHECKPOINTS = 5
     PARETO_PRINT_EVERY = 20
-    PARETO_PRINT_SAMPLES = 40        # 【修改】从4提到40
+    PARETO_PRINT_SAMPLES = 20        # 【加速】从40降到20，减半评测时间
 
     # 评审器（judge）多云与限流
-    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
-    JUDGE_MAX_WORKERS = 16      # 从4增到16，充分并发
-    JUDGE_TIMEOUT_SEC = 8       # 从10降到8，加快失败重试
-    JUDGE_MAX_RETRIES = 1
-    RATE_LIMIT_RPS   = 12       # 从4增到12，每秒可处理更多请求
-    RATE_LIMIT_BURST = 20       # 从6增到20，支持突发16个并发
+    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求
+    JUDGE_MAX_WORKERS = 8       # 匹配单步生成数 (2×4=8)
+    JUDGE_TIMEOUT_SEC = 6       # 从8降到6，更快失败重试
+    JUDGE_MAX_RETRIES = 0       # 【加速】禁用重试，失败直接降级
+    RATE_LIMIT_RPS   = 10       # 从12降到10，避免触发限流
+    RATE_LIMIT_BURST = 12       # 从20降到12，匹配单步生成数
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
@@ -1835,6 +1837,20 @@ def load_model_and_tokenizer():
     # 参考模型仅推理：不需要 checkpointing
     base_model.config.use_cache = False
     model.config.use_cache = False
+
+    # 【加速优化】torch.compile() 加速（可选）
+    if config.USE_TORCH_COMPILE:
+        try:
+            import torch
+            if hasattr(torch, 'compile'):
+                print(f"🚀 启用 torch.compile() 加速（mode={config.COMPILE_MODE}）...")
+                model = torch.compile(model, mode=config.COMPILE_MODE)
+                base_model = torch.compile(base_model, mode=config.COMPILE_MODE)
+                print("✅ torch.compile() 已启用（首次运行会编译，稍慢）")
+            else:
+                print("⚠️ PyTorch 版本过低，不支持 torch.compile()（需要 ≥2.0）")
+        except Exception as e:
+            print(f"⚠️ torch.compile() 启用失败: {e}")
 
     print("✅ 模型加载成功!")
     return model, base_model, tokenizer, device
