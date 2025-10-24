@@ -246,11 +246,12 @@ class Config:
     PARETO_PRINT_SAMPLES = 40        # 【修改】从4提到40
 
     # 评审器（judge）多云与限流
-    JUDGE_MAX_WORKERS = 4
-    JUDGE_TIMEOUT_SEC = 10
+    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
+    JUDGE_MAX_WORKERS = 16      # 从4增到16，充分并发
+    JUDGE_TIMEOUT_SEC = 8       # 从10降到8，加快失败重试
     JUDGE_MAX_RETRIES = 1
-    RATE_LIMIT_RPS   = 4
-    RATE_LIMIT_BURST = 6
+    RATE_LIMIT_RPS   = 12       # 从4增到12，每秒可处理更多请求
+    RATE_LIMIT_BURST = 20       # 从6增到20，支持突发16个并发
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
@@ -1790,8 +1791,18 @@ def load_model_and_tokenizer():
     tokenizer.padding_side = "left"
 
     dtype = torch.bfloat16 if (config.USE_BF16 and torch.cuda.is_available()) else torch.float16
-    model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra)
-    base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra)
+
+    # 【加速优化】启用 Flash Attention 2（如果可用）
+    attn_kwargs = {}
+    try:
+        import flash_attn
+        attn_kwargs["attn_implementation"] = "flash_attention_2"
+        print("✅ Flash Attention 2 可用，已启用")
+    except ImportError:
+        print("⚠️ Flash Attention 2 不可用，使用默认实现")
+
+    model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra, **attn_kwargs)
+    base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra, **attn_kwargs)
 
     if config.USE_LORA:
         lcfg = LoraConfig(task_type=TaskType.CAUSAL_LM, r=config.LORA_R, lora_alpha=config.LORA_ALPHA,
