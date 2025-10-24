@@ -242,19 +242,19 @@ class Config:
     USE_CAGRAD = True
     CAGRAD_C = 0.2
 
-    # Pareto（【加速】减少评测样本）
+    # Pareto（评测配置）
     PARETO_EVAL_FREQ = 50
     N_PARETO_CHECKPOINTS = 5
     PARETO_PRINT_EVERY = 20
-    PARETO_PRINT_SAMPLES = 20        # 【加速】从40降到20，减半评测时间
+    PARETO_PRINT_SAMPLES = 40        # 【恢复】保持40，确保评测准确
 
     # 评审器（judge）多云与限流
-    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求
-    JUDGE_MAX_WORKERS = 8       # 匹配单步生成数 (2×4=8)
-    JUDGE_TIMEOUT_SEC = 6       # 从8降到6，更快失败重试
-    JUDGE_MAX_RETRIES = 0       # 【加速】禁用重试，失败直接降级
-    RATE_LIMIT_RPS   = 10       # 从12降到10，避免触发限流
-    RATE_LIMIT_BURST = 12       # 从20降到12，匹配单步生成数
+    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求（不影响训练效果）
+    JUDGE_MAX_WORKERS = 8       # 匹配单步生成数 (2×4=8)，纯并发优化
+    JUDGE_TIMEOUT_SEC = 10      # 【恢复】保持原值，避免过多超时影响 reward
+    JUDGE_MAX_RETRIES = 1       # 【恢复】保留重试，确保 reward 质量
+    RATE_LIMIT_RPS   = 10       # 避免触发限流
+    RATE_LIMIT_BURST = 12       # 匹配单步生成数
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
