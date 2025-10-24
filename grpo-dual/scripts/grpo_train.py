@@ -171,20 +171,21 @@ class Config:
     # SFT
     SFT_STEPS = 200
     SFT_LR = 5e-5
-    SFT_BATCH_SIZE = 4
-    SFT_MAXLEN = 1024
+    SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
+    SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（修复后的稳定配置）
+    # GRPO（显存优化配置）
     GRPO_STEPS = 500
     GRPO_LR = 5e-6          # 从1e-5降到5e-6（降低50%，更稳定）
-    GRPO_BATCH_SIZE = 4     # 从2增到4（增大batch，减少方差）
-    K_ROLLOUTS = 4          # 从2增到4（每个样本4条候选）
+    GRPO_BATCH_SIZE = 2     # 【显存优化】从4降到2，减少单次生成显存
+    K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
+    GRADIENT_ACCUMULATION_STEPS = 2  # 【新增】梯度累积，等效 batch=2×2=4
 
     # LoRA
     USE_LORA = True
-    LORA_R = 16
-    LORA_ALPHA = 32
+    LORA_R = 8              # 【显存优化】从16降到8，减少参数量
+    LORA_ALPHA = 16         # 同步调整 (保持 alpha=2*r)
     LORA_DROPOUT = 0.1
     TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
 
@@ -193,8 +194,8 @@ class Config:
     USE_GRADIENT_CHECKPOINTING = True
     
     # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
-    MAX_NEW_TOKENS_TRAIN = 128     # 硬约束上限
-    MAX_NEW_TOKENS_EVAL = 128      # 评测也遵守硬约束
+    MAX_NEW_TOKENS_TRAIN = 96      # 【显存优化】从128降到96，减少显存占用
+    MAX_NEW_TOKENS_EVAL = 96       # 评测同步降低
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
     
     TEMPERATURE_TRAIN = 0.5        # 【大幅降低】从0.6→0.5，显著更保守
@@ -2015,8 +2016,22 @@ class MultiObjectiveDataset(torch.utils.data.Dataset):
 # =============================================================================
 def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     print("\n" + "="*80)
-    print("阶段2: GRPO 多目标训练（v2.2 - 反馈优化版）")
+    print("阶段2: GRPO 多目标训练（v2.3 - 显存优化版）")
     print("="*80)
+
+    # 【显存优化】打印显存配置
+    if torch.cuda.is_available():
+        print(f"\n显存优化配置:")
+        print(f"  GRPO_BATCH_SIZE: {config.GRPO_BATCH_SIZE} (单次生成)")
+        print(f"  GRADIENT_ACCUMULATION_STEPS: {config.GRADIENT_ACCUMULATION_STEPS}")
+        print(f"  有效 batch size: {config.GRPO_BATCH_SIZE * config.GRADIENT_ACCUMULATION_STEPS}")
+        print(f"  K_ROLLOUTS: {config.K_ROLLOUTS}")
+        print(f"  单步生成总数: {config.GRPO_BATCH_SIZE * config.K_ROLLOUTS}")
+        print(f"  MAX_NEW_TOKENS: {config.MAX_NEW_TOKENS_TRAIN}")
+        print(f"  LORA_R: {config.LORA_R}")
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  GPU 总显存: {gpu_mem:.1f} GB")
+        print()
     
     # 打印生成配置
     GenerationConfigManager.print_config(mode="train")
@@ -2052,6 +2067,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         tqdm = lambda x, **kw: x
     progress = tqdm(range(config.GRPO_STEPS), desc="GRPO训练")
 
+    # 【显存优化】梯度累积计数器
+    accumulation_counter = 0
+
     for step in progress:
         import time as _t
         t0 = _t.time()
@@ -2066,6 +2084,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
             max_new_tokens=current_max_new_tokens_train  # 【修正】传入动态调整的max_new_tokens
         )
+
+        # 【显存优化】生成后立即清理显存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         # flatten
         all_prompts, all_resps, all_lengths, all_truncated, idx_map = [], [], [], [], []
         for i, s in enumerate(batch):
@@ -2154,9 +2176,15 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         nan_inf_hits = 0
         grad_cosine_sim = 0.0  # 记录梯度余弦相似度
-        
+
+        # 【显存优化】仅在累积周期开始时清零梯度
+        accumulation_counter += 1
+        is_accumulation_start = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 1)
+        is_accumulation_end = (accumulation_counter % config.GRADIENT_ACCUMULATION_STEPS == 0)
+
         for _ in range(config.MU_UPDATES):
-            opt.zero_grad(set_to_none=True)
+            if is_accumulation_start:
+                opt.zero_grad(set_to_none=True)
 
             out_cur = model(input_ids=full_tok["input_ids"],
                             attention_mask=full_tok.get("attention_mask"),
@@ -2193,6 +2221,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             else:
                 loss_halu = _anchor_zero
 
+            # 【显存优化】梯度累积：loss 除以累积步数
+            loss_fair = loss_fair / config.GRADIENT_ACCUMULATION_STEPS
+            loss_halu = loss_halu / config.GRADIENT_ACCUMULATION_STEPS
+
             # 检查 NaN/Inf
             if torch.isnan(loss_fair) or torch.isinf(loss_fair) or torch.isnan(loss_halu) or torch.isinf(loss_halu):
                 nan_inf_hits += 1
@@ -2219,8 +2251,14 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             else:
                 _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h))
 
-            torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
-            opt.step()
+            # 【显存优化】仅在累积周期结束时更新参数
+            if is_accumulation_end:
+                torch.nn.utils.clip_grad_norm_(trainable, max_norm=1.0)
+                opt.step()
+
+                # 【显存优化】参数更新后清理显存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         t_mu = _t.time() - t_mu0
 
         # 收集指标
