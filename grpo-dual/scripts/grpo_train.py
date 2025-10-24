@@ -1515,19 +1515,32 @@ class FrequencyPenaltyProcessor(torch.nn.Module):
 def build_safe_logits_processors():
     """
     构建logits处理器列表
-    【修正】只添加自定义processor，让generate()处理temperature/top_k/top_p
+    【修复】必须手动添加 Temperature/TopK/TopP 处理器
+    原因：传递自定义 logits_processor 时，transformers 会禁用内置处理器
     """
+    from transformers import (
+        TemperatureLogitsWarper,
+        TopKLogitsWarper,
+        TopPLogitsWarper,
+    )
+
     lp = LogitsProcessorList()
-    
-    # 只添加自定义的processor
-    if config.PRESENCE_PENALTY != 0.0: 
+
+    # 【关键】先添加采样处理器（按transformers内部顺序）
+    if config.TEMPERATURE_TRAIN != 1.0:
+        lp.append(TemperatureLogitsWarper(config.TEMPERATURE_TRAIN))
+    if config.TOP_K_TRAIN > 0:
+        lp.append(TopKLogitsWarper(top_k=config.TOP_K_TRAIN, min_tokens_to_keep=1))
+    if config.TOP_P_TRAIN < 1.0:
+        lp.append(TopPLogitsWarper(top_p=config.TOP_P_TRAIN, min_tokens_to_keep=1))
+
+    # 然后添加自定义的penalty处理器
+    if config.PRESENCE_PENALTY != 0.0:
         lp.append(PresencePenaltyProcessor(config.PRESENCE_PENALTY))
-    if config.FREQUENCY_PENALTY != 0.0: 
+    if config.FREQUENCY_PENALTY != 0.0:
         lp.append(FrequencyPenaltyProcessor(config.FREQUENCY_PENALTY))
-    
-    # 【关键】不要添加Temperature/TopK/TopP，让generate()自动处理
-    # 否则会重复应用！
-    
+
+    # 最后添加安全处理器
     lp.append(SanityLogitsProcessor(2))
     return lp
 
@@ -1577,19 +1590,16 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True,
                        truncation=True, max_length=config.SFT_MAXLEN).to(device)
 
-    # 【关键】所有采样参数明确传递，不通过logits_processor
+    # 【修复】采样参数通过 logits_processor 传递，避免重复或被忽略
     with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
             do_sample=True,
-            temperature=config.TEMPERATURE_TRAIN,
-            top_k=config.TOP_K_TRAIN,
-            top_p=config.TOP_P_TRAIN,
+            # 【移除】temperature/top_k/top_p（已在 logits_processor 中处理）
             repetition_penalty=config.REP_PENALTY_TRAIN,
-            # 【移除】length_penalty（只对beam search有效）
-            logits_processor=processors,  # 只包含自定义的processor
+            logits_processor=processors,  # 包含 Temperature/TopK/TopP/Penalty/Sanity
             num_return_sequences=1,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=eos_ids,  # §2: 多终止符
@@ -1666,11 +1676,8 @@ def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: b
                 max_new_tokens=config.MAX_NEW_TOKENS_EVAL,
                 min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
                 do_sample=True,
-                temperature=config.TEMPERATURE_TRAIN,
-                top_k=config.TOP_K_TRAIN,
-                top_p=config.TOP_P_TRAIN,
+                # 【移除】temperature/top_k/top_p（已在 logits_processor 中处理）
                 repetition_penalty=config.REP_PENALTY_TRAIN,
-                # 【移除】length_penalty（只对beam search有效）
                 logits_processor=processors,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=eos_ids,  # §2: 多终止符
@@ -2164,8 +2171,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
 
-            delta = (ref_lp - cur_lp).clamp(-10, 10)
-            kl = torch.exp(delta) - delta - 1.0
+            # 【修复】KL散度计算：使用标准的log概率差值，不使用指数爆炸公式
+            # 原公式 kl=exp(delta)-delta-1 会导致数值爆炸（delta=3时kl=16）
+            # 标准 KL penalty: E[log(pi_ref/pi_new)] = E[log_pi_ref - log_pi_new]
+            kl = (ref_lp - cur_lp).clamp(0, 10)  # KL非负，且限制上界防止极端值
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
