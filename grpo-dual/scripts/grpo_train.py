@@ -1922,6 +1922,12 @@ def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
     return adv
 
 def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor):
+    """
+    设置/累加梯度向量到参数
+
+    【修复梯度累积】如果 p.grad 已存在，应该累加而非覆盖！
+    这样才能支持跨 micro-batch 的梯度累积
+    """
     ptr = 0
     for p in params:
         num = p.numel()
@@ -1929,7 +1935,7 @@ def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor):
         if p.grad is None:
             p.grad = g.clone()
         else:
-            p.grad.copy_(g)
+            p.grad.add_(g)  # 【修复】累加而非覆盖，支持梯度累积
         ptr += num
 
 def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2):
