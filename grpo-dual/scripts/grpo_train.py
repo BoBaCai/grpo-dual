@@ -2219,11 +2219,18 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
 
-            # 【修复】KL散度计算：使用标准的log概率差值，不使用指数爆炸公式
-            # 原公式 kl=exp(delta)-delta-1 会导致数值爆炸（delta=3时kl=16）
-            # 标准 KL penalty: E[log(pi_ref/pi_new)] = E[log_pi_ref - log_pi_new]
-            delta = (ref_lp - cur_lp).clamp(-10, 10)  # 保留 delta 用于指标记录
-            kl = delta.clamp(0, 10)  # KL非负，且限制上界防止极端值
+            # 【修复】KL散度计算：使用正确的方向！
+            # 标准 KL divergence: KL(π_cur || π_ref) = E[log π_cur - log π_ref]
+            # 正确的公式是 cur_lp - ref_lp，而不是 ref_lp - cur_lp！
+            #
+            # 为什么之前的公式是错的：
+            #   delta = ref_lp - cur_lp (错误方向)
+            #   当模型学习后，cur_lp 增加 → delta 变负 → clamp(0,10) 变成 0
+            #   → 完全没有 KL penalty → KL=0.000
+            #
+            # 正确的实现：
+            delta = (cur_lp - ref_lp).clamp(-10, 10)  # 正确的方向
+            kl = delta.abs().clamp(0, 10)  # 使用绝对值（双向 penalty），防止极端值
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
