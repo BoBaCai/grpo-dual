@@ -44,11 +44,19 @@ else
     exit 1
 fi
 
-# 检查梯度累积
+# 检查梯度累积配置
 if grep -q "GRADIENT_ACCUMULATION_STEPS = 2" grpo-dual/scripts/grpo_train.py; then
     echo "✅ 梯度累积配置已存在"
 else
     echo "❌ 梯度累积配置缺失！"
+    exit 1
+fi
+
+# 检查梯度累积修复（最关键！）
+if grep -q "p.grad.add_(g)  # 【修复】累加而非覆盖" grpo-dual/scripts/grpo_train.py; then
+    echo "✅ 梯度累积 bug 修复已存在（关键修复！）"
+else
+    echo "❌ 梯度累积 bug 修复缺失！这会导致 KL=0.000"
     exit 1
 fi
 
