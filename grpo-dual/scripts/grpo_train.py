@@ -1921,12 +1921,17 @@ def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
     adv = ((r - mean) / std).view(-1).clamp(-config.ADV_CLIP, config.ADV_CLIP)
     return adv
 
-def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor):
+def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor, accumulate: bool = True):
     """
     设置/累加梯度向量到参数
 
-    【修复梯度累积】如果 p.grad 已存在，应该累加而非覆盖！
-    这样才能支持跨 micro-batch 的梯度累积
+    【修复梯度累积】支持梯度累积和性能优化
+
+    Args:
+        params: 参数列表
+        vec: 梯度向量
+        accumulate: 如果 True，累加梯度（后续 micro-batch）
+                   如果 False，覆盖梯度（第一个 micro-batch，性能更好）
     """
     ptr = 0
     for p in params:
@@ -1934,11 +1939,18 @@ def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor):
         g = vec[ptr:ptr+num].view_as(p)
         if p.grad is None:
             p.grad = g.clone()
+        elif accumulate:
+            p.grad.add_(g)  # 累加（梯度累积）
         else:
-            p.grad.add_(g)  # 【修复】累加而非覆盖，支持梯度累积
+            p.grad.copy_(g)  # 覆盖（第一个 micro-batch，更快）
         ptr += num
 
-def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2):
+def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2, accumulate: bool=True):
+    """CAGrad 梯度合成算法
+
+    Args:
+        accumulate: 传递给 _set_grads_from_vec，控制累加还是覆盖
+    """
     eps = 1e-12
     g0 = 0.5 * (g_fair_vec + g_halu_vec)
     phi = (c**2) * (g0.norm().pow(2) + eps)
@@ -1949,14 +1961,14 @@ def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: t
     for _ in range(20):
         w1 = wl + (wr-wl)/3.0
         w2 = wr - (wr-wl)/3.0
-        if F(w1) < F(w2): 
+        if F(w1) < F(w2):
             wr = w2
-        else: 
+        else:
             wl = w1
     w_star = 0.5*(wl+wr)
     gw = w_star*g_fair_vec + (1-w_star)*g_halu_vec
     d = g0 + (torch.sqrt(phi) / (gw.norm() + eps)) * gw
-    _set_grads_from_vec(params, d)
+    _set_grads_from_vec(params, d, accumulate=accumulate)
 
 # =============================================================================
 # SFT
@@ -2202,7 +2214,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # 在累积周期开始时清零梯度
         if should_zero_grad:
-            opt.zero_grad(set_to_none=True)
+            opt.zero_grad(set_to_none=False)  # 【性能优化】设为0而非None，后续可以用copy_而非clone
+            is_first_microbatch = True
+        else:
+            is_first_microbatch = False
 
         for _ in range(config.MU_UPDATES):
 
@@ -2273,10 +2288,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 use_conflict_resolution = config.USE_CAGRAD
 
             # 【修改】根据冲突状态决定梯度合成策略
+            # 【性能优化】第一个 micro-batch 用 copy_（快），后续用 add_（累加）
             if use_conflict_resolution:
-                cagrad_combine_and_set_grads(trainable, vec_f, vec_h, c=config.CAGRAD_C)
+                cagrad_combine_and_set_grads(trainable, vec_f, vec_h, c=config.CAGRAD_C, accumulate=not is_first_microbatch)
             else:
-                _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h))
+                _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h), accumulate=not is_first_microbatch)
 
         # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
         # 在累积周期结束时更新参数
