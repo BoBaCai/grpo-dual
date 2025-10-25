@@ -1518,26 +1518,12 @@ class FrequencyPenaltyProcessor(torch.nn.Module):
 def build_safe_logits_processors():
     """
     构建logits处理器列表
-    【修复】必须手动添加 Temperature/TopK/TopP 处理器
-    原因：传递自定义 logits_processor 时，transformers 会禁用内置处理器
+    【修复】只添加自定义 processor（Penalty + Sanity）
+    Temperature/TopK/TopP 直接传给 generate()，避免警告
     """
-    from transformers import (
-        TemperatureLogitsWarper,
-        TopKLogitsWarper,
-        TopPLogitsWarper,
-    )
-
     lp = LogitsProcessorList()
 
-    # 【关键】先添加采样处理器（按transformers内部顺序）
-    if config.TEMPERATURE_TRAIN != 1.0:
-        lp.append(TemperatureLogitsWarper(config.TEMPERATURE_TRAIN))
-    if config.TOP_K_TRAIN > 0:
-        lp.append(TopKLogitsWarper(top_k=config.TOP_K_TRAIN, min_tokens_to_keep=1))
-    if config.TOP_P_TRAIN < 1.0:
-        lp.append(TopPLogitsWarper(top_p=config.TOP_P_TRAIN, min_tokens_to_keep=1))
-
-    # 然后添加自定义的penalty处理器
+    # 只添加自定义的penalty处理器
     if config.PRESENCE_PENALTY != 0.0:
         lp.append(PresencePenaltyProcessor(config.PRESENCE_PENALTY))
     if config.FREQUENCY_PENALTY != 0.0:
@@ -1593,16 +1579,18 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True,
                        truncation=True, max_length=config.SFT_MAXLEN).to(device)
 
-    # 【修复】采样参数通过 logits_processor 传递，避免重复或被忽略
+    # 【最终修复】采样参数直接传递给 generate()，避免警告
     with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
         out = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
             do_sample=True,
-            # 【移除】temperature/top_k/top_p（已在 logits_processor 中处理）
+            temperature=config.TEMPERATURE_TRAIN,
+            top_k=config.TOP_K_TRAIN,
+            top_p=config.TOP_P_TRAIN,
             repetition_penalty=config.REP_PENALTY_TRAIN,
-            logits_processor=processors,  # 包含 Temperature/TopK/TopP/Penalty/Sanity
+            logits_processor=processors,  # 只包含 Penalty + Sanity
             num_return_sequences=1,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=eos_ids,  # §2: 多终止符
@@ -1679,7 +1667,9 @@ def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: b
                 max_new_tokens=config.MAX_NEW_TOKENS_EVAL,
                 min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
                 do_sample=True,
-                # 【移除】temperature/top_k/top_p（已在 logits_processor 中处理）
+                temperature=config.TEMPERATURE_TRAIN,
+                top_k=config.TOP_K_TRAIN,
+                top_p=config.TOP_P_TRAIN,
                 repetition_penalty=config.REP_PENALTY_TRAIN,
                 logits_processor=processors,
                 pad_token_id=tokenizer.pad_token_id,
