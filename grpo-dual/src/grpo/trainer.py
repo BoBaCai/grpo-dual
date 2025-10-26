@@ -2281,20 +2281,23 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
 
-            # 【标准GRPO KL散度】DeepSeekMath式(4)：无偏单样本估计器
+            # 【标准GRPO KL散度】DeepSeekMath式(4)：前向KL的无偏单样本估计器
             #
-            # 公式：KL(π_θ || π_ref) 的无偏估计 = r - log(r) - 1
-            # 其中 r = π_ref(a|s) / π_θ(a|s) = exp(ref_lp - cur_lp)
+            # 公式：D_KL(π_cur || π_ref) = E[log(π_cur/π_ref)]
+            # 无偏估计器（DeepSeekMath Eq.4）：exp(-δ) + δ - 1
+            # 其中 δ = log(π_cur) - log(π_ref) = cur_lp - ref_lp
+            #
+            # 【关键】GRPO用前向KL（cur||ref），不是反向KL（ref||cur）
+            # - 前向KL：锚住当前策略，避免偏离参考模型
+            # - 反向KL：PPO(2017)罚项用的方向，GRPO不用这个
             #
             # 参考：
-            # - DeepSeekMath (Shao et al., 2024) 式(4)
-            # - RLHF Book (Lambert et al., 2024) 式(56)
-            # - Schulman (2020) 无偏KL估计器
+            # - DeepSeekMath (Shao et al., 2024) 式(4): exp(-δ) + δ - 1
+            # - InstructGPT/RLHF: reward里减β*δ，等价于前向KL
             #
             # 数值稳定性：clamp delta到[-20, 20]避免exp溢出
-            delta = (ref_lp - cur_lp).clamp(-20, 20)  # ref - cur（注意方向！）
-            ratio_kl = torch.exp(delta)  # r = π_ref / π_θ
-            kl = ratio_kl - torch.log(ratio_kl.clamp(min=1e-10)) - 1.0  # 无偏估计器，保证非负
+            delta = (cur_lp - ref_lp).clamp(-20, 20)  # δ = cur - ref (GRPO前向KL)
+            kl = torch.exp(-delta) + delta - 1.0      # 无偏估计器：exp(-δ) + δ - 1
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
