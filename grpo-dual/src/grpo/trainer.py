@@ -247,8 +247,9 @@ class Config:
     # Pareto（评测配置）
     PARETO_EVAL_FREQ = 50
     N_PARETO_CHECKPOINTS = 5
-    PARETO_PRINT_EVERY = 20
+    PARETO_PRINT_EVERY = 50          # 【性能优化】降低快速评估频率，与正式评估同步
     PARETO_PRINT_SAMPLES = 40        # 【恢复】保持40，确保评测准确
+    PARETO_QUICK_EVAL_SAMPLES = 10   # 【新增】快速评估使用更少样本，仅看趋势
 
     # 评审器（judge）多云与限流
     # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求（不影响训练效果）
@@ -2439,14 +2440,15 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         })
 
         # 【修改】在线中途快评，默认greedy模式（稳定）
+        # 【性能优化】使用更少样本数加速快速评估
         if (step + 1) % config.PARETO_PRINT_EVERY == 0:
             with torch.no_grad():
-                # 中途快评固定使用greedy
+                # 中途快评固定使用greedy，使用少量样本仅看趋势
                 fair_q = quick_eval_fast(model, tokenizer, device, judge, dataset, "fairness",
-                                        n_samples=config.PARETO_PRINT_SAMPLES, provider_hint="openai",
+                                        n_samples=config.PARETO_QUICK_EVAL_SAMPLES, provider_hint="openai",
                                         use_sampling=False)  # 固定greedy
                 halu_q = quick_eval_fast(model, tokenizer, device, judge, dataset, "hallucination",
-                                        n_samples=config.PARETO_PRINT_SAMPLES, provider_hint="openai",
+                                        n_samples=config.PARETO_QUICK_EVAL_SAMPLES, provider_hint="openai",
                                         use_sampling=False)  # 固定greedy
             # 打印奖励分数和关键指标
             print(f"\n[QuickEval@{step+1}] mode=greedy fairness={fair_q:.3f}  hallucination={halu_q:.3f}")
