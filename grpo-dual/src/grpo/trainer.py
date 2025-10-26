@@ -545,13 +545,14 @@ class BranchedKLController:
         self.kl_f_history = deque(maxlen=window_size)
         self.kl_h_history = deque(maxlen=window_size)
 
-        # 【性能修复】放宽KL目标，基于实际训练数据调整
-        # Fairness: 实际KL在0.09-0.27，目标放宽到0.08-0.15
-        # Hallucination: 实际KL在0.03-0.05，目标降低到0.04-0.10
-        self.target_kl_f_min = 0.08
-        self.target_kl_f_max = 0.15
-        self.target_kl_h_min = 0.04
-        self.target_kl_h_max = 0.10
+        # 【标准GRPO KL目标】基于DeepSeekMath和标准无偏估计器
+        # 标准GRPO的KL范围：通常0.001-0.05（远小于平方误差）
+        # 参考：DeepSeekMath用β=0.04，说明KL应该很小
+        # Fairness和Hallucination统一目标（多任务共享模型）
+        self.target_kl_f_min = 0.005  # 下界：允许少量探索
+        self.target_kl_f_max = 0.05   # 上界：避免偏离太远
+        self.target_kl_h_min = 0.005  # 统一范围（简化调试）
+        self.target_kl_h_max = 0.05   # 统一范围
 
         self.adjustment_log = []
 
@@ -2120,10 +2121,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                                         winsorize_quantile=config.REWARD_WINSORIZE_QUANTILE)
     
     # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
-    # 【性能修复】降低初始β，配合放宽的KL目标，给模型更多学习空间
+    # 【标准GRPO KL控制】使用DeepSeekMath式(4)的无偏估计器
+    # β参考值：DeepSeekMath用0.04，我们分支化控制用略高的起点
     kl_controller = BranchedKLController(
-        beta_f_init=0.05,  # 降低到0.05，配合新KL目标[0.08-0.15]
-        beta_h_init=0.15,  # 降低到0.15，配合新KL目标[0.04-0.10]
+        beta_f_init=0.05,  # Fairness: 较低β，目标KL∈[0.005, 0.05]
+        beta_h_init=0.10,  # Hallucination: 中等β，目标KL∈[0.005, 0.05]（降低以匹配标准KL）
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
@@ -2279,21 +2281,20 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
 
-            # 【最终修复】KL散度计算：使用平方误差（稳定且对称）
+            # 【标准GRPO KL散度】DeepSeekMath式(4)：无偏单样本估计器
             #
-            # 问题历史：
-            # 1. exp(delta)-delta-1 → 爆炸（delta=3时kl=16）
-            # 2. ref_lp - cur_lp → 方向反了，KL=0.000
-            # 3. abs(cur_lp - ref_lp) → 双向penalty，模型崩溃（F生成长度=1.0）
+            # 公式：KL(π_θ || π_ref) 的无偏估计 = r - log(r) - 1
+            # 其中 r = π_ref(a|s) / π_θ(a|s) = exp(ref_lp - cur_lp)
             #
-            # 正确的实现：使用平方误差
-            # - KL ≈ (cur_lp - ref_lp)^2 / 2（二阶泰勒展开）
-            # - 总是非负，对称，不爆炸
-            # - 当 cur_lp ≈ ref_lp 时，KL ≈ 0（模型接近参考）
-            # - 当 cur_lp 偏离 ref_lp 时，KL 增大（需要 penalty）
+            # 参考：
+            # - DeepSeekMath (Shao et al., 2024) 式(4)
+            # - RLHF Book (Lambert et al., 2024) 式(56)
+            # - Schulman (2020) 无偏KL估计器
             #
-            delta = (cur_lp - ref_lp).clamp(-10, 10)  # 防止极端值
-            kl = (delta ** 2) * 0.5  # 平方误差（不再需要 abs 或 clamp）
+            # 数值稳定性：clamp delta到[-20, 20]避免exp溢出
+            delta = (ref_lp - cur_lp).clamp(-20, 20)  # ref - cur（注意方向！）
+            ratio_kl = torch.exp(delta)  # r = π_ref / π_θ
+            kl = ratio_kl - torch.log(ratio_kl.clamp(min=1e-10)) - 1.0  # 无偏估计器，保证非负
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
