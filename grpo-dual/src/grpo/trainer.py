@@ -179,10 +179,10 @@ class Config:
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
     GRPO_LR = 5e-6          # 从1e-5降到5e-6（降低50%，更稳定）
-    GRPO_BATCH_SIZE = 2     # 【显存优化】从4降到2，减少单次生成显存
+    GRPO_BATCH_SIZE = 4     # 【性能优化】提升到4，充分利用A100显存，加速30-40%
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 2  # 【新增】梯度累积，等效 batch=2×2=4
+    GRADIENT_ACCUMULATION_STEPS = 1  # 【性能优化】降到1，batch已足够大（有效batch=4）
 
     # LoRA
     USE_LORA = True
@@ -198,8 +198,8 @@ class Config:
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
     # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
-    MAX_NEW_TOKENS_TRAIN = 96      # 【显存优化】从128降到96，减少显存占用
-    MAX_NEW_TOKENS_EVAL = 96       # 评测同步降低
+    MAX_NEW_TOKENS_TRAIN = 64      # 【性能优化】降到64，实际生成长度21-31足够，减少padding浪费
+    MAX_NEW_TOKENS_EVAL = 64       # 评测同步降低
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
     
     TEMPERATURE_TRAIN = 0.5        # 【大幅降低】从0.6→0.5，显著更保守
@@ -529,11 +529,13 @@ class BranchedKLController:
         self.kl_f_history = deque(maxlen=window_size)
         self.kl_h_history = deque(maxlen=window_size)
 
-        # 分支目标
-        self.target_kl_f_min = 0.02
-        self.target_kl_f_max = 0.06
-        self.target_kl_h_min = 0.08
-        self.target_kl_h_max = 0.15
+        # 【性能修复】放宽KL目标，基于实际训练数据调整
+        # Fairness: 实际KL在0.09-0.27，目标放宽到0.08-0.15
+        # Hallucination: 实际KL在0.03-0.05，目标降低到0.04-0.10
+        self.target_kl_f_min = 0.08
+        self.target_kl_f_max = 0.15
+        self.target_kl_h_min = 0.04
+        self.target_kl_h_max = 0.10
 
         self.adjustment_log = []
 
@@ -2102,9 +2104,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                                         winsorize_quantile=config.REWARD_WINSORIZE_QUANTILE)
     
     # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
+    # 【性能修复】降低初始β，配合放宽的KL目标，给模型更多学习空间
     kl_controller = BranchedKLController(
-        beta_f_init=0.10,  # 从0.02增到0.10（5倍），更强的KL约束
-        beta_h_init=0.30,  # 从0.10增到0.30（3倍），保证安全性
+        beta_f_init=0.05,  # 降低到0.05，配合新KL目标[0.08-0.15]
+        beta_h_init=0.15,  # 降低到0.15，配合新KL目标[0.04-0.10]
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
