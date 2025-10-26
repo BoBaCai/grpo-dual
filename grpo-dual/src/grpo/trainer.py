@@ -547,12 +547,12 @@ class BranchedKLController:
 
         # 【标准GRPO KL目标】基于DeepSeekMath和标准无偏估计器
         # 标准GRPO的KL范围：通常0.001-0.05（远小于平方误差）
-        # 参考：DeepSeekMath用β=0.04，说明KL应该很小
+        # 参考：DeepSeekMath用β=0.04，我们用3x β，相应扩大目标范围以适应强约束
         # Fairness和Hallucination统一目标（多任务共享模型）
-        self.target_kl_f_min = 0.005  # 下界：允许少量探索
-        self.target_kl_f_max = 0.05   # 上界：避免偏离太远
-        self.target_kl_h_min = 0.005  # 统一范围（简化调试）
-        self.target_kl_h_max = 0.05   # 统一范围
+        self.target_kl_f_min = 0.01   # 下界：提高至0.01，避免过度保守
+        self.target_kl_f_max = 0.15   # 上界：扩大至0.15，配合更强β留出适应空间
+        self.target_kl_h_min = 0.01   # 统一范围（简化调试）
+        self.target_kl_h_max = 0.15   # 统一范围
 
         self.adjustment_log = []
 
@@ -2122,10 +2122,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     
     # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
     # 【标准GRPO KL控制】使用DeepSeekMath式(4)的无偏估计器
-    # β参考值：DeepSeekMath用0.04，我们分支化控制用略高的起点
+    # β参考值：DeepSeekMath用0.04，我们分支化控制用3x起点（多任务+梯度合并需要更强约束）
     kl_controller = BranchedKLController(
-        beta_f_init=0.05,  # Fairness: 较低β，目标KL∈[0.005, 0.05]
-        beta_h_init=0.10,  # Hallucination: 中等β，目标KL∈[0.005, 0.05]（降低以匹配标准KL）
+        beta_f_init=0.15,  # Fairness: 3x增强β，目标KL∈[0.01, 0.15]
+        beta_h_init=0.30,  # Hallucination: 3x增强β，目标KL∈[0.01, 0.15]（降低delta避免大偏差）
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
