@@ -194,7 +194,7 @@ class Config:
     # 数值/加速
     USE_BF16 = True
     USE_GRADIENT_CHECKPOINTING = True
-    USE_TORCH_COMPILE = False    # 【加速】可选：torch.compile() 加速（需要 PyTorch 2.0+）
+    USE_TORCH_COMPILE = True     # 【性能优化】启用torch.compile加速（15-30%提速，PyTorch 2.0+）
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
     # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
@@ -2004,7 +2004,8 @@ def sft_continue(model, tokenizer, device, dataset):
     if model is None: 
         return
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = AdamW(params, lr=config.SFT_LR)
+    # 【性能优化】使用Fused AdamW加速（5-10%提速，需要CUDA）
+    opt = AdamW(params, lr=config.SFT_LR, fused=torch.cuda.is_available())
     try:
         from tqdm.auto import tqdm
     except:
@@ -2114,7 +2115,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     current_max_new_tokens_train = config.MAX_NEW_TOKENS_TRAIN  # 128（硬约束）
     
     trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = AdamW(trainable, lr=config.GRPO_LR, weight_decay=0.01)
+    # 【性能优化】使用Fused AdamW加速（5-10%提速，需要CUDA）
+    opt = AdamW(trainable, lr=config.GRPO_LR, weight_decay=0.01, fused=torch.cuda.is_available())
     try:
         from tqdm.auto import tqdm
     except:
