@@ -268,12 +268,12 @@ class Config:
     PARETO_QUICK_EVAL_SAMPLES = 10   # 【新增】快速评估使用更少样本，仅看趋势
 
     # 评审器（judge）多云与限流
-    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求（不影响训练效果）
-    JUDGE_MAX_WORKERS = 8       # 匹配单步生成数 (2×4=8)，纯并发优化
-    JUDGE_TIMEOUT_SEC = 10      # 【恢复】保持原值，避免过多超时影响 reward
+    # 【性能优化】匹配当前 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
+    JUDGE_MAX_WORKERS = 16      # 提升到16，匹配单步生成数 (4×4=16)，消除分波等待
+    JUDGE_TIMEOUT_SEC = 7       # 降低到7秒，压缩长尾延迟（有重试兜底）
     JUDGE_MAX_RETRIES = 1       # 【恢复】保留重试，确保 reward 质量
-    RATE_LIMIT_RPS   = 10       # 避免触发限流
-    RATE_LIMIT_BURST = 12       # 匹配单步生成数
+    RATE_LIMIT_RPS   = 20       # 提升到20，充分利用两家API吞吐
+    RATE_LIMIT_BURST = 20       # 提升到20，匹配并发数，避免限流等待
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
