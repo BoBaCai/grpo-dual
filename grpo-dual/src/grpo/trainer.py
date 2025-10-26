@@ -96,6 +96,22 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from json import JSONDecodeError
 
+# =============================================================================
+# torch.compile() 配置优化（修复CUDAGraph动态shape警告）
+# =============================================================================
+# NLP任务中输入长度是动态的，会导致torch.compile记录过多CUDA图
+# 解决方案：配置Inductor跳过动态shape的CUDA图，静默警告
+try:
+    if hasattr(torch, '_inductor') and hasattr(torch._inductor, 'config'):
+        # 跳过动态shape的CUDA图（避免51个不同size的开销）
+        torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+        # 静默警告
+        torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+        # 【可选】启用更积极的fusion优化
+        torch._inductor.config.coordinate_descent_tuning = True
+except Exception:
+    pass  # 旧版本PyTorch不支持这些配置，忽略即可
+
 try:
     from scipy import stats as scipy_stats
 except ImportError:
