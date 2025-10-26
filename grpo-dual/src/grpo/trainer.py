@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-多目标 LoRA + GRPO（v2.2 - 反馈优化版）
+多目标 LoRA + GRPO（v2.2 - 反馈优化版）（2025/10/26 15:45 ver.)
 核心改进：
 - ✅ 训练/评测配置严格分离
 - ✅ 截断率监控与自适应max_new_tokens
