@@ -2258,7 +2258,30 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # 【新增】奖励分支内标准化（含winsorize去除离群值）
         task_list = [tasks[idx_map[i]] for i in range(len(idx_map))]
+        rewards_before_norm = rewards.clone()  # 保存normalize前的值用于debug
         rewards = reward_normalizer.update_and_normalize(rewards, task_list)
+
+        # 【诊断模块】前20步打印Fairness样本详情，排查奖励函数bug
+        if step < 20:
+            fairness_indices = [i for i, task in enumerate(task_list) if task == "fairness"]
+            if fairness_indices:
+                print(f"\n{'='*70}")
+                print(f"[Fairness诊断@step{step+1}] 发现 {len(fairness_indices)} 个Fairness样本（共{len(task_list)}个）")
+                print(f"{'='*70}")
+                # 只打印前3个Fairness样本，避免输出过长
+                for idx in fairness_indices[:3]:
+                    prompt_preview = all_prompts[idx][:100].replace('\n', ' ')
+                    resp_preview = all_resps[idx][:150].replace('\n', ' ')
+                    print(f"\n样本 #{idx} (batch内索引{idx_map[idx]}):")
+                    print(f"  Prompt: {prompt_preview}...")
+                    print(f"  Generated: {resp_preview}...")
+                    print(f"  Length: {all_lengths[idx]} tokens")
+                    print(f"  Truncated: {all_truncated[idx]}")
+                    print(f"  Reward (原始): {rewards_before_norm[idx].item():.3f}")
+                    print(f"  Reward (归一化后): {rewards[idx].item():.3f}")
+                if len(fairness_indices) > 3:
+                    print(f"\n... 还有 {len(fairness_indices) - 3} 个Fairness样本未显示")
+                print(f"{'='*70}\n")
 
         # ——一次性分词 + 计算 ref_lp（复用）——
         t_tok0 = _t.time()
