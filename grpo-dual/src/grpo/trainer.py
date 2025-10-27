@@ -2319,6 +2319,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         else:
             is_first_microbatch = False
 
+        # 初始化loss变量（供后续指标收集使用）
+        loss_fair = torch.tensor(0.0, device=device)
+        loss_halu = torch.tensor(0.0, device=device)
+
         for _ in range(config.MU_UPDATES):
 
             out_cur = model(input_ids=full_tok["input_ids"],
@@ -2421,6 +2425,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
             # 7) 设置最终梯度
             _set_grads_from_vec(trainable, vec_final, accumulate=not is_first_microbatch)
+
+            # 8) 重建完整loss用于指标收集（不参与反传）
+            # loss_fair和loss_halu在后续代码中用于日志记录
+            loss_fair = reward_loss_f + beta_f * kl_loss_f
+            loss_halu = reward_loss_h + beta_h * kl_loss_h
 
         # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
         # 在累积周期结束时更新参数
