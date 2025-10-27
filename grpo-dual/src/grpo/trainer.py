@@ -214,12 +214,12 @@ class Config:
     USE_TORCH_COMPILE = False    # 【已禁用】编译开销>收益（SFT动态shape多，首次编译慢）
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
-    # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
-    MAX_NEW_TOKENS_TRAIN = 64      # 【性能优化】降到64，实际生成长度21-31足够，减少padding浪费
-    MAX_NEW_TOKENS_EVAL = 64       # 评测同步降低
+    # 【修改】生成配置：平衡质量与性能
+    MAX_NEW_TOKENS_TRAIN = 96      # 【修复】从64提升到96，解决Hallucination任务25%截断率
+    MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
-    
-    TEMPERATURE_TRAIN = 0.5        # 【大幅降低】从0.6→0.5，显著更保守
+
+    TEMPERATURE_TRAIN = 0.4        # 【进一步降低】从0.5→0.4，减少KL漂移（研究显示KL=0.309过高）
     TOP_K_TRAIN = 30               # 【降低】从40→30，更严格裁剪
     TOP_P_TRAIN = 0.85             # 【降低】从0.9→0.85，更严格
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
@@ -258,7 +258,9 @@ class Config:
     GRADIENT_CONFLICT_THRESHOLD = -0.1  # 余弦相似度阈值
 
     # CAGrad
-    USE_CAGRAD = True
+    # 【暂时禁用】测试KL修复效果，需要可预测的β_eff=0.5×β（问题7）
+    # CAGrad会动态调整β_eff=(0.5+λw)×β，使KL控制难以预测
+    USE_CAGRAD = False  # 改为False，使用常数权重0.5×(g_f+g_h)
     CAGRAD_C = 0.2
 
     # Pareto（评测配置）
