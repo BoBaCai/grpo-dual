@@ -219,9 +219,9 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.4        # 【进一步降低】从0.5→0.4，减少KL漂移（研究显示KL=0.309过高）
-    TOP_K_TRAIN = 30               # 【降低】从40→30，更严格裁剪
-    TOP_P_TRAIN = 0.85             # 【降低】从0.9→0.85，更严格
+    TEMPERATURE_TRAIN = 0.3        # 【关键优化】降到0.3，实测KL仍高达0.16-0.20
+    TOP_K_TRAIN = 25               # 【进一步降低】从30→25，配合低温更严格
+    TOP_P_TRAIN = 0.80             # 【进一步降低】从0.85→0.80，减少长尾采样
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
     
     PRESENCE_PENALTY = 0.6         # 【增大】从0.5→0.6
@@ -251,7 +251,7 @@ class Config:
     # 【方案2：拉格朗日KL控制器】β自适应追踪target_KL
     # β ← [β + η(KL - target)]₊ （连续加法更新，更平滑）
     USE_LAGRANGIAN_KL_CONTROL = True   # 启用拉格朗日控制器
-    LAGRANGIAN_LR = 0.01               # η：拉格朗日学习率（0.01-0.1）
+    LAGRANGIAN_LR = 0.1                # η：拉格朗日学习率（提高到0.1，10倍加速收敛）
     LAGRANGIAN_UPDATE_FREQ = 5         # 每N步更新一次β（更频繁=更responsive）
     
     # 【新增】奖励分支内标准化（EMA）
