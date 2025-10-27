@@ -195,7 +195,7 @@ class Config:
 
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
-    GRPO_LR = 5e-6          # 从1e-5降到5e-6（降低50%，更稳定）
+    GRPO_LR = 2e-6          # 【紧急修复】从5e-6降到2e-6，模型变化太快导致KL发散
     GRPO_BATCH_SIZE = 2     # 【显存优化】降到2，Reward-only CAGrad需要4次反传（显存×2）
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
@@ -219,9 +219,9 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.3        # 【关键优化】降到0.3，实测KL仍高达0.16-0.20
-    TOP_K_TRAIN = 25               # 【进一步降低】从30→25，配合低温更严格
-    TOP_P_TRAIN = 0.80             # 【进一步降低】从0.85→0.80，减少长尾采样
+    TEMPERATURE_TRAIN = 0.25       # 【紧急修复】从0.3降到0.25，实测KL仍在上升
+    TOP_K_TRAIN = 20               # 【进一步降低】从25→20
+    TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
     
     PRESENCE_PENALTY = 0.6         # 【增大】从0.5→0.6
@@ -2182,8 +2182,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     # 【标准GRPO KL控制】使用DeepSeekMath式(4)的无偏估计器
     # β参考值：DeepSeekMath用0.04，我们分支化控制用3x起点（多任务+梯度合并需要更强约束）
     kl_controller = BranchedKLController(
-        beta_f_init=0.15,  # Fairness: 3x增强β，目标KL∈[0.01, 0.15]
-        beta_h_init=0.30,  # Hallucination: 3x增强β，目标KL∈[0.01, 0.15]（降低delta避免大偏差）
+        beta_f_init=0.30,  # 【紧急修复】从0.15提升到0.30，β涨到0.27仍无法控制KL
+        beta_h_init=0.30,  # 保持0.30（Hallucination已稳定）
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
