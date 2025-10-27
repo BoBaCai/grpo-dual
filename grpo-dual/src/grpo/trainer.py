@@ -258,10 +258,11 @@ class Config:
     GRADIENT_CONFLICT_THRESHOLD = -0.1  # 余弦相似度阈值
 
     # CAGrad
-    # 【暂时禁用】测试KL修复效果，需要可预测的β_eff=0.5×β（问题7）
-    # CAGrad会动态调整β_eff=(0.5+λw)×β，使KL控制难以预测
-    USE_CAGRAD = False  # 改为False，使用常数权重0.5×(g_f+g_h)
-    CAGRAD_C = 0.2
+    # 【方案1：Reward-only CAGrad】现在CAGrad只作用于reward梯度
+    # KL梯度直通（g_final = g_reward_merged + β*∇KL），β完全可解释
+    # 优势：既解决reward冲突，又保持β的可预测性
+    USE_CAGRAD = True   # 启用Reward-only CAGrad
+    CAGRAD_C = 0.2      # c→0退化为平均梯度；c增大更避冲突
 
     # Pareto（评测配置）
     PARETO_EVAL_FREQ = 50
@@ -1993,11 +1994,19 @@ def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor, acc
             p.grad.copy_(g)  # 覆盖（第一个 micro-batch，更快）
         ptr += num
 
-def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2, accumulate: bool=True):
+def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2, accumulate: bool=True, set_grads: bool=True):
     """CAGrad 梯度合成算法
 
     Args:
+        params: 模型参数列表
+        g_fair_vec: Fairness任务梯度向量
+        g_halu_vec: Hallucination任务梯度向量
+        c: CAGrad冲突强度参数（c→0退化为平均梯度）
         accumulate: 传递给 _set_grads_from_vec，控制累加还是覆盖
+        set_grads: 是否直接设置梯度（False则只返回合并后的向量）
+
+    Returns:
+        如果set_grads=False，返回合并后的梯度向量
     """
     eps = 1e-12
     g0 = 0.5 * (g_fair_vec + g_halu_vec)
@@ -2016,7 +2025,11 @@ def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: t
     w_star = 0.5*(wl+wr)
     gw = w_star*g_fair_vec + (1-w_star)*g_halu_vec
     d = g0 + (torch.sqrt(phi) / (gw.norm() + eps)) * gw
-    _set_grads_from_vec(params, d, accumulate=accumulate)
+
+    if set_grads:
+        _set_grads_from_vec(params, d, accumulate=accumulate)
+    else:
+        return d
 
 # =============================================================================
 # SFT
@@ -2310,46 +2323,69 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
             _anchor_zero = sum((p.sum() * 0.0) for p in trainable)
 
+            # 【方案1：Reward-only CAGrad】分开计算reward和KL，只对reward梯度做surgery
+            # 优势：β完全可解释，KL梯度不受CAGrad的λ/w影响
+            # g_final = g_reward_merged + β_f * ∇KL_f + β_h * ∇KL_h
+
+            # 1) 计算各任务的reward loss（不含KL）
             if task_mask_f.any():
-                loss_fair = -(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean()
+                reward_loss_f = -(surr[task_mask_f].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                kl_mean_f = kl[task_mask_f].mean()
             else:
-                loss_fair = _anchor_zero
+                reward_loss_f = _anchor_zero
+                kl_mean_f = torch.tensor(0.0, device=surr.device)
 
             if task_mask_h.any():
-                loss_halu = -(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean()
+                reward_loss_h = -(surr[task_mask_h].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                kl_mean_h = kl[task_mask_h].mean()
             else:
-                loss_halu = _anchor_zero
-
-            # 【显存优化】梯度累积：loss 除以累积步数
-            loss_fair = loss_fair / config.GRADIENT_ACCUMULATION_STEPS
-            loss_halu = loss_halu / config.GRADIENT_ACCUMULATION_STEPS
+                reward_loss_h = _anchor_zero
+                kl_mean_h = torch.tensor(0.0, device=surr.device)
 
             # 检查 NaN/Inf
-            if torch.isnan(loss_fair) or torch.isinf(loss_fair) or torch.isnan(loss_halu) or torch.isinf(loss_halu):
+            if torch.isnan(reward_loss_f) or torch.isinf(reward_loss_f) or \
+               torch.isnan(reward_loss_h) or torch.isinf(reward_loss_h):
                 nan_inf_hits += 1
                 continue
 
-            # 【新增】计算两个任务的梯度并监控冲突
-            grads_f = torch.autograd.grad(loss_fair, trainable, retain_graph=True, allow_unused=True)
-            grads_h = torch.autograd.grad(loss_halu, trainable, retain_graph=True, allow_unused=True)
+            # 2) 分别计算reward梯度（retain_graph=True以便后续计算KL梯度）
+            grads_reward_f = torch.autograd.grad(reward_loss_f, trainable, retain_graph=True, allow_unused=True)
+            grads_reward_h = torch.autograd.grad(reward_loss_h, trainable, retain_graph=True, allow_unused=True)
 
-            vec_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_f, trainable)])
-            vec_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_h, trainable)])
+            vec_reward_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_reward_f, trainable)])
+            vec_reward_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_reward_h, trainable)])
 
-            # 【新增】监控梯度冲突
+            # 3) 监控reward梯度冲突（不是总梯度冲突）
             if conflict_monitor is not None:
-                conflict_info = conflict_monitor.update(vec_f, vec_h, step + 1)
+                conflict_info = conflict_monitor.update(vec_reward_f, vec_reward_h, step + 1)
                 grad_cosine_sim = conflict_info["cosine_sim"]
                 use_conflict_resolution = conflict_info["use_conflict_resolution"]
             else:
                 use_conflict_resolution = config.USE_CAGRAD
 
-            # 【修改】根据冲突状态决定梯度合成策略
-            # 【性能优化】第一个 micro-batch 用 copy_（快），后续用 add_（累加）
+            # 4) 对reward梯度做CAGrad surgery（或常数权重合并）
             if use_conflict_resolution:
-                cagrad_combine_and_set_grads(trainable, vec_f, vec_h, c=config.CAGRAD_C, accumulate=not is_first_microbatch)
+                vec_reward_merged = cagrad_combine_and_set_grads(trainable, vec_reward_f, vec_reward_h,
+                                                                  c=config.CAGRAD_C, accumulate=not is_first_microbatch,
+                                                                  set_grads=False)  # 先不设置，稍后加上KL
             else:
-                _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h), accumulate=not is_first_microbatch)
+                vec_reward_merged = 0.5 * (vec_reward_f + vec_reward_h)
+
+            # 5) 计算KL梯度（直通，不做surgery）
+            kl_loss_f = kl_mean_f / config.GRADIENT_ACCUMULATION_STEPS
+            kl_loss_h = kl_mean_h / config.GRADIENT_ACCUMULATION_STEPS
+
+            grads_kl_f = torch.autograd.grad(kl_loss_f, trainable, retain_graph=True, allow_unused=True)
+            grads_kl_h = torch.autograd.grad(kl_loss_h, trainable, allow_unused=True)
+
+            vec_kl_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_f, trainable)])
+            vec_kl_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_h, trainable)])
+
+            # 6) 最终梯度 = merged reward + β * KL（β完全可解释，不受surgery影响）
+            vec_final = vec_reward_merged + beta_f * vec_kl_f + beta_h * vec_kl_h
+
+            # 7) 设置最终梯度
+            _set_grads_from_vec(trainable, vec_final, accumulate=not is_first_microbatch)
 
         # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
         # 在累积周期结束时更新参数
