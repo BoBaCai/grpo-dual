@@ -195,7 +195,7 @@ class Config:
 
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
-    GRPO_LR = 1e-6          # 【方案A】从5e-6→2e-6→1e-6，极度保守防止KL发散
+    GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
     GRPO_BATCH_SIZE = 2     # 【显存优化】降到2，Reward-only CAGrad需要4次反传（显存×2）
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
