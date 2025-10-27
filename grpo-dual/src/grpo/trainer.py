@@ -245,8 +245,14 @@ class Config:
     KL_ADAPTIVE_WINDOW = 20         # 自适应控制窗口大小
     KL_TARGET_MIN = 0.05            # KL目标下界
     KL_TARGET_MAX = 0.5             # KL目标上界
-    KL_ADJUST_RATIO_HIGH = 1.15     # KL过高时的beta调整倍数
-    KL_ADJUST_RATIO_LOW = 0.85      # KL过低时的beta调整倍数
+    KL_ADJUST_RATIO_HIGH = 1.15     # KL过高时的beta调整倍数（乘法模式）
+    KL_ADJUST_RATIO_LOW = 0.85      # KL过低时的beta调整倍数（乘法模式）
+
+    # 【方案2：拉格朗日KL控制器】β自适应追踪target_KL
+    # β ← [β + η(KL - target)]₊ （连续加法更新，更平滑）
+    USE_LAGRANGIAN_KL_CONTROL = True   # 启用拉格朗日控制器
+    LAGRANGIAN_LR = 0.01               # η：拉格朗日学习率（0.01-0.1）
+    LAGRANGIAN_UPDATE_FREQ = 5         # 每N步更新一次β（更频繁=更responsive）
     
     # 【新增】奖励分支内标准化（EMA）
     REWARD_NORMALIZE = True         # 是否开启奖励标准化
@@ -582,6 +588,10 @@ class BranchedKLController:
     def auto_adjust(self, step: int) -> Optional[str]:
         """
         自动调整两个分支的β
+        支持两种模式：
+        1. 乘法调整（原方法）：β ← β × ratio
+        2. 拉格朗日调整（方案2）：β ← [β + η(KL - target)]₊
+
         返回调整建议
         """
         if not config.KL_ADAPTIVE_CONTROL or not self.should_adjust():
@@ -594,21 +604,46 @@ class BranchedKLController:
         old_beta_h = self.beta_h
         actions = []
 
-        # Fairness分支调整
-        if kl_f_median > self.target_kl_f_max:
-            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_HIGH
-            actions.append(f"Fairness KL过高({kl_f_median:.3f}>{self.target_kl_f_max:.2f})，β_f↑15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
-        elif kl_f_median < self.target_kl_f_min:
-            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_LOW
-            actions.append(f"Fairness KL过低({kl_f_median:.3f}<{self.target_kl_f_min:.2f})，β_f↓15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+        if config.USE_LAGRANGIAN_KL_CONTROL:
+            # 【方案2：拉格朗日控制器】β ← [β + η(KL - target)]₊
+            # 目标取min和max的中点
+            target_kl_f = 0.5 * (self.target_kl_f_min + self.target_kl_f_max)
+            target_kl_h = 0.5 * (self.target_kl_h_min + self.target_kl_h_max)
 
-        # Hallucination分支调整
-        if kl_h_median > self.target_kl_h_max:
-            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_HIGH
-            actions.append(f"Hallucination KL过高({kl_h_median:.3f}>{self.target_kl_h_max:.2f})，β_h↑15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
-        elif kl_h_median < self.target_kl_h_min:
-            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_LOW
-            actions.append(f"Hallucination KL过低({kl_h_median:.3f}<{self.target_kl_h_min:.2f})，β_h↓15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+            # 每LAGRANGIAN_UPDATE_FREQ步更新一次（更平滑）
+            if step % config.LAGRANGIAN_UPDATE_FREQ == 0:
+                # Fairness分支拉格朗日更新
+                kl_error_f = kl_f_median - target_kl_f
+                delta_beta_f = config.LAGRANGIAN_LR * kl_error_f
+                self.beta_f = max(0.01, self.beta_f + delta_beta_f)  # [·]₊投影到≥0.01
+
+                if abs(delta_beta_f) > 1e-4:  # 只记录显著变化
+                    actions.append(f"Fairness拉格朗日: KL={kl_f_median:.3f}(目标{target_kl_f:.3f}), β_f: {old_beta_f:.4f}→{self.beta_f:.4f} (Δ{delta_beta_f:+.4f})")
+
+                # Hallucination分支拉格朗日更新
+                kl_error_h = kl_h_median - target_kl_h
+                delta_beta_h = config.LAGRANGIAN_LR * kl_error_h
+                self.beta_h = max(0.01, self.beta_h + delta_beta_h)  # [·]₊投影到≥0.01
+
+                if abs(delta_beta_h) > 1e-4:
+                    actions.append(f"Hallucination拉格朗日: KL={kl_h_median:.3f}(目标{target_kl_h:.3f}), β_h: {old_beta_h:.4f}→{self.beta_h:.4f} (Δ{delta_beta_h:+.4f})")
+        else:
+            # 【原方法：乘法调整】离散的×ratio
+            # Fairness分支调整
+            if kl_f_median > self.target_kl_f_max:
+                self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_HIGH
+                actions.append(f"Fairness KL过高({kl_f_median:.3f}>{self.target_kl_f_max:.2f})，β_f↑15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+            elif kl_f_median < self.target_kl_f_min:
+                self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_LOW
+                actions.append(f"Fairness KL过低({kl_f_median:.3f}<{self.target_kl_f_min:.2f})，β_f↓15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+
+            # Hallucination分支调整
+            if kl_h_median > self.target_kl_h_max:
+                self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_HIGH
+                actions.append(f"Hallucination KL过高({kl_h_median:.3f}>{self.target_kl_h_max:.2f})，β_h↑15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+            elif kl_h_median < self.target_kl_h_min:
+                self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_LOW
+                actions.append(f"Hallucination KL过低({kl_h_median:.3f}<{self.target_kl_h_min:.2f})，β_h↓15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
 
         if actions:
             log_entry = {
