@@ -622,16 +622,16 @@ class BranchedKLController:
                 delta_beta_f = config.LAGRANGIAN_LR * kl_error_f
                 self.beta_f = max(0.01, self.beta_f + delta_beta_f)  # [·]₊投影到≥0.01
 
-                if abs(delta_beta_f) > 1e-4:  # 只记录显著变化
-                    actions.append(f"Fairness拉格朗日: KL={kl_f_median:.3f}(目标{target_kl_f:.3f}), β_f: {old_beta_f:.4f}→{self.beta_f:.4f} (Δ{delta_beta_f:+.4f})")
+                # 【修改】总是显示两个任务的调整，方便调试
+                actions.append(f"Fairness拉格朗日: KL={kl_f_median:.3f}(目标{target_kl_f:.3f}), β_f: {old_beta_f:.4f}→{self.beta_f:.4f} (Δ{delta_beta_f:+.4f})")
 
                 # Hallucination分支拉格朗日更新
                 kl_error_h = kl_h_median - target_kl_h
                 delta_beta_h = config.LAGRANGIAN_LR * kl_error_h
                 self.beta_h = max(0.01, self.beta_h + delta_beta_h)  # [·]₊投影到≥0.01
 
-                if abs(delta_beta_h) > 1e-4:
-                    actions.append(f"Hallucination拉格朗日: KL={kl_h_median:.3f}(目标{target_kl_h:.3f}), β_h: {old_beta_h:.4f}→{self.beta_h:.4f} (Δ{delta_beta_h:+.4f})")
+                # 【修改】总是显示，即使变化很小
+                actions.append(f"Hallucination拉格朗日: KL={kl_h_median:.3f}(目标{target_kl_h:.3f}), β_h: {old_beta_h:.4f}→{self.beta_h:.4f} (Δ{delta_beta_h:+.4f})")
         else:
             # 【原方法：乘法调整】离散的×ratio
             # Fairness分支调整
