@@ -2638,7 +2638,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         adj_history = kl_controller.get_adjustment_history()
         if adj_history:
             for adj in adj_history[-10:]:  # 显示最后10次调整
-                print(f"Step {adj['step']}: {adj['action']}")
+                # actions是列表，需要join成字符串
+                actions_str = "; ".join(adj['actions']) if isinstance(adj.get('actions'), list) else str(adj.get('actions', ''))
+                print(f"Step {adj['step']}: {actions_str}")
         else:
             print("未触发调整")
         print("="*60)
