@@ -546,14 +546,16 @@ class BranchedKLController:
         self.kl_f_history = deque(maxlen=window_size)
         self.kl_h_history = deque(maxlen=window_size)
 
-        # 【标准GRPO KL目标】基于DeepSeekMath和标准无偏估计器
-        # 标准GRPO的KL范围：通常0.001-0.05（远小于平方误差）
-        # 参考：DeepSeekMath用β=0.04，我们用3x β，相应扩大目标范围以适应强约束
-        # Fairness和Hallucination统一目标（多任务共享模型）
-        self.target_kl_f_min = 0.01   # 下界：提高至0.01，避免过度保守
-        self.target_kl_f_max = 0.15   # 上界：扩大至0.15，配合更强β留出适应空间
-        self.target_kl_h_min = 0.01   # 统一范围（简化调试）
-        self.target_kl_h_max = 0.15   # 统一范围
+        # 【标准GRPO KL目标】基于真实前向KL（非平方近似）
+        # 参考研究结论：
+        # - 真·前向KL的合理目标：0.02-0.05 per-token（对应 δ_rms ≈ 0.14-0.32）
+        # - PPO论文的自适应KL：dtarg ∈ {0.003, 0.01, 0.03}（反向KL口径）
+        # - DeepSeekMath：β=0.04（无显式target_kl）
+        # 我们用3x β（0.15/0.30），目标范围设为保守带
+        self.target_kl_f_min = 0.02   # 下界：避免过度保守，允许适度探索
+        self.target_kl_f_max = 0.05   # 上界：标准GRPO保守带，对应 δ_rms ≈ 0.32
+        self.target_kl_h_min = 0.02   # 统一范围（多任务共享模型）
+        self.target_kl_h_max = 0.05   # 统一范围
 
         self.adjustment_log = []
 
