@@ -195,7 +195,7 @@ class Config:
 
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
-    GRPO_LR = 2e-6          # 【紧急修复】从5e-6降到2e-6，模型变化太快导致KL发散
+    GRPO_LR = 1e-6          # 【方案A】从5e-6→2e-6→1e-6，极度保守防止KL发散
     GRPO_BATCH_SIZE = 2     # 【显存优化】降到2，Reward-only CAGrad需要4次反传（显存×2）
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
@@ -219,7 +219,7 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.25       # 【紧急修复】从0.3降到0.25，实测KL仍在上升
+    TEMPERATURE_TRAIN = 0.3        # 【方案B】保持0.3，配合极低LR=1e-6，先不降到0.2
     TOP_K_TRAIN = 20               # 【进一步降低】从25→20
     TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
