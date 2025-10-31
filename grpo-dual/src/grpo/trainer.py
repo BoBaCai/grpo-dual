@@ -200,10 +200,10 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 0.01              # 【熵正则化】防止熵塌陷，鼓励探索（loss -= entropy_coef * entropy）
+    ENTROPY_COEF = 0.05              # 【紧急增强】从0.01提高到0.05，0.01太弱无法对抗熵塌陷
 
     # Reward Scale（多目标平衡）
-    FAIRNESS_REWARD_SCALE = 0.5      # 【Reward Scale】降低50%，解决Fairness信号过强（诊断显示F/H=2.3-7.6倍）
+    FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
     HALLUCINATION_REWARD_SCALE = 1.0 # Hallucination保持不变
 
     # LoRA
@@ -224,7 +224,7 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.25       # 【降低】从0.3→0.25，减少随机性以缓解熵塌陷
+    TEMPERATURE_TRAIN = 0.4        # 【紧急修正】从0.25提高到0.4，低温导致熵塌陷恶化！需要更多探索
     TOP_K_TRAIN = 20               # 【进一步降低】从25→20
     TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
