@@ -2348,6 +2348,59 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
         t_adv = _t.time() - t_adv0
 
+        # 【优先级C：Reward统计监控】分析Fairness vs Hallucination的reward分布和信号强度
+        if step < 20:
+            fairness_indices_all = [i for i, task in enumerate(task_list) if task == "fairness"]
+            halu_indices_all = [i for i, task in enumerate(task_list) if task == "hallucination"]
+
+            if len(fairness_indices_all) > 0 and len(halu_indices_all) > 0:
+                # 使用归一化前的reward进行分析（更能反映原始scale）
+                f_rewards = rewards_before_norm[fairness_indices_all]
+                h_rewards = rewards_before_norm[halu_indices_all]
+
+                # 使用归一化后的reward和advantage计算梯度信号强度
+                f_rewards_norm = rewards[fairness_indices_all]
+                h_rewards_norm = rewards[halu_indices_all]
+                f_adv = adv[fairness_indices_all]
+                h_adv = adv[halu_indices_all]
+
+                # 梯度信号强度 = |reward| × |advantage|（决定了实际的梯度大小）
+                f_signal = (f_rewards_norm.abs() * f_adv.abs()).mean().item()
+                h_signal = (h_rewards_norm.abs() * h_adv.abs()).mean().item()
+
+                print(f"\n{'='*70}")
+                print(f"[Reward Scale诊断@step{step+1}]")
+                print(f"{'='*70}")
+                print(f"样本分布: Fairness={len(fairness_indices_all)}, Hallucination={len(halu_indices_all)}")
+                print(f"\nReward统计（归一化前，原始scale）:")
+                print(f"  Fairness:      mean={f_rewards.mean().item():+.3f}, std={f_rewards.std().item():.3f}, range=[{f_rewards.min().item():+.3f}, {f_rewards.max().item():+.3f}]")
+                print(f"  Hallucination: mean={h_rewards.mean().item():+.3f}, std={h_rewards.std().item():.3f}, range=[{h_rewards.min().item():+.3f}, {h_rewards.max().item():+.3f}]")
+                print(f"  Reward均值比例 (F/H): {f_rewards.mean().item() / (h_rewards.mean().item() + 1e-6):.2f}")
+
+                print(f"\n梯度信号强度（|reward_norm| × |advantage|）:")
+                print(f"  Fairness signal:      {f_signal:.4f}")
+                print(f"  Hallucination signal: {h_signal:.4f}")
+                print(f"  信号强度比例 (F/H):    {f_signal / (h_signal + 1e-6):.2f}")
+
+                # 判断和建议
+                ratio = f_signal / (h_signal + 1e-6)
+                if ratio > 3.0:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 严重失衡！")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.3 (降低70%)")
+                elif ratio > 2.0:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 中度失衡")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.5 (降低50%)")
+                elif ratio > 1.5:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 轻度失衡")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.7 (降低30%)")
+                elif ratio < 0.67:  # 1/1.5
+                    print(f"\n  ⚠️  Fairness信号强度低于Hallucination - 可能需要提升")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 1.5 (提升50%)")
+                else:
+                    print(f"\n  ✓ 两个任务的信号强度基本平衡（比例{ratio:.2f}在0.67-1.5之间）")
+
+                print(f"{'='*70}\n")
+
         # ——MU_UPDATES（old_lp 快照一次；每次仅重算 cur_lp）——
         t_mu0 = _t.time()
         # 先用当前模型快照 old_lp（no_grad）
