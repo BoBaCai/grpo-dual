@@ -200,7 +200,7 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 0.05              # 【紧急增强】从0.01提高到0.05，0.01太弱无法对抗熵塌陷
+    ENTROPY_COEF = 0.2               # 【超强增强】从0.05→0.2，诊断显示logits极度尖锐(gap=5-11, max_prob≈1.0)
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -224,7 +224,7 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.4        # 【紧急修正】从0.25提高到0.4，低温导致熵塌陷恶化！需要更多探索
+    TEMPERATURE_TRAIN = 1.0        # 【极端修正】从0.4→1.0，诊断显示temp=0.4无法软化gap=7的logits
     TOP_K_TRAIN = 20               # 【进一步降低】从25→20
     TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
@@ -1573,6 +1573,25 @@ class ParetoFrontier:
 # =============================================================================
 from transformers import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
+class LogitsClippingProcessor(torch.nn.Module):
+    """
+    Logits裁剪处理器：限制logits范围，防止极度尖锐的分布
+    当logits差距太大时（如gap>10），即使高温也无法软化
+    """
+    def __init__(self, max_value=15.0):
+        super().__init__()
+        self.max_value = max_value
+
+    def forward(self, input_ids, scores):
+        # 中心化：减去最大值（数值稳定性）
+        scores = scores - scores.max(dim=-1, keepdim=True).values
+
+        # 裁剪到 [-max_value, 0] 范围
+        # 这限制了最大gap=max_value
+        scores = scores.clamp(min=-self.max_value, max=0.0)
+
+        return scores
+
 class DebugLogitsProcessor(torch.nn.Module):
     """
     调试处理器：打印logits分布信息，帮助诊断温度是否生效
@@ -1606,9 +1625,9 @@ class DebugLogitsProcessor(torch.nn.Module):
 
                 print(f"\n🔍 [Step {self.step_counter[0]}] Logits Distribution Debug:")
                 print(f"   Temperature: {self.temperature}")
-                print(f"   Max logit: {max_logit:.3f}")
-                print(f"   Gap (1st-2nd): {logit_gap:.3f}")
-                print(f"   Top-5 probs: {top5_probs.cpu().numpy()}")
+                print(f"   Max logit (before clip): {max_logit:.3f}")
+                print(f"   Gap (1st-2nd, before clip): {logit_gap:.3f}")
+                print(f"   Top-5 probs (after clip+temp): {top5_probs.cpu().numpy()}")
                 print(f"   Max prob: {top5_probs[0].item():.6f}")
 
                 self.has_printed = True
@@ -1657,10 +1676,14 @@ def build_safe_logits_processors(step_counter=None):
     【修复】只添加自定义 processor（Penalty + Sanity）
     Temperature/TopK/TopP 直接传给 generate()，避免警告
     【调试】添加 DebugLogitsProcessor 来诊断温度问题
+    【紧急修复】添加 LogitsClippingProcessor 防止logits过度尖锐
     """
     lp = LogitsProcessorList()
 
-    # 添加调试处理器（仅在前20步）
+    # 🔧 先裁剪logits，防止gap过大（诊断显示gap=5-11）
+    lp.append(LogitsClippingProcessor(max_value=15.0))
+
+    # 添加调试处理器（仅在前20步，需在clip之后）
     if step_counter is not None:
         lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter))
 
