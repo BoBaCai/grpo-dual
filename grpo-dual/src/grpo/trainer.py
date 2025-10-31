@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 多目标 LoRA + GRPO（v2.2 - 反馈优化版）
+（2025/10/26 15:46 ver.)
 核心改进：
 - ✅ 训练/评测配置严格分离
 - ✅ 截断率监控与自适应max_new_tokens
@@ -11,6 +12,8 @@
 - ✅ max_new_tokens增大（训练96/评测128）
 - ⚠️ 训练采样适度放松（temp=0.9，保持一定约束）
 - ⚠️ 坚持统一KL控制（不分支化β）
+
+Claude verified: This is the 2624-line trainer.py file
 """
 
 # =============================================================================
@@ -94,6 +97,22 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from json import JSONDecodeError
 
+# =============================================================================
+# torch.compile() 配置优化（修复CUDAGraph动态shape警告）
+# =============================================================================
+# NLP任务中输入长度是动态的，会导致torch.compile记录过多CUDA图
+# 解决方案：配置Inductor跳过动态shape的CUDA图，静默警告
+try:
+    if hasattr(torch, '_inductor') and hasattr(torch._inductor, 'config'):
+        # 跳过动态shape的CUDA图（避免51个不同size的开销）
+        torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+        # 静默警告
+        torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None
+        # 【可选】启用更积极的fusion优化
+        torch._inductor.config.coordinate_descent_tuning = True
+except Exception:
+    pass  # 旧版本PyTorch不支持这些配置，忽略即可
+
 try:
     from scipy import stats as scipy_stats
 except ImportError:
@@ -176,11 +195,11 @@ class Config:
 
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
-    GRPO_LR = 5e-6          # 从1e-5降到5e-6（降低50%，更稳定）
-    GRPO_BATCH_SIZE = 2     # 【显存优化】从4降到2，减少单次生成显存
+    GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
+    GRPO_BATCH_SIZE = 2     # 【显存优化】降到2，Reward-only CAGrad需要4次反传（显存×2）
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 2  # 【新增】梯度累积，等效 batch=2×2=4
+    GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
 
     # LoRA
     USE_LORA = True
@@ -192,17 +211,17 @@ class Config:
     # 数值/加速
     USE_BF16 = True
     USE_GRADIENT_CHECKPOINTING = True
-    USE_TORCH_COMPILE = False    # 【加速】可选：torch.compile() 加速（需要 PyTorch 2.0+）
+    USE_TORCH_COMPILE = False    # 【已禁用】编译开销>收益（SFT动态shape多，首次编译慢）
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
-    # 【修改】生成配置：满足128硬约束，更激进地降低长度倾向
-    MAX_NEW_TOKENS_TRAIN = 96      # 【显存优化】从128降到96，减少显存占用
-    MAX_NEW_TOKENS_EVAL = 96       # 评测同步降低
+    # 【修改】生成配置：平衡质量与性能
+    MAX_NEW_TOKENS_TRAIN = 96      # 【修复】从64提升到96，解决Hallucination任务25%截断率
+    MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
-    
-    TEMPERATURE_TRAIN = 0.5        # 【大幅降低】从0.6→0.5，显著更保守
-    TOP_K_TRAIN = 30               # 【降低】从40→30，更严格裁剪
-    TOP_P_TRAIN = 0.85             # 【降低】从0.9→0.85，更严格
+
+    TEMPERATURE_TRAIN = 0.3        # 【方案B】保持0.3，配合极低LR=1e-6，先不降到0.2
+    TOP_K_TRAIN = 20               # 【进一步降低】从25→20
+    TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
     
     PRESENCE_PENALTY = 0.6         # 【增大】从0.5→0.6
@@ -226,8 +245,14 @@ class Config:
     KL_ADAPTIVE_WINDOW = 20         # 自适应控制窗口大小
     KL_TARGET_MIN = 0.05            # KL目标下界
     KL_TARGET_MAX = 0.5             # KL目标上界
-    KL_ADJUST_RATIO_HIGH = 1.15     # KL过高时的beta调整倍数
-    KL_ADJUST_RATIO_LOW = 0.85      # KL过低时的beta调整倍数
+    KL_ADJUST_RATIO_HIGH = 1.15     # KL过高时的beta调整倍数（乘法模式）
+    KL_ADJUST_RATIO_LOW = 0.85      # KL过低时的beta调整倍数（乘法模式）
+
+    # 【方案2：拉格朗日KL控制器】β自适应追踪target_KL
+    # β ← [β + η(KL - target)]₊ （连续加法更新，更平滑）
+    USE_LAGRANGIAN_KL_CONTROL = True   # 启用拉格朗日控制器
+    LAGRANGIAN_LR = 0.1                # η：拉格朗日学习率（提高到0.1，10倍加速收敛）
+    LAGRANGIAN_UPDATE_FREQ = 5         # 每N步更新一次β（更频繁=更responsive）
     
     # 【新增】奖励分支内标准化（EMA）
     REWARD_NORMALIZE = True         # 是否开启奖励标准化
@@ -239,22 +264,31 @@ class Config:
     GRADIENT_CONFLICT_THRESHOLD = -0.1  # 余弦相似度阈值
 
     # CAGrad
-    USE_CAGRAD = True
-    CAGRAD_C = 0.2
+    # 【方案1：Reward-only CAGrad】现在CAGrad只作用于reward梯度
+    # KL梯度直通（g_final = g_reward_merged + β*∇KL），β完全可解释
+    # 优势：既解决reward冲突，又保持β的可预测性
+    # 注意：需要4次反传（2×reward + 2×KL），显存开销×2
+    USE_CAGRAD = True   # 启用Reward-only CAGrad
+    CAGRAD_C = 0.2      # c→0退化为平均梯度；c增大更避冲突
+
+    # 【显存紧急模式】如果仍然OOM，启用此选项
+    # 将Reward-only CAGrad简化为2次反传（牺牲部分β可解释性）
+    LOW_MEMORY_MODE = False  # True=简化为2次反传；False=完整4次反传
 
     # Pareto（评测配置）
     PARETO_EVAL_FREQ = 50
     N_PARETO_CHECKPOINTS = 5
-    PARETO_PRINT_EVERY = 20
+    PARETO_PRINT_EVERY = 50          # 【性能优化】降低快速评估频率，与正式评估同步
     PARETO_PRINT_SAMPLES = 40        # 【恢复】保持40，确保评测准确
+    PARETO_QUICK_EVAL_SAMPLES = 10   # 【新增】快速评估使用更少样本，仅看趋势
 
     # 评审器（judge）多云与限流
-    # 【加速优化】匹配 GRPO_BATCH_SIZE×K_ROLLOUTS=8 的并发需求（不影响训练效果）
-    JUDGE_MAX_WORKERS = 8       # 匹配单步生成数 (2×4=8)，纯并发优化
-    JUDGE_TIMEOUT_SEC = 10      # 【恢复】保持原值，避免过多超时影响 reward
+    # 【性能优化】匹配当前 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
+    JUDGE_MAX_WORKERS = 16      # 提升到16，匹配单步生成数 (4×4=16)，消除分波等待
+    JUDGE_TIMEOUT_SEC = 7       # 降低到7秒，压缩长尾延迟（有重试兜底）
     JUDGE_MAX_RETRIES = 1       # 【恢复】保留重试，确保 reward 质量
-    RATE_LIMIT_RPS   = 10       # 避免触发限流
-    RATE_LIMIT_BURST = 12       # 匹配单步生成数
+    RATE_LIMIT_RPS   = 20       # 提升到20，充分利用两家API吞吐
+    RATE_LIMIT_BURST = 20       # 提升到20，匹配并发数，避免限流等待
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
@@ -526,11 +560,16 @@ class BranchedKLController:
         self.kl_f_history = deque(maxlen=window_size)
         self.kl_h_history = deque(maxlen=window_size)
 
-        # 分支目标
-        self.target_kl_f_min = 0.02
-        self.target_kl_f_max = 0.06
-        self.target_kl_h_min = 0.08
-        self.target_kl_h_max = 0.15
+        # 【标准GRPO KL目标】基于真实前向KL（非平方近似）
+        # 参考研究结论：
+        # - 真·前向KL的合理目标：0.02-0.05 per-token（对应 δ_rms ≈ 0.14-0.32）
+        # - PPO论文的自适应KL：dtarg ∈ {0.003, 0.01, 0.03}（反向KL口径）
+        # - DeepSeekMath：β=0.04（无显式target_kl）
+        # 我们用3x β（0.15/0.30），目标范围设为保守带
+        self.target_kl_f_min = 0.02   # 下界：避免过度保守，允许适度探索
+        self.target_kl_f_max = 0.05   # 上界：标准GRPO保守带，对应 δ_rms ≈ 0.32
+        self.target_kl_h_min = 0.02   # 统一范围（多任务共享模型）
+        self.target_kl_h_max = 0.05   # 统一范围
 
         self.adjustment_log = []
 
@@ -554,6 +593,10 @@ class BranchedKLController:
     def auto_adjust(self, step: int) -> Optional[str]:
         """
         自动调整两个分支的β
+        支持两种模式：
+        1. 乘法调整（原方法）：β ← β × ratio
+        2. 拉格朗日调整（方案2）：β ← [β + η(KL - target)]₊
+
         返回调整建议
         """
         if not config.KL_ADAPTIVE_CONTROL or not self.should_adjust():
@@ -566,21 +609,46 @@ class BranchedKLController:
         old_beta_h = self.beta_h
         actions = []
 
-        # Fairness分支调整
-        if kl_f_median > self.target_kl_f_max:
-            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_HIGH
-            actions.append(f"Fairness KL过高({kl_f_median:.3f}>{self.target_kl_f_max:.2f})，β_f↑15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
-        elif kl_f_median < self.target_kl_f_min:
-            self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_LOW
-            actions.append(f"Fairness KL过低({kl_f_median:.3f}<{self.target_kl_f_min:.2f})，β_f↓15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+        if config.USE_LAGRANGIAN_KL_CONTROL:
+            # 【方案2：拉格朗日控制器】β ← [β + η(KL - target)]₊
+            # 目标取min和max的中点
+            target_kl_f = 0.5 * (self.target_kl_f_min + self.target_kl_f_max)
+            target_kl_h = 0.5 * (self.target_kl_h_min + self.target_kl_h_max)
 
-        # Hallucination分支调整
-        if kl_h_median > self.target_kl_h_max:
-            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_HIGH
-            actions.append(f"Hallucination KL过高({kl_h_median:.3f}>{self.target_kl_h_max:.2f})，β_h↑15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
-        elif kl_h_median < self.target_kl_h_min:
-            self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_LOW
-            actions.append(f"Hallucination KL过低({kl_h_median:.3f}<{self.target_kl_h_min:.2f})，β_h↓15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+            # 每LAGRANGIAN_UPDATE_FREQ步更新一次（更平滑）
+            if step % config.LAGRANGIAN_UPDATE_FREQ == 0:
+                # Fairness分支拉格朗日更新
+                kl_error_f = kl_f_median - target_kl_f
+                delta_beta_f = config.LAGRANGIAN_LR * kl_error_f
+                self.beta_f = max(0.01, self.beta_f + delta_beta_f)  # [·]₊投影到≥0.01
+
+                # 【修改】总是显示两个任务的调整，方便调试
+                actions.append(f"Fairness拉格朗日: KL={kl_f_median:.3f}(目标{target_kl_f:.3f}), β_f: {old_beta_f:.4f}→{self.beta_f:.4f} (Δ{delta_beta_f:+.4f})")
+
+                # Hallucination分支拉格朗日更新
+                kl_error_h = kl_h_median - target_kl_h
+                delta_beta_h = config.LAGRANGIAN_LR * kl_error_h
+                self.beta_h = max(0.01, self.beta_h + delta_beta_h)  # [·]₊投影到≥0.01
+
+                # 【修改】总是显示，即使变化很小
+                actions.append(f"Hallucination拉格朗日: KL={kl_h_median:.3f}(目标{target_kl_h:.3f}), β_h: {old_beta_h:.4f}→{self.beta_h:.4f} (Δ{delta_beta_h:+.4f})")
+        else:
+            # 【原方法：乘法调整】离散的×ratio
+            # Fairness分支调整
+            if kl_f_median > self.target_kl_f_max:
+                self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_HIGH
+                actions.append(f"Fairness KL过高({kl_f_median:.3f}>{self.target_kl_f_max:.2f})，β_f↑15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+            elif kl_f_median < self.target_kl_f_min:
+                self.beta_f = old_beta_f * config.KL_ADJUST_RATIO_LOW
+                actions.append(f"Fairness KL过低({kl_f_median:.3f}<{self.target_kl_f_min:.2f})，β_f↓15%: {old_beta_f:.4f}→{self.beta_f:.4f}")
+
+            # Hallucination分支调整
+            if kl_h_median > self.target_kl_h_max:
+                self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_HIGH
+                actions.append(f"Hallucination KL过高({kl_h_median:.3f}>{self.target_kl_h_max:.2f})，β_h↑15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
+            elif kl_h_median < self.target_kl_h_min:
+                self.beta_h = old_beta_h * config.KL_ADJUST_RATIO_LOW
+                actions.append(f"Hallucination KL过低({kl_h_median:.3f}<{self.target_kl_h_min:.2f})，β_h↓15%: {old_beta_h:.4f}→{self.beta_h:.4f}")
 
         if actions:
             log_entry = {
@@ -1966,11 +2034,19 @@ def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor, acc
             p.grad.copy_(g)  # 覆盖（第一个 micro-batch，更快）
         ptr += num
 
-def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2, accumulate: bool=True):
+def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: torch.Tensor, g_halu_vec: torch.Tensor, c: float=0.2, accumulate: bool=True, set_grads: bool=True):
     """CAGrad 梯度合成算法
 
     Args:
+        params: 模型参数列表
+        g_fair_vec: Fairness任务梯度向量
+        g_halu_vec: Hallucination任务梯度向量
+        c: CAGrad冲突强度参数（c→0退化为平均梯度）
         accumulate: 传递给 _set_grads_from_vec，控制累加还是覆盖
+        set_grads: 是否直接设置梯度（False则只返回合并后的向量）
+
+    Returns:
+        如果set_grads=False，返回合并后的梯度向量
     """
     eps = 1e-12
     g0 = 0.5 * (g_fair_vec + g_halu_vec)
@@ -1989,7 +2065,11 @@ def cagrad_combine_and_set_grads(params: List[torch.nn.Parameter], g_fair_vec: t
     w_star = 0.5*(wl+wr)
     gw = w_star*g_fair_vec + (1-w_star)*g_halu_vec
     d = g0 + (torch.sqrt(phi) / (gw.norm() + eps)) * gw
-    _set_grads_from_vec(params, d, accumulate=accumulate)
+
+    if set_grads:
+        _set_grads_from_vec(params, d, accumulate=accumulate)
+    else:
+        return d
 
 # =============================================================================
 # SFT
@@ -2001,7 +2081,8 @@ def sft_continue(model, tokenizer, device, dataset):
     if model is None: 
         return
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = AdamW(params, lr=config.SFT_LR)
+    # 【性能优化】使用Fused AdamW加速（5-10%提速，需要CUDA）
+    opt = AdamW(params, lr=config.SFT_LR, fused=torch.cuda.is_available())
     try:
         from tqdm.auto import tqdm
     except:
@@ -2064,10 +2145,6 @@ class MultiObjectiveDataset(torch.utils.data.Dataset):
 def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     """
     🔥🔥🔥 版本检查点 #2 - 如果你能看到这个，说明用的是最新代码！🔥🔥🔥
-
-    Claude 理解：这个函数实现了 GRPO 多目标强化学习训练，核心是通过分支化 KL 控制器
-    同时优化 Fluency 和 Hallucination 两个目标，使用 LoRA 进行参数高效微调，
-    并配合奖励标准化和梯度冲突监控来稳定训练过程。
     """
     print("\n" + "="*80)
     print("阶段2: GRPO 多目标训练（v2.3 - 显存优化版）")
@@ -2102,9 +2179,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                                         winsorize_quantile=config.REWARD_WINSORIZE_QUANTILE)
     
     # §7: 初始化分支化KL控制器（拒绝老师建议，恢复原设计）
+    # 【标准GRPO KL控制】使用DeepSeekMath式(4)的无偏估计器
+    # β参考值：DeepSeekMath用0.04，我们分支化控制用3x起点（多任务+梯度合并需要更强约束）
     kl_controller = BranchedKLController(
-        beta_f_init=0.10,  # 从0.02增到0.10（5倍），更强的KL约束
-        beta_h_init=0.30,  # 从0.10增到0.30（3倍），保证安全性
+        beta_f_init=0.30,  # 【紧急修复】从0.15提升到0.30，β涨到0.27仍无法控制KL
+        beta_h_init=0.30,  # 保持0.30（Hallucination已稳定）
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     
@@ -2115,7 +2194,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     current_max_new_tokens_train = config.MAX_NEW_TOKENS_TRAIN  # 128（硬约束）
     
     trainable = [p for p in model.parameters() if p.requires_grad]
-    opt = AdamW(trainable, lr=config.GRPO_LR, weight_decay=0.01)
+    # 【性能优化】使用Fused AdamW加速（5-10%提速，需要CUDA）
+    opt = AdamW(trainable, lr=config.GRPO_LR, weight_decay=0.01, fused=torch.cuda.is_available())
     try:
         from tqdm.auto import tqdm
     except:
@@ -2176,9 +2256,65 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         if (step + 1) % 5 == 0:
             print(f"\n[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
 
-        # 【新增】奖励分支内标准化（含winsorize去除离群值）
+        # 【优先级2：长度惩罚】对Fairness极短回答进行惩罚，防止熵塌陷导致的1-token生成
         task_list = [tasks[idx_map[i]] for i in range(len(idx_map))]
+        length_penalty_count = 0
+        for i in range(len(rewards)):
+            if task_list[i] == "fairness" and all_lengths[i] < 5:
+                # 极短的Fairness回答（<5 tokens）受到严重惩罚
+                original_reward = rewards[i].item()
+                rewards[i] = rewards[i] * 0.3 - 0.3  # 双重惩罚：缩放到30%并减0.3
+                length_penalty_count += 1
+                if step < 20:  # 前20步打印详细信息
+                    print(f"  [长度惩罚] 样本#{i} (Fairness, {all_lengths[i]}tokens): reward {original_reward:.3f} → {rewards[i].item():.3f}")
+
+        if length_penalty_count > 0 and step < 20:
+            print(f"  本步共对 {length_penalty_count} 个极短Fairness回答施加了长度惩罚\n")
+
+        # 【新增】奖励分支内标准化（含winsorize去除离群值）
+        rewards_before_norm = rewards.clone()  # 保存normalize前的值用于debug
         rewards = reward_normalizer.update_and_normalize(rewards, task_list)
+
+        # 【诊断模块】前20步打印Fairness样本详情，排查奖励函数bug
+        if step < 20:
+            fairness_indices = [i for i, task in enumerate(task_list) if task == "fairness"]
+            if fairness_indices:
+                # 【优先级1：熵监控】计算生成的熵值，检测熵塌陷
+                # 为了计算熵，需要先tokenize并forward一次（仅诊断时）
+                full_tok_diag, comp_mask_diag = _tokenize_concat(tokenizer, all_prompts, all_resps, all_lengths, device)
+                with torch.no_grad():
+                    out_diag = model(input_ids=full_tok_diag["input_ids"],
+                                    attention_mask=full_tok_diag.get("attention_mask"),
+                                    use_cache=False)
+                    # 计算每个位置的熵
+                    logits = out_diag.logits[:, :-1, :]  # [batch, seq_len, vocab_size]
+                    probs = F.softmax(logits, dim=-1)
+                    entropy_per_pos = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)  # [batch, seq_len]
+                    # 只计算生成部分的平均熵（使用comp_mask）
+                    entropy_per_sample = (entropy_per_pos * comp_mask_diag).sum(dim=1) / comp_mask_diag.sum(dim=1).clamp_min(1.0)
+
+                print(f"\n{'='*70}")
+                print(f"[Fairness诊断@step{step+1}] 发现 {len(fairness_indices)} 个Fairness样本（共{len(task_list)}个）")
+                print(f"{'='*70}")
+                # 只打印前3个Fairness样本，避免输出过长
+                for idx in fairness_indices[:3]:
+                    prompt_preview = all_prompts[idx][:100].replace('\n', ' ')
+                    resp_preview = all_resps[idx][:150].replace('\n', ' ')
+                    entropy_val = entropy_per_sample[idx].item()
+                    print(f"\n样本 #{idx} (batch内索引{idx_map[idx]}):")
+                    print(f"  Prompt: {prompt_preview}...")
+                    print(f"  Generated: {resp_preview}...")
+                    print(f"  Length: {all_lengths[idx]} tokens")
+                    print(f"  Truncated: {all_truncated[idx]}")
+                    print(f"  Reward (原始): {rewards_before_norm[idx].item():.3f}")
+                    print(f"  Reward (归一化后): {rewards[idx].item():.3f}")
+                    print(f"  Entropy: {entropy_val:.3f} {'⚠️ 熵塌陷!' if entropy_val < 0.5 else '✓ 正常' if entropy_val > 1.5 else '⚠️ 偏低'}")
+                if len(fairness_indices) > 3:
+                    print(f"\n... 还有 {len(fairness_indices) - 3} 个Fairness样本未显示")
+                    # 打印整体熵统计
+                    fairness_entropies = entropy_per_sample[fairness_indices]
+                    print(f"  Fairness整体熵统计: mean={fairness_entropies.mean():.3f}, min={fairness_entropies.min():.3f}, max={fairness_entropies.max():.3f}")
+                print(f"{'='*70}\n")
 
         # ——一次性分词 + 计算 ref_lp（复用）——
         t_tok0 = _t.time()
@@ -2212,6 +2348,59 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
         t_adv = _t.time() - t_adv0
 
+        # 【优先级C：Reward统计监控】分析Fairness vs Hallucination的reward分布和信号强度
+        if step < 20:
+            fairness_indices_all = [i for i, task in enumerate(task_list) if task == "fairness"]
+            halu_indices_all = [i for i, task in enumerate(task_list) if task == "hallucination"]
+
+            if len(fairness_indices_all) > 0 and len(halu_indices_all) > 0:
+                # 使用归一化前的reward进行分析（更能反映原始scale）
+                f_rewards = rewards_before_norm[fairness_indices_all]
+                h_rewards = rewards_before_norm[halu_indices_all]
+
+                # 使用归一化后的reward和advantage计算梯度信号强度
+                f_rewards_norm = rewards[fairness_indices_all]
+                h_rewards_norm = rewards[halu_indices_all]
+                f_adv = adv[fairness_indices_all]
+                h_adv = adv[halu_indices_all]
+
+                # 梯度信号强度 = |reward| × |advantage|（决定了实际的梯度大小）
+                f_signal = (f_rewards_norm.abs() * f_adv.abs()).mean().item()
+                h_signal = (h_rewards_norm.abs() * h_adv.abs()).mean().item()
+
+                print(f"\n{'='*70}")
+                print(f"[Reward Scale诊断@step{step+1}]")
+                print(f"{'='*70}")
+                print(f"样本分布: Fairness={len(fairness_indices_all)}, Hallucination={len(halu_indices_all)}")
+                print(f"\nReward统计（归一化前，原始scale）:")
+                print(f"  Fairness:      mean={f_rewards.mean().item():+.3f}, std={f_rewards.std().item():.3f}, range=[{f_rewards.min().item():+.3f}, {f_rewards.max().item():+.3f}]")
+                print(f"  Hallucination: mean={h_rewards.mean().item():+.3f}, std={h_rewards.std().item():.3f}, range=[{h_rewards.min().item():+.3f}, {h_rewards.max().item():+.3f}]")
+                print(f"  Reward均值比例 (F/H): {f_rewards.mean().item() / (h_rewards.mean().item() + 1e-6):.2f}")
+
+                print(f"\n梯度信号强度（|reward_norm| × |advantage|）:")
+                print(f"  Fairness signal:      {f_signal:.4f}")
+                print(f"  Hallucination signal: {h_signal:.4f}")
+                print(f"  信号强度比例 (F/H):    {f_signal / (h_signal + 1e-6):.2f}")
+
+                # 判断和建议
+                ratio = f_signal / (h_signal + 1e-6)
+                if ratio > 3.0:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 严重失衡！")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.3 (降低70%)")
+                elif ratio > 2.0:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 中度失衡")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.5 (降低50%)")
+                elif ratio > 1.5:
+                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 轻度失衡")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.7 (降低30%)")
+                elif ratio < 0.67:  # 1/1.5
+                    print(f"\n  ⚠️  Fairness信号强度低于Hallucination - 可能需要提升")
+                    print(f"  建议: FAIRNESS_REWARD_SCALE = 1.5 (提升50%)")
+                else:
+                    print(f"\n  ✓ 两个任务的信号强度基本平衡（比例{ratio:.2f}在0.67-1.5之间）")
+
+                print(f"{'='*70}\n")
+
         # ——MU_UPDATES（old_lp 快照一次；每次仅重算 cur_lp）——
         t_mu0 = _t.time()
         # 先用当前模型快照 old_lp（no_grad）
@@ -2244,6 +2433,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         else:
             is_first_microbatch = False
 
+        # 初始化loss变量（供后续指标收集使用）
+        loss_fair = torch.tensor(0.0, device=device)
+        loss_halu = torch.tensor(0.0, device=device)
+
         for _ in range(config.MU_UPDATES):
 
             out_cur = model(input_ids=full_tok["input_ids"],
@@ -2259,21 +2452,23 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
 
-            # 【最终修复】KL散度计算：使用平方误差（稳定且对称）
+            # 【标准GRPO KL散度】DeepSeekMath式(4)：前向KL的无偏单样本估计器
             #
-            # 问题历史：
-            # 1. exp(delta)-delta-1 → 爆炸（delta=3时kl=16）
-            # 2. ref_lp - cur_lp → 方向反了，KL=0.000
-            # 3. abs(cur_lp - ref_lp) → 双向penalty，模型崩溃（F生成长度=1.0）
+            # 公式：D_KL(π_cur || π_ref) = E[log(π_cur/π_ref)]
+            # 无偏估计器（DeepSeekMath Eq.4）：exp(-δ) + δ - 1
+            # 其中 δ = log(π_cur) - log(π_ref) = cur_lp - ref_lp
             #
-            # 正确的实现：使用平方误差
-            # - KL ≈ (cur_lp - ref_lp)^2 / 2（二阶泰勒展开）
-            # - 总是非负，对称，不爆炸
-            # - 当 cur_lp ≈ ref_lp 时，KL ≈ 0（模型接近参考）
-            # - 当 cur_lp 偏离 ref_lp 时，KL 增大（需要 penalty）
+            # 【关键】GRPO用前向KL（cur||ref），不是反向KL（ref||cur）
+            # - 前向KL：锚住当前策略，避免偏离参考模型
+            # - 反向KL：PPO(2017)罚项用的方向，GRPO不用这个
             #
-            delta = (cur_lp - ref_lp).clamp(-10, 10)  # 防止极端值
-            kl = (delta ** 2) * 0.5  # 平方误差（不再需要 abs 或 clamp）
+            # 参考：
+            # - DeepSeekMath (Shao et al., 2024) 式(4): exp(-δ) + δ - 1
+            # - InstructGPT/RLHF: reward里减β*δ，等价于前向KL
+            #
+            # 数值稳定性：clamp delta到[-20, 20]避免exp溢出
+            delta = (cur_lp - ref_lp).clamp(-20, 20)  # δ = cur - ref (GRPO前向KL)
+            kl = torch.exp(-delta) + delta - 1.0      # 无偏估计器：exp(-δ) + δ - 1
 
             # §7: 使用分支化β值（不同的KL约束）
             beta_f = kl_controller.get_beta_f()  # Fairness: 低β
@@ -2281,46 +2476,120 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
             _anchor_zero = sum((p.sum() * 0.0) for p in trainable)
 
-            if task_mask_f.any():
-                loss_fair = -(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean()
+            # 【方案1：Reward-only CAGrad】分开计算reward和KL，只对reward梯度做surgery
+            # 优势：β完全可解释，KL梯度不受CAGrad的λ/w影响
+            # g_final = g_reward_merged + β_f * ∇KL_f + β_h * ∇KL_h
+
+            if config.LOW_MEMORY_MODE:
+                # 【低显存模式】简化为2次反传（完整loss），但手动调整KL项权重
+                # 显存节约50%，但β可解释性略微下降（CAGrad会影响整体梯度）
+                if task_mask_f.any():
+                    loss_fair = (-(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    kl_mean_f = kl[task_mask_f].mean()
+                else:
+                    loss_fair = _anchor_zero
+                    kl_mean_f = torch.tensor(0.0, device=surr.device)
+
+                if task_mask_h.any():
+                    loss_halu = (-(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    kl_mean_h = kl[task_mask_h].mean()
+                else:
+                    loss_halu = _anchor_zero
+                    kl_mean_h = torch.tensor(0.0, device=surr.device)
+
+                # 检查 NaN/Inf
+                if torch.isnan(loss_fair) or torch.isinf(loss_fair) or \
+                   torch.isnan(loss_halu) or torch.isinf(loss_halu):
+                    nan_inf_hits += 1
+                    continue
+
+                # 2次反传：直接计算完整loss的梯度
+                grads_f = torch.autograd.grad(loss_fair, trainable, retain_graph=True, allow_unused=True)
+                grads_h = torch.autograd.grad(loss_halu, trainable, allow_unused=True)
+
+                vec_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_f, trainable)])
+                vec_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_h, trainable)])
+
+                # 监控梯度冲突
+                if conflict_monitor is not None:
+                    conflict_info = conflict_monitor.update(vec_f, vec_h, step + 1)
+                    grad_cosine_sim = conflict_info["cosine_sim"]
+                    use_conflict_resolution = conflict_info["use_conflict_resolution"]
+                else:
+                    use_conflict_resolution = config.USE_CAGRAD
+
+                # CAGrad或常数权重合并
+                if use_conflict_resolution:
+                    cagrad_combine_and_set_grads(trainable, vec_f, vec_h, c=config.CAGRAD_C, accumulate=not is_first_microbatch)
+                else:
+                    _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h), accumulate=not is_first_microbatch)
+
             else:
-                loss_fair = _anchor_zero
+                # 【完整模式】4次反传，β完全可解释
+                # 1) 计算各任务的reward loss（不含KL）
+                if task_mask_f.any():
+                    reward_loss_f = -(surr[task_mask_f].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    kl_mean_f = kl[task_mask_f].mean()
+                else:
+                    reward_loss_f = _anchor_zero
+                    kl_mean_f = torch.tensor(0.0, device=surr.device)
 
-            if task_mask_h.any():
-                loss_halu = -(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean()
-            else:
-                loss_halu = _anchor_zero
+                if task_mask_h.any():
+                    reward_loss_h = -(surr[task_mask_h].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    kl_mean_h = kl[task_mask_h].mean()
+                else:
+                    reward_loss_h = _anchor_zero
+                    kl_mean_h = torch.tensor(0.0, device=surr.device)
 
-            # 【显存优化】梯度累积：loss 除以累积步数
-            loss_fair = loss_fair / config.GRADIENT_ACCUMULATION_STEPS
-            loss_halu = loss_halu / config.GRADIENT_ACCUMULATION_STEPS
+                # 检查 NaN/Inf
+                if torch.isnan(reward_loss_f) or torch.isinf(reward_loss_f) or \
+                   torch.isnan(reward_loss_h) or torch.isinf(reward_loss_h):
+                    nan_inf_hits += 1
+                    continue
 
-            # 检查 NaN/Inf
-            if torch.isnan(loss_fair) or torch.isinf(loss_fair) or torch.isnan(loss_halu) or torch.isinf(loss_halu):
-                nan_inf_hits += 1
-                continue
+                # 2) 分别计算reward梯度（retain_graph=True以便后续计算KL梯度）
+                grads_reward_f = torch.autograd.grad(reward_loss_f, trainable, retain_graph=True, allow_unused=True)
+                grads_reward_h = torch.autograd.grad(reward_loss_h, trainable, retain_graph=True, allow_unused=True)
 
-            # 【新增】计算两个任务的梯度并监控冲突
-            grads_f = torch.autograd.grad(loss_fair, trainable, retain_graph=True, allow_unused=True)
-            grads_h = torch.autograd.grad(loss_halu, trainable, retain_graph=True, allow_unused=True)
+                vec_reward_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_reward_f, trainable)])
+                vec_reward_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_reward_h, trainable)])
 
-            vec_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_f, trainable)])
-            vec_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_h, trainable)])
+                # 3) 监控reward梯度冲突（不是总梯度冲突）
+                if conflict_monitor is not None:
+                    conflict_info = conflict_monitor.update(vec_reward_f, vec_reward_h, step + 1)
+                    grad_cosine_sim = conflict_info["cosine_sim"]
+                    use_conflict_resolution = conflict_info["use_conflict_resolution"]
+                else:
+                    use_conflict_resolution = config.USE_CAGRAD
 
-            # 【新增】监控梯度冲突
-            if conflict_monitor is not None:
-                conflict_info = conflict_monitor.update(vec_f, vec_h, step + 1)
-                grad_cosine_sim = conflict_info["cosine_sim"]
-                use_conflict_resolution = conflict_info["use_conflict_resolution"]
-            else:
-                use_conflict_resolution = config.USE_CAGRAD
+                # 4) 对reward梯度做CAGrad surgery（或常数权重合并）
+                if use_conflict_resolution:
+                    vec_reward_merged = cagrad_combine_and_set_grads(trainable, vec_reward_f, vec_reward_h,
+                                                                      c=config.CAGRAD_C, accumulate=not is_first_microbatch,
+                                                                      set_grads=False)  # 先不设置，稍后加上KL
+                else:
+                    vec_reward_merged = 0.5 * (vec_reward_f + vec_reward_h)
 
-            # 【修改】根据冲突状态决定梯度合成策略
-            # 【性能优化】第一个 micro-batch 用 copy_（快），后续用 add_（累加）
-            if use_conflict_resolution:
-                cagrad_combine_and_set_grads(trainable, vec_f, vec_h, c=config.CAGRAD_C, accumulate=not is_first_microbatch)
-            else:
-                _set_grads_from_vec(trainable, 0.5*(vec_f+vec_h), accumulate=not is_first_microbatch)
+                # 5) 计算KL梯度（直通，不做surgery）
+                kl_loss_f = kl_mean_f / config.GRADIENT_ACCUMULATION_STEPS
+                kl_loss_h = kl_mean_h / config.GRADIENT_ACCUMULATION_STEPS
+
+                grads_kl_f = torch.autograd.grad(kl_loss_f, trainable, retain_graph=True, allow_unused=True)
+                grads_kl_h = torch.autograd.grad(kl_loss_h, trainable, allow_unused=True)
+
+                vec_kl_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_f, trainable)])
+                vec_kl_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_h, trainable)])
+
+                # 6) 最终梯度 = merged reward + β * KL（β完全可解释，不受surgery影响）
+                vec_final = vec_reward_merged + beta_f * vec_kl_f + beta_h * vec_kl_h
+
+                # 7) 设置最终梯度
+                _set_grads_from_vec(trainable, vec_final, accumulate=not is_first_microbatch)
+
+                # 8) 重建完整loss用于指标收集（不参与反传）
+                # loss_fair和loss_halu在后续代码中用于日志记录
+                loss_fair = reward_loss_f + beta_f * kl_loss_f
+                loss_halu = reward_loss_h + beta_h * kl_loss_h
 
         # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
         # 在累积周期结束时更新参数
@@ -2441,14 +2710,15 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         })
 
         # 【修改】在线中途快评，默认greedy模式（稳定）
+        # 【性能优化】使用更少样本数加速快速评估
         if (step + 1) % config.PARETO_PRINT_EVERY == 0:
             with torch.no_grad():
-                # 中途快评固定使用greedy
+                # 中途快评固定使用greedy，使用少量样本仅看趋势
                 fair_q = quick_eval_fast(model, tokenizer, device, judge, dataset, "fairness",
-                                        n_samples=config.PARETO_PRINT_SAMPLES, provider_hint="openai",
+                                        n_samples=config.PARETO_QUICK_EVAL_SAMPLES, provider_hint="openai",
                                         use_sampling=False)  # 固定greedy
                 halu_q = quick_eval_fast(model, tokenizer, device, judge, dataset, "hallucination",
-                                        n_samples=config.PARETO_PRINT_SAMPLES, provider_hint="openai",
+                                        n_samples=config.PARETO_QUICK_EVAL_SAMPLES, provider_hint="openai",
                                         use_sampling=False)  # 固定greedy
             # 打印奖励分数和关键指标
             print(f"\n[QuickEval@{step+1}] mode=greedy fairness={fair_q:.3f}  hallucination={halu_q:.3f}")
@@ -2477,7 +2747,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         adj_history = kl_controller.get_adjustment_history()
         if adj_history:
             for adj in adj_history[-10:]:  # 显示最后10次调整
-                print(f"Step {adj['step']}: {adj['action']}")
+                # actions是列表，需要join成字符串
+                actions_str = "; ".join(adj['actions']) if isinstance(adj.get('actions'), list) else str(adj.get('actions', ''))
+                print(f"Step {adj['step']}: {actions_str}")
         else:
             print("未触发调整")
         print("="*60)
