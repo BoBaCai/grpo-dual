@@ -1604,13 +1604,17 @@ class EOSSuppressionProcessor(torch.nn.Module):
 class LogitsClippingProcessor(torch.nn.Module):
     """
     Logits裁剪处理器：限制logits范围，防止极度尖锐的分布
-    当logits差距太大时（如gap>10），即使高温也无法软化
+    【暂时禁用】max_value=10导致固定max_prob≈0.1465（数学: p=1/(1+(V-1)*e^-C), V=128k, C=10）
     """
-    def __init__(self, max_value=10.0):  # 【降低】从15→10，因为15仍产生0.946 max_prob
+    def __init__(self, max_value=50.0):  # 【暂时禁用】从10→50，基本等于不裁剪
         super().__init__()
         self.max_value = max_value
+        self.enabled = False  # 【禁用】先关闭裁剪，观察真实分布
 
     def forward(self, input_ids, scores):
+        if not self.enabled:
+            return scores  # 禁用时直接返回
+
         # 中心化：减去最大值（数值稳定性）
         scores = scores - scores.max(dim=-1, keepdim=True).values
 
@@ -1624,10 +1628,11 @@ class DebugLogitsProcessor(torch.nn.Module):
     """
     调试处理器：打印logits分布信息，帮助诊断温度是否生效
     """
-    def __init__(self, temperature, step_counter):
+    def __init__(self, temperature, step_counter, label=""):
         super().__init__()
         self.temperature = temperature
         self.step_counter = step_counter
+        self.label = label  # "pre-clip" or "post-clip"
         self.has_printed = False
 
     def forward(self, input_ids, scores):
@@ -1651,11 +1656,11 @@ class DebugLogitsProcessor(torch.nn.Module):
                 sorted_logits, _ = torch.sort(sample_logits, descending=True)
                 logit_gap = (sorted_logits[0] - sorted_logits[1]).item()
 
-                print(f"\n🔍 [Step {self.step_counter[0]}] Logits Distribution Debug:")
+                print(f"\n🔍 [Step {self.step_counter[0]}] Logits Distribution Debug ({self.label}):")
                 print(f"   Temperature: {self.temperature}")
-                print(f"   Max logit (before clip): {max_logit:.3f}")
-                print(f"   Gap (1st-2nd, before clip): {logit_gap:.3f}")
-                print(f"   Top-5 probs (after clip+temp): {top5_probs.cpu().numpy()}")
+                print(f"   Max logit: {max_logit:.3f}")
+                print(f"   Gap (1st-2nd): {logit_gap:.3f}")
+                print(f"   Top-5 probs: {top5_probs.cpu().numpy()}")
                 print(f"   Max prob: {top5_probs[0].item():.6f}")
 
                 self.has_printed = True
@@ -1703,8 +1708,8 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     构建logits处理器列表
     【修复】只添加自定义 processor（Penalty + Sanity）
     Temperature/TopK/TopP 直接传给 generate()，避免警告
-    【调试】添加 DebugLogitsProcessor 来诊断温度问题
-    【紧急修复】添加 LogitsClippingProcessor 防止logits过度尖锐
+    【调试】在clip前后都打印，诊断真实分布
+    【暂时禁用clip】LogitsClipping导致固定max_prob=0.1465
     【强制约束】添加 EOSSuppressionProcessor 禁止过早EOS
     """
     lp = LogitsProcessorList()
@@ -1713,12 +1718,16 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     if eos_token_ids is not None:
         lp.append(EOSSuppressionProcessor(eos_token_ids, min_new_tokens=10))
 
-    # 🔧 裁剪logits，防止gap过大（从15降到10，因为15仍产生0.946 max_prob）
-    lp.append(LogitsClippingProcessor(max_value=10.0))
-
-    # 添加调试处理器（仅在前20步，需在clip之后）
+    # 🔍 调试1: clip之前（看真实logits）
     if step_counter is not None:
-        lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter))
+        lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter, label="raw"))
+
+    # 🔧 裁剪logits（暂时禁用，因为导致0.1465固定值）
+    lp.append(LogitsClippingProcessor(max_value=50.0))  # enabled=False
+
+    # 🔍 调试2: clip之后（验证是否被裁剪）
+    # if step_counter is not None:
+    #     lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter, label="post-clip"))
 
     # 只添加自定义的penalty处理器
     if config.PRESENCE_PENALTY != 0.0:
