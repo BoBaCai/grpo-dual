@@ -1711,7 +1711,7 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
 
     # 🚫 禁止前10个token生成EOS（诊断显示频繁1-token生成）
     if eos_token_ids is not None:
-        lp.append(EOSSuppressionProcessor(eos_token_ids, min_length=10))
+        lp.append(EOSSuppressionProcessor(eos_token_ids, min_new_tokens=10))
 
     # 🔧 裁剪logits，防止gap过大（从15降到10，因为15仍产生0.946 max_prob）
     lp.append(LogitsClippingProcessor(max_value=10.0))
