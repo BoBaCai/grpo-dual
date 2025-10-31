@@ -2256,8 +2256,22 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         if (step + 1) % 5 == 0:
             print(f"\n[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
 
-        # 【新增】奖励分支内标准化（含winsorize去除离群值）
+        # 【优先级2：长度惩罚】对Fairness极短回答进行惩罚，防止熵塌陷导致的1-token生成
         task_list = [tasks[idx_map[i]] for i in range(len(idx_map))]
+        length_penalty_count = 0
+        for i in range(len(rewards)):
+            if task_list[i] == "fairness" and all_lengths[i] < 5:
+                # 极短的Fairness回答（<5 tokens）受到严重惩罚
+                original_reward = rewards[i].item()
+                rewards[i] = rewards[i] * 0.3 - 0.3  # 双重惩罚：缩放到30%并减0.3
+                length_penalty_count += 1
+                if step < 20:  # 前20步打印详细信息
+                    print(f"  [长度惩罚] 样本#{i} (Fairness, {all_lengths[i]}tokens): reward {original_reward:.3f} → {rewards[i].item():.3f}")
+
+        if length_penalty_count > 0 and step < 20:
+            print(f"  本步共对 {length_penalty_count} 个极短Fairness回答施加了长度惩罚\n")
+
+        # 【新增】奖励分支内标准化（含winsorize去除离群值）
         rewards_before_norm = rewards.clone()  # 保存normalize前的值用于debug
         rewards = reward_normalizer.update_and_normalize(rewards, task_list)
 
@@ -2265,6 +2279,20 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         if step < 20:
             fairness_indices = [i for i, task in enumerate(task_list) if task == "fairness"]
             if fairness_indices:
+                # 【优先级1：熵监控】计算生成的熵值，检测熵塌陷
+                # 为了计算熵，需要先tokenize并forward一次（仅诊断时）
+                full_tok_diag, comp_mask_diag = _tokenize_concat(tokenizer, all_prompts, all_resps, all_lengths, device)
+                with torch.no_grad():
+                    out_diag = model(input_ids=full_tok_diag["input_ids"],
+                                    attention_mask=full_tok_diag.get("attention_mask"),
+                                    use_cache=False)
+                    # 计算每个位置的熵
+                    logits = out_diag.logits[:, :-1, :]  # [batch, seq_len, vocab_size]
+                    probs = F.softmax(logits, dim=-1)
+                    entropy_per_pos = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)  # [batch, seq_len]
+                    # 只计算生成部分的平均熵（使用comp_mask）
+                    entropy_per_sample = (entropy_per_pos * comp_mask_diag).sum(dim=1) / comp_mask_diag.sum(dim=1).clamp_min(1.0)
+
                 print(f"\n{'='*70}")
                 print(f"[Fairness诊断@step{step+1}] 发现 {len(fairness_indices)} 个Fairness样本（共{len(task_list)}个）")
                 print(f"{'='*70}")
@@ -2272,6 +2300,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 for idx in fairness_indices[:3]:
                     prompt_preview = all_prompts[idx][:100].replace('\n', ' ')
                     resp_preview = all_resps[idx][:150].replace('\n', ' ')
+                    entropy_val = entropy_per_sample[idx].item()
                     print(f"\n样本 #{idx} (batch内索引{idx_map[idx]}):")
                     print(f"  Prompt: {prompt_preview}...")
                     print(f"  Generated: {resp_preview}...")
@@ -2279,8 +2308,12 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                     print(f"  Truncated: {all_truncated[idx]}")
                     print(f"  Reward (原始): {rewards_before_norm[idx].item():.3f}")
                     print(f"  Reward (归一化后): {rewards[idx].item():.3f}")
+                    print(f"  Entropy: {entropy_val:.3f} {'⚠️ 熵塌陷!' if entropy_val < 0.5 else '✓ 正常' if entropy_val > 1.5 else '⚠️ 偏低'}")
                 if len(fairness_indices) > 3:
                     print(f"\n... 还有 {len(fairness_indices) - 3} 个Fairness样本未显示")
+                    # 打印整体熵统计
+                    fairness_entropies = entropy_per_sample[fairness_indices]
+                    print(f"  Fairness整体熵统计: mean={fairness_entropies.mean():.3f}, min={fairness_entropies.min():.3f}, max={fairness_entropies.max():.3f}")
                 print(f"{'='*70}\n")
 
         # ——一次性分词 + 计算 ref_lp（复用）——
