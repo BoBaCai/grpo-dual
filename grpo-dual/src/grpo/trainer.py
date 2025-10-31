@@ -1573,6 +1573,48 @@ class ParetoFrontier:
 # =============================================================================
 from transformers import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
+class DebugLogitsProcessor(torch.nn.Module):
+    """
+    调试处理器：打印logits分布信息，帮助诊断温度是否生效
+    """
+    def __init__(self, temperature, step_counter):
+        super().__init__()
+        self.temperature = temperature
+        self.step_counter = step_counter
+        self.has_printed = False
+
+    def forward(self, input_ids, scores):
+        # 只在前20步打印一次（第一个batch的第一个token）
+        if self.step_counter[0] <= 20 and not self.has_printed:
+            with torch.no_grad():
+                # 获取第一个样本的logits
+                sample_logits = scores[0].float()
+
+                # 应用温度缩放
+                scaled_logits = sample_logits / self.temperature
+
+                # 计算softmax概率
+                probs = torch.softmax(scaled_logits, dim=-1)
+
+                # 获取top-5概率
+                top5_probs, top5_indices = torch.topk(probs, k=5)
+
+                # 计算logits的尖锐度
+                max_logit = sample_logits.max().item()
+                sorted_logits, _ = torch.sort(sample_logits, descending=True)
+                logit_gap = (sorted_logits[0] - sorted_logits[1]).item()
+
+                print(f"\n🔍 [Step {self.step_counter[0]}] Logits Distribution Debug:")
+                print(f"   Temperature: {self.temperature}")
+                print(f"   Max logit: {max_logit:.3f}")
+                print(f"   Gap (1st-2nd): {logit_gap:.3f}")
+                print(f"   Top-5 probs: {top5_probs.cpu().numpy()}")
+                print(f"   Max prob: {top5_probs[0].item():.6f}")
+
+                self.has_printed = True
+
+        return scores
+
 class SanityLogitsProcessor(torch.nn.Module):
     def __init__(self, min_tokens_to_keep=1):
         super().__init__()
@@ -1609,13 +1651,18 @@ class FrequencyPenaltyProcessor(torch.nn.Module):
             scores[b, uniq] -= self.penalty * cnt.to(scores.dtype)
         return scores
 
-def build_safe_logits_processors():
+def build_safe_logits_processors(step_counter=None):
     """
     构建logits处理器列表
     【修复】只添加自定义 processor（Penalty + Sanity）
     Temperature/TopK/TopP 直接传给 generate()，避免警告
+    【调试】添加 DebugLogitsProcessor 来诊断温度问题
     """
     lp = LogitsProcessorList()
+
+    # 添加调试处理器（仅在前20步）
+    if step_counter is not None:
+        lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter))
 
     # 只添加自定义的penalty处理器
     if config.PRESENCE_PENALTY != 0.0:
@@ -1651,10 +1698,11 @@ def temporary_no_checkpointing(model):
                 model.enable_input_require_grads()
 
 # 训练用：批量生成（一次生成 B×K）
-def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]]]:
+def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]]]:
     """
     批量生成，返回文本、长度和每个prompt的实际token长度
     §1&§2修复: 应用聊天模板 + 多终止符
+    【调试】添加step参数用于debug logging
     """
     if max_new_tokens is None:
         max_new_tokens = config.MAX_NEW_TOKENS_TRAIN
@@ -1666,7 +1714,9 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     # §2: 获取多终止符
     eos_ids = get_eos_token_ids(tokenizer)
 
-    processors = build_safe_logits_processors()  # 【修正】移除参数
+    # 创建step_counter（使用list使其可变）
+    step_counter = [step] if step is not None else None
+    processors = build_safe_logits_processors(step_counter)  # 【修正】传入step_counter
     batch_prompts = []
     for p in formatted_prompts:  # 使用格式化后的prompts
         batch_prompts.extend([p]*k)
@@ -2229,7 +2279,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         t_gen0 = _t.time()
         cand_by_sample, lengths_by_sample, _, truncated_by_sample = generate_candidates_batch(
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
-            max_new_tokens=current_max_new_tokens_train  # 【修正】传入动态调整的max_new_tokens
+            max_new_tokens=current_max_new_tokens_train,  # 【修正】传入动态调整的max_new_tokens
+            step=step  # 【调试】传入step用于debug logging
         )
 
         # 【显存优化】生成后立即清理显存
