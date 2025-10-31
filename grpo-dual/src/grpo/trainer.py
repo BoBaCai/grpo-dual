@@ -200,6 +200,11 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
+    ENTROPY_COEF = 0.01              # 【熵正则化】防止熵塌陷，鼓励探索（loss -= entropy_coef * entropy）
+
+    # Reward Scale（多目标平衡）
+    FAIRNESS_REWARD_SCALE = 0.5      # 【Reward Scale】降低50%，解决Fairness信号过强（诊断显示F/H=2.3-7.6倍）
+    HALLUCINATION_REWARD_SCALE = 1.0 # Hallucination保持不变
 
     # LoRA
     USE_LORA = True
@@ -219,7 +224,7 @@ class Config:
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
     MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
 
-    TEMPERATURE_TRAIN = 0.3        # 【方案B】保持0.3，配合极低LR=1e-6，先不降到0.2
+    TEMPERATURE_TRAIN = 0.25       # 【降低】从0.3→0.25，减少随机性以缓解熵塌陷
     TOP_K_TRAIN = 20               # 【进一步降低】从25→20
     TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
     REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
@@ -1766,11 +1771,14 @@ def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: b
                 use_cache=True,
             )
         else:
-            # 贪心模式：不用processor
+            # 贪心模式：显式设置为None避免transformers警告
             out = model.generate(
                 **inputs,
                 max_new_tokens=config.MAX_NEW_TOKENS_EVAL,
                 do_sample=False,
+                temperature=None,  # 【优先级B】显式设置为None，避免警告
+                top_p=None,
+                top_k=None,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=eos_ids,  # §2: 多终止符
                 use_cache=True,
@@ -2275,6 +2283,13 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         if length_penalty_count > 0 and step < 20:
             print(f"  本步共对 {length_penalty_count} 个极短Fairness回答施加了长度惩罚\n")
 
+        # 【优先级A：Reward Scale】调整不同任务的reward权重，解决信号失衡
+        for i in range(len(rewards)):
+            if task_list[i] == "fairness":
+                rewards[i] *= config.FAIRNESS_REWARD_SCALE
+            elif task_list[i] == "hallucination":
+                rewards[i] *= config.HALLUCINATION_REWARD_SCALE
+
         # 【新增】奖励分支内标准化（含winsorize去除离群值）
         rewards_before_norm = rewards.clone()  # 保存normalize前的值用于debug
         rewards = reward_normalizer.update_and_normalize(rewards, task_list)
@@ -2452,6 +2467,13 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             denom = comp_mask.sum(dim=1).clamp_min(1.0)
             cur_lp = (sel * comp_mask).sum(dim=1) / denom
 
+            # 【优先级3：熵计算】计算策略熵，用于熵正则化
+            # entropy = -Σ p(a) * log(p(a)) = -Σ exp(log_p) * log_p
+            cur_probs = torch.exp(cur_logp)  # Convert log probabilities to probabilities
+            token_entropy = -(cur_probs * cur_logp).sum(dim=-1)  # Entropy per token
+            # 只计算生成部分的平均熵（使用comp_mask）
+            sample_entropy = (token_entropy * comp_mask).sum(dim=1) / denom  # Entropy per sample
+
             ratio = torch.exp(cur_lp - old_lp)
             clip_ratio = torch.clamp(ratio, 1-config.PPO_CLIP_EPS, 1+config.PPO_CLIP_EPS)
             surr = torch.minimum(ratio*adv, clip_ratio*adv)
@@ -2488,14 +2510,16 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 # 【低显存模式】简化为2次反传（完整loss），但手动调整KL项权重
                 # 显存节约50%，但β可解释性略微下降（CAGrad会影响整体梯度）
                 if task_mask_f.any():
-                    loss_fair = (-(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    entropy_f = sample_entropy[task_mask_f].mean()  # Fairness平均熵
+                    loss_fair = (-(surr[task_mask_f].mean()) + beta_f * kl[task_mask_f].mean() - config.ENTROPY_COEF * entropy_f) / config.GRADIENT_ACCUMULATION_STEPS
                     kl_mean_f = kl[task_mask_f].mean()
                 else:
                     loss_fair = _anchor_zero
                     kl_mean_f = torch.tensor(0.0, device=surr.device)
 
                 if task_mask_h.any():
-                    loss_halu = (-(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean()) / config.GRADIENT_ACCUMULATION_STEPS
+                    entropy_h = sample_entropy[task_mask_h].mean()  # Hallucination平均熵
+                    loss_halu = (-(surr[task_mask_h].mean()) + beta_h * kl[task_mask_h].mean() - config.ENTROPY_COEF * entropy_h) / config.GRADIENT_ACCUMULATION_STEPS
                     kl_mean_h = kl[task_mask_h].mean()
                 else:
                     loss_halu = _anchor_zero
@@ -2579,21 +2603,43 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 kl_loss_h = kl_mean_h / config.GRADIENT_ACCUMULATION_STEPS
 
                 grads_kl_f = torch.autograd.grad(kl_loss_f, trainable, retain_graph=True, allow_unused=True)
-                grads_kl_h = torch.autograd.grad(kl_loss_h, trainable, allow_unused=True)
+                grads_kl_h = torch.autograd.grad(kl_loss_h, trainable, retain_graph=True, allow_unused=True)
 
                 vec_kl_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_f, trainable)])
                 vec_kl_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_kl_h, trainable)])
 
-                # 6) 最终梯度 = merged reward + β * KL（β完全可解释，不受surgery影响）
-                vec_final = vec_reward_merged + beta_f * vec_kl_f + beta_h * vec_kl_h
+                # 5.5) 【优先级3：熵梯度】计算熵梯度，鼓励探索
+                if task_mask_f.any():
+                    entropy_loss_f = -sample_entropy[task_mask_f].mean() / config.GRADIENT_ACCUMULATION_STEPS  # 负号因为loss中是-entropy
+                    grads_entropy_f = torch.autograd.grad(entropy_loss_f, trainable, retain_graph=True, allow_unused=True)
+                    vec_entropy_f = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_entropy_f, trainable)])
+                else:
+                    vec_entropy_f = torch.zeros_like(vec_kl_f)
+
+                if task_mask_h.any():
+                    entropy_loss_h = -sample_entropy[task_mask_h].mean() / config.GRADIENT_ACCUMULATION_STEPS
+                    grads_entropy_h = torch.autograd.grad(entropy_loss_h, trainable, allow_unused=True)
+                    vec_entropy_h = torch.nn.utils.parameters_to_vector([g if g is not None else torch.zeros_like(p) for g,p in zip(grads_entropy_h, trainable)])
+                else:
+                    vec_entropy_h = torch.zeros_like(vec_kl_h)
+
+                # 6) 最终梯度 = merged reward + β * KL - entropy_coef * entropy（β完全可解释，不受surgery影响）
+                vec_final = vec_reward_merged + beta_f * vec_kl_f + beta_h * vec_kl_h - config.ENTROPY_COEF * (vec_entropy_f + vec_entropy_h)
 
                 # 7) 设置最终梯度
                 _set_grads_from_vec(trainable, vec_final, accumulate=not is_first_microbatch)
 
                 # 8) 重建完整loss用于指标收集（不参与反传）
-                # loss_fair和loss_halu在后续代码中用于日志记录
-                loss_fair = reward_loss_f + beta_f * kl_loss_f
-                loss_halu = reward_loss_h + beta_h * kl_loss_h
+                # loss_fair和loss_halu在后续代码中用于日志记录（包含熵bonus）
+                if task_mask_f.any():
+                    loss_fair = reward_loss_f + beta_f * kl_loss_f - config.ENTROPY_COEF * sample_entropy[task_mask_f].mean() / config.GRADIENT_ACCUMULATION_STEPS
+                else:
+                    loss_fair = reward_loss_f + beta_f * kl_loss_f
+
+                if task_mask_h.any():
+                    loss_halu = reward_loss_h + beta_h * kl_loss_h - config.ENTROPY_COEF * sample_entropy[task_mask_h].mean() / config.GRADIENT_ACCUMULATION_STEPS
+                else:
+                    loss_halu = reward_loss_h + beta_h * kl_loss_h
 
         # 【修复梯度累积】参数更新移到 MU_UPDATES 循环外部
         # 在累积周期结束时更新参数
