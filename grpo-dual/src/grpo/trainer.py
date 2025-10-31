@@ -1573,12 +1573,40 @@ class ParetoFrontier:
 # =============================================================================
 from transformers import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
+class EOSSuppressionProcessor(torch.nn.Module):
+    """
+    EOS抑制处理器：在前N个生成token强制禁止EOS，防止过早结束
+    即使MIN_NEW_TOKENS设置了，某些transformers版本也不工作
+    """
+    def __init__(self, eos_token_ids, min_new_tokens=10):
+        super().__init__()
+        self.eos_token_ids = eos_token_ids if isinstance(eos_token_ids, list) else [eos_token_ids]
+        self.min_new_tokens = min_new_tokens
+        self.prompt_len = None  # 在第一次调用时记录
+
+    def forward(self, input_ids, scores):
+        # 第一次调用：记录prompt长度
+        if self.prompt_len is None:
+            self.prompt_len = input_ids.shape[-1]
+
+        # 计算已生成的token数（不包括prompt）
+        generated_len = input_ids.shape[-1] - self.prompt_len
+
+        # 如果还没达到最小生成长度，禁止EOS
+        if generated_len < self.min_new_tokens:
+            for eos_id in self.eos_token_ids:
+                if eos_id is not None:
+                    # 设置为极小值，确保不会被选中
+                    scores[:, eos_id] = -float('inf')
+
+        return scores
+
 class LogitsClippingProcessor(torch.nn.Module):
     """
     Logits裁剪处理器：限制logits范围，防止极度尖锐的分布
     当logits差距太大时（如gap>10），即使高温也无法软化
     """
-    def __init__(self, max_value=15.0):
+    def __init__(self, max_value=10.0):  # 【降低】从15→10，因为15仍产生0.946 max_prob
         super().__init__()
         self.max_value = max_value
 
@@ -1670,18 +1698,23 @@ class FrequencyPenaltyProcessor(torch.nn.Module):
             scores[b, uniq] -= self.penalty * cnt.to(scores.dtype)
         return scores
 
-def build_safe_logits_processors(step_counter=None):
+def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     """
     构建logits处理器列表
     【修复】只添加自定义 processor（Penalty + Sanity）
     Temperature/TopK/TopP 直接传给 generate()，避免警告
     【调试】添加 DebugLogitsProcessor 来诊断温度问题
     【紧急修复】添加 LogitsClippingProcessor 防止logits过度尖锐
+    【强制约束】添加 EOSSuppressionProcessor 禁止过早EOS
     """
     lp = LogitsProcessorList()
 
-    # 🔧 先裁剪logits，防止gap过大（诊断显示gap=5-11）
-    lp.append(LogitsClippingProcessor(max_value=15.0))
+    # 🚫 禁止前10个token生成EOS（诊断显示频繁1-token生成）
+    if eos_token_ids is not None:
+        lp.append(EOSSuppressionProcessor(eos_token_ids, min_length=10))
+
+    # 🔧 裁剪logits，防止gap过大（从15降到10，因为15仍产生0.946 max_prob）
+    lp.append(LogitsClippingProcessor(max_value=10.0))
 
     # 添加调试处理器（仅在前20步，需在clip之后）
     if step_counter is not None:
@@ -1739,7 +1772,7 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
 
     # 创建step_counter（使用list使其可变）
     step_counter = [step] if step is not None else None
-    processors = build_safe_logits_processors(step_counter)  # 【修正】传入step_counter
+    processors = build_safe_logits_processors(step_counter, eos_ids)  # 【修正】传入step_counter和eos_ids
     batch_prompts = []
     for p in formatted_prompts:  # 使用格式化后的prompts
         batch_prompts.extend([p]*k)
