@@ -1589,23 +1589,25 @@ class EOSSuppressionProcessor(torch.nn.Module):
     def forward(self, input_ids, scores):
         self.call_count += 1
 
-        # 第一次调用：记录prompt长度
+        # 第一次调用：记录prompt长度（只打印一次）
         if self.prompt_len is None:
             self.prompt_len = input_ids.shape[-1]
-            print(f"[EOS Suppressor] 记录prompt长度: {self.prompt_len} (batch_size={input_ids.shape[0]})")
+            if self.call_count == 1:  # 只在真正第一次打印
+                print(f"[EOS Suppressor] 首次调用: prompt_len={self.prompt_len}, batch={input_ids.shape[0]}, min={self.min_new_tokens}")
 
         # 计算已生成的token数（不包括prompt）
         generated_len = input_ids.shape[-1] - self.prompt_len
 
-        # 只在前5次调用打印详细信息
-        if self.call_count <= 5:
-            print(f"\n[EOS Suppressor] Call#{self.call_count}: batch_size={scores.shape[0]}, generated={generated_len}, min={self.min_new_tokens}")
+        # 只在前3次调用打印详细信息
+        if self.call_count <= 3:
+            print(f"\n[EOS Supp] Call#{self.call_count}: gen={generated_len}/{self.min_new_tokens}")
 
-            # 检查EOS token的score（在修改之前）
+            # 【修复】在修改前立即clone保存真实的before状态
+            eos_before_dict = {}
             for eos_id in self.eos_token_ids:
                 if eos_id is not None:
-                    eos_scores_before = scores[:, eos_id].clone()
-                    print(f"  EOS token {eos_id} scores (before): {eos_scores_before.cpu().numpy()}")
+                    eos_before_dict[eos_id] = scores[:, eos_id].detach().clone().cpu().numpy()
+                    print(f"  EOS {eos_id} before: {eos_before_dict[eos_id]}")
 
         # 如果还没达到最小生成长度，禁止EOS
         if generated_len < self.min_new_tokens:
@@ -1614,16 +1616,17 @@ class EOSSuppressionProcessor(torch.nn.Module):
                     # 设置为极小值，确保不会被选中
                     scores[:, eos_id] = -float('inf')
 
-            if self.call_count <= 5:
-                # 检查修改后的score
+            if self.call_count <= 3:
+                # 【修复】修改后立即clone保存真实的after状态
                 for eos_id in self.eos_token_ids:
                     if eos_id is not None:
-                        eos_scores_after = scores[:, eos_id].cpu().numpy()
-                        print(f"  EOS token {eos_id} scores (after):  {eos_scores_after}")
-                        print(f"  → 阻止EOS: 已设置{(eos_scores_after == -float('inf')).sum()}/{len(eos_scores_after)}个样本为-inf")
+                        eos_after = scores[:, eos_id].detach().clone().cpu().numpy()
+                        print(f"  EOS {eos_id} after:  {eos_after}")
+                        blocked = (eos_after == -float('inf')).sum()
+                        print(f"  ✓ 已阻止 {blocked}/{len(eos_after)} 个样本")
         else:
-            if self.call_count <= 5:
-                print(f"  → 允许EOS（generated={generated_len} >= min={self.min_new_tokens}）")
+            if self.call_count <= 3:
+                print(f"  → 允许EOS (gen={generated_len} >= min={self.min_new_tokens})")
 
         return scores
 
@@ -1835,9 +1838,23 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     # §3: 拆回每个 prompt 的 k 条，并准确检测截断
     src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)
     texts, lengths, prompt_lens, truncated_flags = [], [], [], []
+
+    # 【调试】在前2个step打印切片验证
+    if step is not None and step < 2:
+        print(f"\n[Gen Debug] Step {step}: out.shape={out.shape}, src_lens[:3]={src_lens[:3].tolist()}")
+
     for i in range(out.shape[0]):
         response_tokens = out[i, src_lens[i]:]
         decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+        # 【调试】验证切片是否包含prompt
+        if step is not None and step < 2 and i < 2:
+            full_decoded = tokenizer.decode(out[i], skip_special_tokens=False)
+            print(f"  Sample {i}:")
+            print(f"    Full sequence: {full_decoded[:200]}")
+            print(f"    Response only: {decoded[:200]}")
+            print(f"    Response tokens: {response_tokens.shape[0]} tokens")
+
         texts.append(decoded)
 
         # §3修复: 正确计算长度和检测截断
@@ -2342,7 +2359,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     
     # 【新增】初始化梯度冲突监控器
     conflict_monitor = GradientConflictMonitor() if config.GRADIENT_CONFLICT_MONITOR else None
-    
+
+    # 【新增】初始化Reward Scale EMA平滑（避免比值跳变）
+    reward_scale_ema = None  # 首次为None，后续更新
+
     # 【新增】动态调整max_new_tokens的变量（初始即为硬约束上限）
     current_max_new_tokens_train = config.MAX_NEW_TOKENS_TRAIN  # 128（硬约束）
     
@@ -2536,29 +2556,55 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 print(f"\nReward统计（归一化前，原始scale）:")
                 print(f"  Fairness:      mean={f_rewards.mean().item():+.3f}, std={f_rewards.std().item():.3f}, range=[{f_rewards.min().item():+.3f}, {f_rewards.max().item():+.3f}]")
                 print(f"  Hallucination: mean={h_rewards.mean().item():+.3f}, std={h_rewards.std().item():.3f}, range=[{h_rewards.min().item():+.3f}, {h_rewards.max().item():+.3f}]")
-                print(f"  Reward均值比例 (F/H): {f_rewards.mean().item() / (h_rewards.mean().item() + 1e-6):.2f}")
 
                 print(f"\n梯度信号强度（|reward_norm| × |advantage|）:")
                 print(f"  Fairness signal:      {f_signal:.4f}")
                 print(f"  Hallucination signal: {h_signal:.4f}")
-                print(f"  信号强度比例 (F/H):    {f_signal / (h_signal + 1e-6):.2f}")
 
-                # 判断和建议
-                ratio = f_signal / (h_signal + 1e-6)
-                if ratio > 3.0:
-                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 严重失衡！")
-                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.3 (降低70%)")
-                elif ratio > 2.0:
-                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 中度失衡")
-                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.5 (降低50%)")
-                elif ratio > 1.5:
-                    print(f"\n  ⚠️  Fairness信号强度是Hallucination的{ratio:.1f}倍 - 轻度失衡")
-                    print(f"  建议: FAIRNESS_REWARD_SCALE = 0.7 (降低30%)")
-                elif ratio < 0.67:  # 1/1.5
-                    print(f"\n  ⚠️  Fairness信号强度低于Hallucination - 可能需要提升")
-                    print(f"  建议: FAIRNESS_REWARD_SCALE = 1.5 (提升50%)")
+                # 【修复】检查信号是否过弱（避免division by zero和无意义建议）
+                eps = 1e-6
+                signal_threshold = 1e-5  # 信号太弱时不给建议
+
+                if f_signal < signal_threshold and h_signal < signal_threshold:
+                    print(f"  信号强度比例: N/A (两者均过弱 <{signal_threshold})")
+                    print(f"\n  ⚠️  两个任务的信号强度均过弱 - 无需调整scale")
+                elif f_signal < signal_threshold:
+                    print(f"  信号强度比例: N/A (Fairness过弱 <{signal_threshold})")
+                    print(f"\n  ⚠️  Fairness信号过弱 - 可能该batch全为Hallucination样本")
+                elif h_signal < signal_threshold:
+                    print(f"  信号强度比例: N/A (Hallucination过弱 <{signal_threshold})")
+                    print(f"\n  ⚠️  Hallucination信号过弱 - 可能该batch全为Fairness样本")
                 else:
-                    print(f"\n  ✓ 两个任务的信号强度基本平衡（比例{ratio:.2f}在0.67-1.5之间）")
+                    # 有效信号：计算比值并使用EMA平滑
+                    ratio_raw = f_signal / (h_signal + eps)
+
+                    # EMA平滑（alpha=0.7表示较快适应，0.3保留历史）
+                    if reward_scale_ema is None:
+                        reward_scale_ema = ratio_raw  # 首次直接使用
+                    else:
+                        reward_scale_ema = 0.7 * ratio_raw + 0.3 * reward_scale_ema
+
+                    print(f"  信号强度比例 (raw): {ratio_raw:.2f}")
+                    print(f"  信号强度比例 (EMA): {reward_scale_ema:.2f}")
+
+                    # 基于EMA判断和建议（限幅调整幅度）
+                    if reward_scale_ema > 3.0:
+                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的3倍 - 严重失衡")
+                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.8 (降低20%)")
+                    elif reward_scale_ema > 2.0:
+                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的2倍 - 中度失衡")
+                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.85 (降低15%)")
+                    elif reward_scale_ema > 1.5:
+                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的1.5倍 - 轻度失衡")
+                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.9 (降低10%)")
+                    elif reward_scale_ema < 0.5:  # 1/2
+                        print(f"\n  ⚠️  Fairness信号强度持续低于Hallucination一半 - 需要提升")
+                        print(f"  建议: FAIRNESS_REWARD_SCALE × 1.2 (提升20%)")
+                    elif reward_scale_ema < 0.67:  # 1/1.5
+                        print(f"\n  ⚠️  Fairness信号强度持续偏低 - 可能需要提升")
+                        print(f"  建议: FAIRNESS_REWARD_SCALE × 1.1 (提升10%)")
+                    else:
+                        print(f"\n  ✓ 信号强度基本平衡（EMA={reward_scale_ema:.2f}在0.67-1.5之间）")
 
                 print(f"{'='*70}\n")
 
