@@ -1597,21 +1597,33 @@ class EOSSuppressionProcessor(torch.nn.Module):
         # 计算已生成的token数（不包括prompt）
         generated_len = input_ids.shape[-1] - self.prompt_len
 
-        # 只在前30次调用打印（避免刷屏）
-        if self.call_count <= 30:
-            print(f"[EOS Suppressor] Call#{self.call_count}: prompt={self.prompt_len}, current={input_ids.shape[-1]}, generated={generated_len}, min={self.min_new_tokens}")
+        # 只在前5次调用打印详细信息
+        if self.call_count <= 5:
+            print(f"\n[EOS Suppressor] Call#{self.call_count}: batch_size={scores.shape[0]}, generated={generated_len}, min={self.min_new_tokens}")
+
+            # 检查EOS token的score（在修改之前）
+            for eos_id in self.eos_token_ids:
+                if eos_id is not None:
+                    eos_scores_before = scores[:, eos_id].clone()
+                    print(f"  EOS token {eos_id} scores (before): {eos_scores_before.cpu().numpy()}")
 
         # 如果还没达到最小生成长度，禁止EOS
         if generated_len < self.min_new_tokens:
-            if self.call_count <= 30:
-                print(f"[EOS Suppressor]   → 阻止EOS（generated={generated_len} < min={self.min_new_tokens}）")
             for eos_id in self.eos_token_ids:
                 if eos_id is not None:
                     # 设置为极小值，确保不会被选中
                     scores[:, eos_id] = -float('inf')
+
+            if self.call_count <= 5:
+                # 检查修改后的score
+                for eos_id in self.eos_token_ids:
+                    if eos_id is not None:
+                        eos_scores_after = scores[:, eos_id].cpu().numpy()
+                        print(f"  EOS token {eos_id} scores (after):  {eos_scores_after}")
+                        print(f"  → 阻止EOS: 已设置{(eos_scores_after == -float('inf')).sum()}/{len(eos_scores_after)}个样本为-inf")
         else:
-            if self.call_count <= 30:
-                print(f"[EOS Suppressor]   → 允许EOS（generated={generated_len} >= min={self.min_new_tokens}）")
+            if self.call_count <= 5:
+                print(f"  → 允许EOS（generated={generated_len} >= min={self.min_new_tokens}）")
 
         return scores
 
