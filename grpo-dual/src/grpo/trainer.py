@@ -222,15 +222,15 @@ class Config:
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 96      # 【修复】从64提升到96，解决Hallucination任务25%截断率
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
-    MIN_NEW_TOKENS_TRAIN = 3       # 【降低】从4→3，允许非常短的回复
+    MIN_NEW_TOKENS_TRAIN = 15      # 【实验】3→15，延迟EOS释放测试终止符先验（根因#4）
 
-    TEMPERATURE_TRAIN = 1.0        # 【极端修正】从0.4→1.0，诊断显示temp=0.4无法软化gap=7的logits
-    TOP_K_TRAIN = 20               # 【进一步降低】从25→20
-    TOP_P_TRAIN = 0.75             # 【进一步降低】从0.80→0.75
-    REP_PENALTY_TRAIN = 1.15       # 【增大】从1.1→1.15，强烈鼓励结束
+    TEMPERATURE_TRAIN = 1.2        # 【实验】1.0→1.2，对抗gap=7-10极尖分布（根因#3）
+    TOP_K_TRAIN = 0                # 【实验】禁用top_k，只用top_p（避免双重限制）
+    TOP_P_TRAIN = 0.95             # 【实验】0.75→0.95，显著放宽探索空间（根因#3）
+    REP_PENALTY_TRAIN = 1.05       # 【实验】1.15→1.05，降低重复惩罚（配合penalty口径修复）
     
-    PRESENCE_PENALTY = 0.6         # 【增大】从0.5→0.6
-    FREQUENCY_PENALTY = 0.4        # 【增大】从0.3→0.4
+    PRESENCE_PENALTY = 0.3         # 【实验】0.6→0.3，配合口径修复（现只作用于response）
+    FREQUENCY_PENALTY = 0.2        # 【实验】0.4→0.2，配合口径修复（现只作用于response）
     
     # 【移除】LENGTH_PENALTY_TRAIN（只对beam search有效，采样模式下无效）
     
@@ -1714,10 +1714,18 @@ class PresencePenaltyProcessor(torch.nn.Module):
     def __init__(self, penalty=0.0):
         super().__init__()
         self.penalty=float(penalty)
+        self.prompt_len = None  # 记录prompt长度
     def forward(self, input_ids, scores):
         if self.penalty==0.0: return scores
+
+        # 【修复】首次调用记录prompt长度
+        if self.prompt_len is None:
+            self.prompt_len = input_ids.shape[-1]
+
         for b in range(scores.size(0)):
-            seen = torch.unique(input_ids[b])
+            # 【修复】只对已生成部分（不含prompt）统计
+            response_ids = input_ids[b, self.prompt_len:]
+            seen = torch.unique(response_ids)
             scores[b, seen] -= self.penalty
         return scores
 
@@ -1725,10 +1733,18 @@ class FrequencyPenaltyProcessor(torch.nn.Module):
     def __init__(self, penalty=0.0):
         super().__init__()
         self.penalty=float(penalty)
+        self.prompt_len = None  # 记录prompt长度
     def forward(self, input_ids, scores):
         if self.penalty==0.0: return scores
+
+        # 【修复】首次调用记录prompt长度
+        if self.prompt_len is None:
+            self.prompt_len = input_ids.shape[-1]
+
         for b in range(scores.size(0)):
-            uniq, cnt = torch.unique(input_ids[b], return_counts=True)
+            # 【修复】只对已生成部分（不含prompt）统计
+            response_ids = input_ids[b, self.prompt_len:]
+            uniq, cnt = torch.unique(response_ids, return_counts=True)
             scores[b, uniq] -= self.penalty * cnt.to(scores.dtype)
         return scores
 
@@ -1743,9 +1759,9 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     """
     lp = LogitsProcessorList()
 
-    # 🚫 禁止前10个token生成EOS（诊断显示频繁1-token生成）
+    # 🚫 禁止前N个token生成EOS（与MIN_NEW_TOKENS_TRAIN同步）
     if eos_token_ids is not None:
-        lp.append(EOSSuppressionProcessor(eos_token_ids, min_new_tokens=10))
+        lp.append(EOSSuppressionProcessor(eos_token_ids, min_new_tokens=config.MIN_NEW_TOKENS_TRAIN))
 
     # 🔍 调试1: clip之前（看真实logits）
     if step_counter is not None:
