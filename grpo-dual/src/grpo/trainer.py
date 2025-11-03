@@ -1583,21 +1583,35 @@ class EOSSuppressionProcessor(torch.nn.Module):
         self.eos_token_ids = eos_token_ids if isinstance(eos_token_ids, list) else [eos_token_ids]
         self.min_new_tokens = min_new_tokens
         self.prompt_len = None  # 在第一次调用时记录
+        self.call_count = 0  # 调用计数器（调试用）
+        print(f"[EOS Suppressor] 初始化: min_new_tokens={min_new_tokens}, eos_token_ids={eos_token_ids}")
 
     def forward(self, input_ids, scores):
+        self.call_count += 1
+
         # 第一次调用：记录prompt长度
         if self.prompt_len is None:
             self.prompt_len = input_ids.shape[-1]
+            print(f"[EOS Suppressor] 记录prompt长度: {self.prompt_len} (batch_size={input_ids.shape[0]})")
 
         # 计算已生成的token数（不包括prompt）
         generated_len = input_ids.shape[-1] - self.prompt_len
 
+        # 只在前30次调用打印（避免刷屏）
+        if self.call_count <= 30:
+            print(f"[EOS Suppressor] Call#{self.call_count}: prompt={self.prompt_len}, current={input_ids.shape[-1]}, generated={generated_len}, min={self.min_new_tokens}")
+
         # 如果还没达到最小生成长度，禁止EOS
         if generated_len < self.min_new_tokens:
+            if self.call_count <= 30:
+                print(f"[EOS Suppressor]   → 阻止EOS（generated={generated_len} < min={self.min_new_tokens}）")
             for eos_id in self.eos_token_ids:
                 if eos_id is not None:
                     # 设置为极小值，确保不会被选中
                     scores[:, eos_id] = -float('inf')
+        else:
+            if self.call_count <= 30:
+                print(f"[EOS Suppressor]   → 允许EOS（generated={generated_len} >= min={self.min_new_tokens}）")
 
         return scores
 
