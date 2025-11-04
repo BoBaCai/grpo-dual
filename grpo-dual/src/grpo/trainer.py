@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# ✅ Code visibility check by Claude - 2025-11-04
 """
 多目标 LoRA + GRPO（v2.2 - 反馈优化版）
 核心改进：
