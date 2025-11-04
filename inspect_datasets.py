@@ -167,13 +167,18 @@ if HALUEVAL_DIR.exists():
 
         try:
             # HaluEval是JSONL格式（每行一个JSON对象）
+            # 只读前100行用于统计，避免大文件读取过慢
             data = []
             with open(fp, 'r') as f:
-                for line in f:
+                for i, line in enumerate(f):
+                    if i >= 100:  # 只读前100行
+                        break
                     if line.strip():
                         data.append(json.loads(line))
 
-            total = len(data)
+            # 统计总行数
+            with open(fp, 'r') as f:
+                total = sum(1 for _ in f)
             file_size_mb = fp.stat().st_size / 1024 / 1024
 
             print(f"\n{subset}:")
@@ -213,18 +218,15 @@ if HALUEVAL_DIR.exists():
 
         try:
             # HaluEval是JSONL格式（每行一个JSON对象）
-            data = []
+            # 只读第一行获取样本
             with open(fp, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        data.append(json.loads(line))
+                first_line = f.readline()
+                sample = json.loads(first_line) if first_line.strip() else {}
 
-            if len(data) > 0:
+            if sample:
                 print(f"\n{'='*80}")
                 print(f"{subset.upper()} 子集第一个样本：")
                 print(f"{'='*80}")
-
-                sample = data[0]
 
                 # 打印所有字段名
                 print(f"\n可用字段: {list(sample.keys())}")
