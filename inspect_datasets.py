@@ -166,8 +166,12 @@ if HALUEVAL_DIR.exists():
             continue
 
         try:
+            # HaluEval是JSONL格式（每行一个JSON对象）
+            data = []
             with open(fp, 'r') as f:
-                data = json.load(f)
+                for line in f:
+                    if line.strip():
+                        data.append(json.loads(line))
 
             total = len(data)
             file_size_mb = fp.stat().st_size / 1024 / 1024
@@ -208,8 +212,12 @@ if HALUEVAL_DIR.exists():
             continue
 
         try:
+            # HaluEval是JSONL格式（每行一个JSON对象）
+            data = []
             with open(fp, 'r') as f:
-                data = json.load(f)
+                for line in f:
+                    if line.strip():
+                        data.append(json.loads(line))
 
             if len(data) > 0:
                 print(f"\n{'='*80}")

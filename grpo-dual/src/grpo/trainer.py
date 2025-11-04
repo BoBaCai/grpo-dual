@@ -1144,9 +1144,9 @@ class BBQAdapter:
                 correct_answer = chr(65 + label)  # A, B, C
                 answer_text = it.get(answer_key, "")
 
-                # 提取context的一部分作为证据（取前50个字符）
+                # 提取context的一部分作为证据（BBQ平均context长度200+，取前120字符）
                 context = it.get("context", "")
-                context_snippet = context[:50] + "..." if len(context) > 50 else context
+                context_snippet = context[:120] + "..." if len(context) > 120 else context
 
                 return f"Answer: {correct_answer}\nJustification: Based on the context: \"{context_snippet}\", the answer is {answer_text}."
             else:
