@@ -2143,8 +2143,23 @@ def load_model_and_tokenizer():
 
     _ = AutoConfig.from_pretrained(config.BASE_MODEL, trust_remote_code=True, **extra)
     tokenizer = AutoTokenizer.from_pretrained(config.BASE_MODEL, trust_remote_code=True, **extra)
+
+    # 【关键修复】LLaMA-3必须用<|end_of_text|>作为padding，不能用<|eot_id|>
+    # <|eot_id|> (128009) 是对话轮次结束符，不能用于padding
+    # <|end_of_text|> (128001) 是文档结束符，可以用于padding
     if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        # 检查是否有<|end_of_text|>
+        vocab = tokenizer.get_vocab()
+        if '<|end_of_text|>' in vocab:
+            end_of_text_id = tokenizer.convert_tokens_to_ids('<|end_of_text|>')
+            tokenizer.pad_token = '<|end_of_text|>'
+            tokenizer.pad_token_id = end_of_text_id
+            print(f"✅ 设置pad_token为<|end_of_text|> (id={end_of_text_id})")
+        else:
+            # 如果没有<|end_of_text|>，使用eos_token（但打印警告）
+            tokenizer.pad_token = tokenizer.eos_token
+            print(f"⚠️ 未找到<|end_of_text|>，使用eos_token作为pad_token")
+
     tokenizer.padding_side = "left"
 
     # 【关键配置验证】打印特殊token配置
