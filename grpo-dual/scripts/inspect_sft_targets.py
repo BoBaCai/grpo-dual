@@ -22,8 +22,34 @@ import random
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
+# 兼容 notebook 和脚本运行
+try:
+    # 脚本运行模式
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+except NameError:
+    # Notebook 运行模式
+    script_dir = Path.cwd()
+    # 假设在 grpo-dual 目录下运行
+    if script_dir.name == "grpo-dual":
+        project_root = script_dir
+    elif (script_dir / "grpo-dual").exists():
+        project_root = script_dir / "grpo-dual"
+    else:
+        # 尝试向上查找
+        project_root = script_dir
+        while project_root.parent != project_root:
+            if (project_root / "src" / "grpo").exists():
+                break
+            project_root = project_root.parent
+
 # 添加 src 到路径
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+src_path = str(project_root / "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
+print(f"📁 项目根目录: {project_root}")
+print(f"📁 src 路径: {src_path}")
 
 # 导入配置
 from grpo.trainer import config, BBQAdapter, HaluEvalAdapter, Sample
