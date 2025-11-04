@@ -1916,9 +1916,37 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
             print(f"    {decoded[:120]}")
 
             # 异常检测
-            eot_count = full_with_special.count('<|eot_id|>')
-            if eot_count > 3:
-                print(f"\n  ⚠️ 异常: Full包含{eot_count}个<|eot_id|>（正常≤3）")
+            # 【修正】分别统计prompt和response中的<|eot_id|>，排除padding干扰
+            prompt_eot_count = prompt_with_special.count('<|eot_id|>')
+            response_eot_count = response_with_special.count('<|eot_id|>')
+
+            # 检查padding是否被解码为<|eot_id|>（LLaMA-3用eos作为pad）
+            # 统计实际的token ID而非字符串
+            pad_id = tokenizer.pad_token_id
+            eot_token_id = tokenizer.convert_tokens_to_ids('<|eot_id|>') if '<|eot_id|>' in tokenizer.get_vocab() else None
+
+            prompt_token_ids = out[i, :original_input_len]
+            response_token_ids = out[i, original_input_len:]
+
+            if eot_token_id is not None:
+                prompt_eot_token_count = (prompt_token_ids == eot_token_id).sum().item()
+                response_eot_token_count = (response_token_ids == eot_token_id).sum().item()
+                prompt_pad_count = (prompt_token_ids == pad_id).sum().item() if pad_id is not None else 0
+
+                print(f"\n  Token统计:")
+                print(f"    Prompt: {prompt_eot_token_count}个<|eot_id|> tokens, {prompt_pad_count}个padding")
+                print(f"    Response: {response_eot_token_count}个<|eot_id|> tokens")
+                print(f"    pad_token_id={pad_id}, eot_token_id={eot_token_id}")
+
+                # 正常情况：prompt应有2个<|eot_id|>（system结束+user结束），response应≤1个（回答结束）
+                if prompt_eot_token_count > 2:
+                    print(f"  ⚠️ 异常: Prompt包含{prompt_eot_token_count}个<|eot_id|> tokens（正常≤2）")
+                if response_eot_token_count > 1:
+                    print(f"  ⚠️ 异常: Response包含{response_eot_token_count}个<|eot_id|> tokens（正常≤1）")
+
+                # 检查padding是否等于eot
+                if pad_id == eot_token_id:
+                    print(f"  ⚠️ 警告: pad_token_id == eot_token_id ({pad_id})，padding会显示为<|eot_id|>")
 
             if 'system' in decoded[:100].lower() or '<|start_header_id|>' in response_with_special[:50]:
                 print(f"  ⚠️ 异常: Response开头似乎包含chat header")
