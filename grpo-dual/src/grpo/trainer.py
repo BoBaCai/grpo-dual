@@ -2147,6 +2147,30 @@ def load_model_and_tokenizer():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    # 【关键配置验证】打印特殊token配置
+    print("\n" + "="*80)
+    print("Tokenizer特殊Token配置验证")
+    print("="*80)
+    print(f"pad_token: '{tokenizer.pad_token}' (id={tokenizer.pad_token_id})")
+    print(f"eos_token: '{tokenizer.eos_token}' (id={tokenizer.eos_token_id})")
+    print(f"bos_token: '{tokenizer.bos_token}' (id={tokenizer.bos_token_id})")
+
+    vocab = tokenizer.get_vocab()
+    if '<|eot_id|>' in vocab:
+        eot_id = tokenizer.convert_tokens_to_ids('<|eot_id|>')
+        print(f"eot_token: '<|eot_id|>' (id={eot_id})")
+
+        # 检查pad_token_id是否等于eot_token_id（严重错误）
+        if tokenizer.pad_token_id == eot_id:
+            print("❌❌❌ 严重错误: pad_token_id == eot_token_id!")
+            print("    这会导致padding被当成对话结束，必须修复!")
+            raise ValueError(f"pad_token_id ({tokenizer.pad_token_id}) 不能等于 eot_token_id ({eot_id})")
+        else:
+            print(f"✅ 验证通过: pad_token_id ({tokenizer.pad_token_id}) ≠ eot_token_id ({eot_id})")
+
+    print(f"padding_side: {tokenizer.padding_side}")
+    print("="*80 + "\n")
+
     dtype = torch.bfloat16 if (config.USE_BF16 and torch.cuda.is_available()) else torch.float16
 
     # 【加速优化】启用 Flash Attention 2（如果可用）
