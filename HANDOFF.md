@@ -6,7 +6,34 @@
 
 ## 🔥 最关键的Bug（解释所有异常现象）
 
-### Bug #0: pad_token设置错误
+### Bug #0: SFT训练数据质量问题（根本原因）
+**问题**: SFT target包含**占位符**而非真实内容
+```python
+# BBQ disambig（错误）：
+target = "Answer: [Based on context]\nJustification: The context indicates that [cite relevant phrase from context]."
+        # ^^^^^^^^^^^^^^^^^                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        # 这些是占位符，不是真实引用！
+
+# HaluEval（错误）：
+target = "Evidence: \"[From the provided knowledge]\""
+                    # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 占位符
+```
+
+**影响**:
+- **Fairness 4个候选完全相同** → std=0.000（模型学会了固定模板）
+- **Hallucination输出占位符后乱码** → "[From the provided knowledge]"uang7Je47CDF...
+- **模型从未学会真正引用context**
+
+**修复**:
+```python
+# 提取真实的context/knowledge片段
+context_snippet = context[:50] + "..."
+target = f"Answer: {correct_answer}\nJustification: Based on the context: \"{context_snippet}\", the answer is {answer_text}."
+```
+
+---
+
+### Bug #1: pad_token设置错误
 **问题**: LLaMA-3的`eos_token`默认是`<|eot_id|>` (128009)，导致：
 ```python
 # 错误代码（已修复）：
@@ -35,27 +62,27 @@ eos_token: '<|eot_id|>' (id=128009)        ← 128009
 
 ---
 
-## 已修复的Critical Bug（另外5个）
+## 已修复的Critical Bug（另外6个）
 
-### Bug #1: SFT与RL使用不同的模板格式
+### Bug #2: SFT与RL使用不同的模板格式
 - **位置**: `tokenize_sft_pair()` line 2165
 - **问题**: SFT用`"\n\n"`简单拼接，RL用完整chat template
 - **影响**: 模型从未学过chat template格式
 - **修复**: SFT改为使用相同chat template
 
-### Bug #2: Penalty应用于整个序列（含prompt）
+### Bug #3: Penalty应用于整个序列（含prompt）
 - **位置**: `PresencePenaltyProcessor`, `FrequencyPenaltyProcessor` line 1713-1749
 - **问题**: Prompt中的"the"出现20次→-8.0惩罚；EOS从未在prompt→0惩罚→相对提升3000x
 - **影响**: 导致1-token生成
 - **修复**: 只对response部分应用penalty
 
-### Bug #3: KL/loss使用错误的prompt格式
+### Bug #4: KL/loss使用错误的prompt格式
 - **位置**: `generate_candidates_batch()` line 1967, training loop line 2478
 - **问题**: Generate用formatted_prompt（带template），KL/loss用original_prompt（无template）
 - **影响**: 梯度计算在完全不同的token序列上
 - **修复**: 返回并使用formatted_prompts
 
-### Bug #4: LEFT padding下response提取错误
+### Bug #5: LEFT padding下response提取错误
 - **位置**: `generate_candidates_batch()` line 1863-1879
 - **问题**:
 ```python
@@ -70,7 +97,7 @@ original_input_len = inputs["input_ids"].shape[1]  # 绝对长度
 response = out[i, original_input_len:]  # 正确边界
 ```
 
-### Bug #5: LEFT padding下comp_mask计算错误
+### Bug #6: LEFT padding下comp_mask计算错误
 - **位置**: `_tokenize_concat()` line 2230-2252
 - **问题**:
 ```python
@@ -90,19 +117,25 @@ comp_end = T - 1
 
 | Bug | 影响范围 | 需要重训 |
 |-----|----------|----------|
-| #0 | **所有padding=eot信号（最根本）** | **SFT + GRPO** |
-| #1 | SFT学错了格式 | SFT + GRPO |
-| #2 | 所有reward信号 | GRPO |
-| #3 | 所有KL/loss梯度 | GRPO |
-| #4 | 所有reward信号 | GRPO |
-| #5 | 所有loss梯度 | GRPO |
+| #0 | **SFT数据质量（最根本）** | **SFT + GRPO** |
+| #1 | **所有padding=eot信号** | **SFT + GRPO** |
+| #2 | SFT学错了格式 | SFT + GRPO |
+| #3 | 所有reward信号 | GRPO |
+| #4 | 所有KL/loss梯度 | GRPO |
+| #5 | 所有reward信号 | GRPO |
+| #6 | 所有loss梯度 | GRPO |
 
 **之前的checkpoint全部作废。**
 
 **Bug #0是根本原因** - 解释了logging中所有异常现象：
-- `<|eot_id|>`爆量（36/79/148）
-- 极短生成（模型以为padding就是结束信号）
-- 熵崩塌（训练数据被padding污染）
+- Fairness 4个候选完全相同 → std=0.000
+- Hallucination输出占位符+乱码："[From the provided knowledge]"uang7Je47CDF...
+- 模型从未学会真正引用context
+- 熵崩塌（只学会了固定模板）
+
+**Bug #1解释其他异常**：
+- `<|eot_id|>`爆量（36/79/148）- padding显示为eot
+- 极短生成（padding被当成结束信号）
 
 ---
 
