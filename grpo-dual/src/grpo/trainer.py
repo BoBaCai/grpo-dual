@@ -200,7 +200,8 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 0.2               # 【超强增强】从0.05→0.2，诊断显示logits极度尖锐(gap=5-11, max_prob≈1.0)
+    ENTROPY_COEF = 0.5               # 【Entropy崩溃修复】从0.2→0.5，配合MIN_NEW_TOKENS修复
+                                     # 原因：0.2在entropy=0.005时bonus太弱(0.001)，提升到0.5增强探索
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -222,8 +223,10 @@ class Config:
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 128     # 【修复】从96提升到128，减少截断
     MAX_NEW_TOKENS_EVAL = 128      # 评测同步提升
-    MIN_NEW_TOKENS_TRAIN = 5       # 【关键修复】从15降到5，避免强制续写导致乱码
-                                   # 原因：Hallucination任务想在10 tokens结束，但被迫续到15+导致乱码token
+    MIN_NEW_TOKENS_TRAIN = 30      # 【Entropy崩溃修复】从5→30，匹配SFT target平均长度
+                                   # 根因：SFT训练平均48 tokens，但MIN=5导致EOS Suppressor 100%触发
+                                   # → 模型被迫续写 → 只输出最确定token → Entropy崩溃到0.005
+                                   # 30 = 中位数50的60%，覆盖95%样本（最短23 tokens）
 
     TEMPERATURE_TRAIN = 0.9        # 【修复】从1.2降到0.9，配合更强的惩罚
     TOP_K_TRAIN = 100              # 【修复】启用top_k=100，限制低频乱码token
