@@ -1808,11 +1808,19 @@ def temporary_no_checkpointing(model):
                 model.enable_input_require_grads()
 
 # 训练用：批量生成（一次生成 B×K）
-def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]]]:
+def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
     """
     批量生成，返回文本、长度和每个prompt的实际token长度
     §1&§2修复: 应用聊天模板 + 多终止符
     【调试】添加step参数用于debug logging
+    【修复】返回formatted_prompts确保后续tokenize一致性
+
+    Returns:
+        grouped_texts: List[List[str]] - 每个prompt的K个候选回复
+        grouped_lengths: List[List[int]] - 每个候选的token长度
+        unique_prompt_lens: List[int] - 每个prompt的token长度
+        grouped_truncated: List[List[bool]] - 每个候选是否被截断
+        formatted_prompts: List[str] - 格式化后的prompts（用于后续tokenize）
     """
     if max_new_tokens is None:
         max_new_tokens = config.MAX_NEW_TOKENS_TRAIN
@@ -1950,7 +1958,8 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     # 返回每个原始prompt的长度（去重）
     unique_prompt_lens = [prompt_lens[i] for i in range(0, len(prompt_lens), k)]
 
-    return grouped_texts, grouped_lengths, unique_prompt_lens, grouped_truncated
+    # 【修复】返回formatted_prompts以供后续tokenize使用
+    return grouped_texts, grouped_lengths, unique_prompt_lens, grouped_truncated, formatted_prompts
 
 # 评估用：支持贪心和采样两种模式
 def generate_one_response(model, tokenizer, device, prompt: str, use_sampling: bool = False) -> str:
@@ -2461,7 +2470,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # ——生成（批量）——
         t_gen0 = _t.time()
-        cand_by_sample, lengths_by_sample, _, truncated_by_sample = generate_candidates_batch(
+        cand_by_sample, lengths_by_sample, _, truncated_by_sample, formatted_prompts = generate_candidates_batch(
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
             max_new_tokens=current_max_new_tokens_train,  # 【修正】传入动态调整的max_new_tokens
             step=step  # 【调试】传入step用于debug logging
@@ -2473,7 +2482,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         # flatten
         all_prompts, all_resps, all_lengths, all_truncated, idx_map = [], [], [], [], []
         for i, s in enumerate(batch):
-            all_prompts += [s.prompt]*config.K_ROLLOUTS
+            # 【修复】使用formatted_prompts而不是原始prompt
+            all_prompts += [formatted_prompts[i]]*config.K_ROLLOUTS
             all_resps   += cand_by_sample[i]
             all_lengths += lengths_by_sample[i]  # 这个是response的实际token长度
             all_truncated += truncated_by_sample[i]  # §3: 截断标记
