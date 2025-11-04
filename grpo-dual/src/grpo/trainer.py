@@ -2228,25 +2228,25 @@ def _tokenize_concat(tokenizer, prompts: List[str], responses: List[str], respon
     comp_mask = torch.zeros(B, T-1, device=device, dtype=torch.float32)
     
     for i in range(B):
-        # 完整序列的有效长度（不含padding）
-        valid_len = int(attn[i].sum().item())
-        
         # response的实际token长度（从generate时传入）
         resp_len = response_lens[i]
-        
-        # response在ids序列中的起始位置（从有效末尾向前数）
-        # 注意：valid_len是ids的有效长度，response_len也是ids的长度
-        resp_start_in_ids = max(0, valid_len - resp_len)
-        
+
+        # 【关键修复】LEFT PADDING下response位置计算
+        # 由于padding在左侧，prompt+response在右侧，response总是在序列末尾
+        # Response在ids中的绝对起始位置 = 总长度 - response长度
+        resp_start_in_ids = T - resp_len
+
         # 在logits中，预测response第一个token的位置
         # logits[j] 预测 ids[j+1]
         # 如果response从ids[resp_start_in_ids]开始
         # 那么logits[resp_start_in_ids-1]预测ids[resp_start_in_ids]
         comp_start_in_logits = max(0, resp_start_in_ids - 1)
-        
-        # logits的有效末尾位置
-        comp_end_in_logits = valid_len - 1
-        
+
+        # 【关键修复】LEFT PADDING下，response延伸到序列末尾
+        # 最后一个token是ids[T-1]，预测它的logits位置是T-2
+        # 切片上界是T-1（左闭右开，实际包含到T-2）
+        comp_end_in_logits = T - 1
+
         # 设置mask
         if comp_start_in_logits < comp_end_in_logits:
             comp_mask[i, comp_start_in_logits:comp_end_in_logits] = 1.0
