@@ -1855,21 +1855,62 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)
     texts, lengths, prompt_lens, truncated_flags = [], [], [], []
 
-    # 【调试】在前2个step打印切片验证
+    # 【关键诊断】边界检查（前2步）
     if step is not None and step < 2:
-        print(f"\n[Gen Debug] Step {step}: out.shape={out.shape}, src_lens[:3]={src_lens[:3].tolist()}")
+        print(f"\n{'='*70}")
+        print(f"[模板/边界核查] Step {step}")
+        print(f"{'='*70}")
+        print(f"out.shape={out.shape}, src_lens[:3]={src_lens[:3].tolist()}")
 
     for i in range(out.shape[0]):
         response_tokens = out[i, src_lens[i]:]
         decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
 
-        # 【调试】验证切片是否包含prompt
+        # 【关键诊断】详细边界分析（前2步，前2样本）
         if step is not None and step < 2 and i < 2:
-            full_decoded = tokenizer.decode(out[i], skip_special_tokens=False)
-            print(f"  Sample {i}:")
-            print(f"    Full sequence: {full_decoded[:200]}")
-            print(f"    Response only: {decoded[:200]}")
-            print(f"    Response tokens: {response_tokens.shape[0]} tokens")
+            # 获取对应的原始prompt索引
+            original_idx = i // k
+            formatted_prompt = formatted_prompts[original_idx] if original_idx < len(formatted_prompts) else "[N/A]"
+
+            # Full sequence (含special tokens)
+            full_with_special = tokenizer.decode(out[i], skip_special_tokens=False)
+
+            # Prompt部分 (含special tokens)
+            prompt_tokens = out[i, :src_lens[i]]
+            prompt_with_special = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+
+            # Response部分 (含special tokens)
+            response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
+
+            # Token级细节：边界附近±5个token
+            boundary_tokens_ids = out[i, max(0, src_lens[i]-5):min(out.shape[1], src_lens[i]+10)].tolist()
+            boundary_tokens_str = [tokenizer.decode([tid]) for tid in boundary_tokens_ids]
+
+            print(f"\n{'─'*70}")
+            print(f"样本 {i} (原始prompt索引{original_idx}):")
+            print(f"  Prompt长度: {src_lens[i]} tokens")
+            print(f"  Response长度: {response_tokens.shape[0]} tokens")
+            print(f"\n  格式化Prompt(末尾60字符):")
+            print(f"    {formatted_prompt[-60:]}")
+            print(f"\n  Prompt部分Token级(末尾80字符,含special):")
+            print(f"    {prompt_with_special[-80:]}")
+            print(f"\n  边界附近Token(前5个prompt末尾+后5个response开头):")
+            print(f"    IDs: {boundary_tokens_ids}")
+            print(f"    Decoded: {boundary_tokens_str}")
+            print(f"\n  Response部分(前120字符,含special):")
+            print(f"    {response_with_special[:120]}")
+            print(f"\n  Response部分(前120字符,跳special):")
+            print(f"    {decoded[:120]}")
+
+            # 异常检测
+            eot_count = full_with_special.count('<|eot_id|>')
+            if eot_count > 3:
+                print(f"\n  ⚠️ 异常: Full包含{eot_count}个<|eot_id|>（正常≤3）")
+
+            if 'system' in decoded[:100].lower() or '<|start_header_id|>' in response_with_special[:50]:
+                print(f"  ⚠️ 异常: Response开头似乎包含chat header")
+
+            print(f"{'─'*70}")
 
         texts.append(decoded)
 
@@ -2122,17 +2163,33 @@ def load_model_and_tokenizer():
 # SFT：仅对 completion 计 loss
 # =============================================================================
 def tokenize_sft_pair(tokenizer, prompt: str, target: str, device):
-    sep = "\n\n"
-    prompt_ids = tokenizer(prompt + sep, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
-    full_ids   = tokenizer(prompt + sep + target, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
+    """
+    【修复】使用与GRPO相同的chat template，确保SFT→RL一致性
+    """
+    # 【关键修复】使用chat template（与GRPO generate保持一致）
+    system_msg = "You are a helpful, accurate, and unbiased assistant."
+    formatted_prompt = apply_chat_template(tokenizer, prompt, system_msg)
+
+    # Tokenize prompt部分
+    prompt_ids = tokenizer(formatted_prompt, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
+
+    # Tokenize完整序列（prompt + target）
+    # 注意：target不需要再包装，直接拼接即可（assistant的回复内容）
+    full_text = formatted_prompt + target
+    full_ids = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
+
     input_ids = full_ids["input_ids"]
     attn_mask = full_ids.get("attention_mask")
     labels = input_ids.clone()
+
+    # Mask掉prompt部分（只对assistant回复部分计算loss）
     prompt_len = prompt_ids["input_ids"].shape[1]
     labels[:, :prompt_len] = -100
+
     batch = {"input_ids": input_ids.to(device), "labels": labels.to(device)}
     if attn_mask is not None:
         batch["attention_mask"] = attn_mask.to(device)
+
     return batch
 
 # =============================================================================
