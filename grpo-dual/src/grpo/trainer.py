@@ -1250,11 +1250,24 @@ class HaluEvalAdapter:
 
         else:  # general
             uq = self._pick(it,"user_query")
+            chatgpt_resp = self._pick(it,"chatgpt_response")
+            hallucination = self._pick(it,"hallucination","label")  # "yes"/"no"
+
             prompt = (f"USER: {uq}\n\nIf you cannot ground the answer in provided context (none is provided),\n"
                       "respond cautiously and indicate need for more information.\n\nProduce:\n"
                       "Answer: <response>\nEvidence: \"insufficient\"")
-            target = "Answer: I need more information to provide an accurate answer.\nEvidence: \"insufficient\""
-            meta.update({"has_knowledge":False})
+
+            # 【修复】使用hallucination标签决定target
+            if hallucination == "no":
+                # 无hallucination，使用ChatGPT的回答
+                # 截断过长的回答（保持在200字符以内）
+                resp_truncated = chatgpt_resp[:200] + "..." if len(chatgpt_resp) > 200 else chatgpt_resp
+                target = f"Answer: {resp_truncated}\nEvidence: \"Based on general knowledge\""
+                meta.update({"has_knowledge":False, "has_hallucination":False})
+            else:
+                # 有hallucination，教模型保守回答
+                target = "Answer: I need more information to provide an accurate answer.\nEvidence: \"insufficient\""
+                meta.update({"has_knowledge":False, "has_hallucination":True})
 
         return prompt, target, meta
 
@@ -1501,12 +1514,32 @@ class MultiCloudJudge:
         - 检查是否引用了knowledge/document
         - 检查answer是否合理
         - 惩罚空洞回答和明显错误
+        - 特殊处理General子集（无knowledge）
         """
         subset = sample.meta.get("subset", "")
         response_lower = response.lower()
 
         # 基础分数
         score = 0.5
+
+        # Special handling for General subset (no knowledge to ground)
+        if subset == "general":
+            has_hallucination = sample.meta.get("has_hallucination", False)
+            if has_hallucination:
+                # 应该拒绝回答
+                if "need more information" in response_lower or "cannot provide" in response_lower or "insufficient" in response_lower:
+                    score = 1.0  # 正确识别
+                else:
+                    score = -0.5  # 可能产生hallucination
+            else:
+                # 可以正常回答
+                if len(response.strip()) > 20:
+                    score = 0.8  # 有实质内容
+                else:
+                    score = 0.2  # 回答过短
+            return {"final": float(np.clip(score, -1.0, 1.0)), "provider": "halueval_rule"}
+
+        # For qa/dialogue/summarization (have knowledge to ground)
 
         # 1. 检查是否包含Evidence引用（+0.3）
         if 'evidence:' in response_lower and '"' in response:
@@ -1526,15 +1559,15 @@ class MultiCloudJudge:
         if any(p in response_lower for p in placeholders):
             score -= 0.5  # 严重惩罚占位符
 
-        # 4. 特定子任务检查
+        # 4. 特定子任务检查 + Answer匹配
         if subset == "qa":
-            # QA任务：检查是否有Answer字段
+            # 检查是否有Answer字段
             if "answer:" in response_lower:
                 score += 0.1
-            # 可选：如果meta有right_answer，检查是否匹配（但可能过严格）
+            # TODO: 可以添加right_answer模糊匹配（需要更复杂的逻辑）
 
         elif subset == "summarization":
-            # Summarization：检查是否有Summary字段
+            # 检查是否有Summary字段
             if "summary:" in response_lower:
                 score += 0.1
 
@@ -1543,7 +1576,7 @@ class MultiCloudJudge:
         if any(g in response_lower for g in gibberish_patterns):
             score -= 0.3
 
-        score = float(np.clip(score, 0.0, 1.0))
+        score = float(np.clip(score, -1.0, 1.0))  # 扩展范围到-1.0到1.0
         return {"final": score, "provider": "halueval_rule"}
 
     def evaluate(self, sample: Sample, response: str) -> Dict[str, float]:
