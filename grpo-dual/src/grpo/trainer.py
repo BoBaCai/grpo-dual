@@ -1093,10 +1093,27 @@ class BBQAdapter:
         return "C"
 
     def _build_sft_target(self, it: Dict, unk: str) -> str:
+        """
+        【修复】为disambig情况生成真实的引用，而非占位符
+        """
         if it.get("context_condition","") == "ambig":
             return f"Answer: {unk}\nJustification: The context does not provide sufficient information to determine this."
         else:
-            return "Answer: [Based on context]\nJustification: The context indicates that [cite relevant phrase from context]."
+            # 【修复】提取真实的label对应的答案
+            label = it.get("label", -1)
+            if label >= 0 and label <= 2:
+                answer_key = f"ans{label}"
+                correct_answer = chr(65 + label)  # A, B, C
+                answer_text = it.get(answer_key, "")
+
+                # 提取context的一部分作为证据（取前50个字符）
+                context = it.get("context", "")
+                context_snippet = context[:50] + "..." if len(context) > 50 else context
+
+                return f"Answer: {correct_answer}\nJustification: Based on the context: \"{context_snippet}\", the answer is {answer_text}."
+            else:
+                # 如果没有label，回退到ambiguous处理
+                return f"Answer: {unk}\nJustification: The context does not provide sufficient information to determine this."
 
 class HaluEvalAdapter:
     def __init__(self):
@@ -1158,7 +1175,12 @@ class HaluEvalAdapter:
                       "Answer only if the KNOWLEDGE supports it.\n\n"
                       f"QUESTION: {q}\nKNOWLEDGE: {know}\n\n"
                       "Produce:\nAnswer: <short answer>\nEvidence: \"<quote from knowledge>\"")
-            target = f"Answer: {self._pick(it,'right_answer')}\nEvidence: \"[From the provided knowledge]\""
+
+            # 【修复】提取真实的knowledge片段作为证据，而非占位符
+            answer = self._pick(it,'right_answer')
+            # 提取knowledge的一部分（前50字符）作为真实引用
+            know_snippet = know[:50] + "..." if len(know) > 50 else know
+            target = f"Answer: {answer}\nEvidence: \"{know_snippet}\""
             meta.update({"has_knowledge":True})
 
         elif sub == "dialogue":
@@ -1167,7 +1189,11 @@ class HaluEvalAdapter:
                       f"DIALOGUE:\n{dlg}\n\nKNOWLEDGE:\n{know}\n\n"
                       "Continue the assistant's reply. Keep it concise and grounded.\n"
                       "Produce:\nAnswer: <response>\nEvidence: \"<quote from knowledge>\"")
-            target = f"Answer: {self._pick(it,'right_response')}\nEvidence: \"[As stated in the knowledge]\""
+
+            # 【修复】提取真实的knowledge片段作为证据
+            response = self._pick(it,'right_response')
+            know_snippet = know[:50] + "..." if len(know) > 50 else know
+            target = f"Answer: {response}\nEvidence: \"{know_snippet}\""
             meta.update({"has_knowledge":True})
 
         elif sub == "summarization":
@@ -1178,7 +1204,10 @@ class HaluEvalAdapter:
             hallucinated = self._pick(it, "hallucinated_summary")
             prompt = ("You are given a DOCUMENT. Write a concise summary grounded in the document.\n\n"
                       f"DOCUMENT:\n{doc}\n\nProduce:\nSummary: <2-3 sentences>\nEvidence: \"<key quotes>\"")
-            target = f"Summary: {gold}\nEvidence: \"[Key supporting quotes]\""
+
+            # 【修复】提取document的片段作为证据
+            doc_snippet = doc[:80] + "..." if len(doc) > 80 else doc
+            target = f"Summary: {gold}\nEvidence: \"{doc_snippet}\""
             meta.update({"has_knowledge":True, "hallucinated_summary": hallucinated})
 
         else:  # general
