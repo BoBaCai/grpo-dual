@@ -220,17 +220,19 @@ class Config:
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
     # 【修改】生成配置：平衡质量与性能
-    MAX_NEW_TOKENS_TRAIN = 96      # 【修复】从64提升到96，解决Hallucination任务25%截断率
-    MAX_NEW_TOKENS_EVAL = 96       # 评测同步提升
-    MIN_NEW_TOKENS_TRAIN = 15      # 【实验】3→15，延迟EOS释放测试终止符先验（根因#4）
+    MAX_NEW_TOKENS_TRAIN = 128     # 【修复】从96提升到128，减少截断
+    MAX_NEW_TOKENS_EVAL = 128      # 评测同步提升
+    MIN_NEW_TOKENS_TRAIN = 5       # 【关键修复】从15降到5，避免强制续写导致乱码
+                                   # 原因：Hallucination任务想在10 tokens结束，但被迫续到15+导致乱码token
 
-    TEMPERATURE_TRAIN = 1.2        # 【实验】1.0→1.2，对抗gap=7-10极尖分布（根因#3）
-    TOP_K_TRAIN = 0                # 【实验】禁用top_k，只用top_p（避免双重限制）
-    TOP_P_TRAIN = 0.95             # 【实验】0.75→0.95，显著放宽探索空间（根因#3）
-    REP_PENALTY_TRAIN = 1.05       # 【实验】1.15→1.05，降低重复惩罚（配合penalty口径修复）
-    
-    PRESENCE_PENALTY = 0.3         # 【实验】0.6→0.3，配合口径修复（现只作用于response）
-    FREQUENCY_PENALTY = 0.2        # 【实验】0.4→0.2，配合口径修复（现只作用于response）
+    TEMPERATURE_TRAIN = 0.9        # 【修复】从1.2降到0.9，配合更强的惩罚
+    TOP_K_TRAIN = 100              # 【修复】启用top_k=100，限制低频乱码token
+    TOP_P_TRAIN = 0.9              # 【修复】从0.95收紧到0.9
+    REP_PENALTY_TRAIN = 1.18       # 【修复】从1.05提升到1.18，强力去重
+
+    PRESENCE_PENALTY = 0.7         # 【修复】从0.3提升到0.7，惩罚模板化输出
+    FREQUENCY_PENALTY = 0.3        # 【修复】从0.2提升到0.3
+    NO_REPEAT_NGRAM_SIZE = 3       # 【新增】禁止3-gram重复，防止"insufficient information"循环
     
     # 【移除】LENGTH_PENALTY_TRAIN（只对beam search有效，采样模式下无效）
     
@@ -1852,6 +1854,7 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
             top_k=config.TOP_K_TRAIN,
             top_p=config.TOP_P_TRAIN,
             repetition_penalty=config.REP_PENALTY_TRAIN,
+            no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,  # 【新增】防止n-gram重复
             logits_processor=processors,  # 只包含 Penalty + Sanity
             num_return_sequences=1,
             pad_token_id=tokenizer.pad_token_id,
