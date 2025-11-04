@@ -4,7 +4,38 @@
 
 ---
 
-## 已修复的Critical Bug（5个）
+## 🔥 最关键的Bug（解释所有异常现象）
+
+### Bug #0: pad_token设置错误
+**问题**: LLaMA-3的`eos_token`默认是`<|eot_id|>` (128009)，导致：
+```python
+# 错误代码（已修复）：
+tokenizer.pad_token = tokenizer.eos_token  # pad_token_id = 128009 = eot_token_id
+```
+
+**影响**:
+- **所有padding被当成"对话轮次结束"**
+- 短prompt有50+个padding → 50+个eot信号
+- 解释logging中的`<|eot_id|>`爆量（36/79/148个）
+- 模型训练和生成完全错乱
+
+**修复**:
+```python
+# 正确：明确使用<|end_of_text|>作为padding
+tokenizer.pad_token = '<|end_of_text|>'  # id=128001
+# <|eot_id|> (128009) 保留给对话轮次结束
+```
+
+**验证**（训练启动时会自动打印）:
+```
+pad_token: '<|end_of_text|>' (id=128001)  ← 必须是128001
+eos_token: '<|eot_id|>' (id=128009)        ← 128009
+✅ 验证通过: pad_token_id (128001) ≠ eot_token_id (128009)
+```
+
+---
+
+## 已修复的Critical Bug（另外5个）
 
 ### Bug #1: SFT与RL使用不同的模板格式
 - **位置**: `tokenize_sft_pair()` line 2165
@@ -59,13 +90,19 @@ comp_end = T - 1
 
 | Bug | 影响范围 | 需要重训 |
 |-----|----------|----------|
+| #0 | **所有padding=eot信号（最根本）** | **SFT + GRPO** |
 | #1 | SFT学错了格式 | SFT + GRPO |
 | #2 | 所有reward信号 | GRPO |
 | #3 | 所有KL/loss梯度 | GRPO |
 | #4 | 所有reward信号 | GRPO |
-| #5 | 所有loss梯度（最严重）| GRPO |
+| #5 | 所有loss梯度 | GRPO |
 
 **之前的checkpoint全部作废。**
+
+**Bug #0是根本原因** - 解释了logging中所有异常现象：
+- `<|eot_id|>`爆量（36/79/148）
+- 极短生成（模型以为padding就是结束信号）
+- 熵崩塌（训练数据被padding污染）
 
 ---
 
@@ -204,19 +241,31 @@ FREQUENCY_PENALTY = 0.2        # 降低（配合scope修复）
 ## Commit记录
 
 ```bash
-git log --oneline HEAD~7..HEAD
+git log --oneline HEAD~10..HEAD
+91ee919 CRITICAL: fix pad_token must be <|end_of_text|> not <|eot_id|>
+fa435d2 docs: update HANDOFF with tokenizer validation info
+32a8753 feat: add tokenizer config validation at startup
+5459abf docs: update HANDOFF to explain improved diagnostics
+40b85f6 fix: improve boundary diagnostics to distinguish padding from actual eot tokens
+9172089 docs: add handoff documentation for critical bug fixes
 a07af9a CRITICAL: fix comp_mask calculation for left padding
 fc99b9f CRITICAL: fix left padding response extraction boundary error
 86a5902 CRITICAL: fix _tokenize_concat using wrong prompt format for KL/loss
 6810389 CRITICAL: fix SFT→RL template inconsistency causing boundary corruption
-be52b55 fix: address structural root causes of entropy collapse
 ```
+
+**最关键的commit**: `91ee919` - 修复pad_token配置错误，解释所有异常现象
 
 ---
 
 ## 文件修改汇总
 
 ### `src/grpo/trainer.py`
+
+#### Line 2144-2163: Tokenizer Initialization (CRITICAL)
+- 修复pad_token设置：必须用`<|end_of_text|>` (128001)
+- 不能用`<|eot_id|>` (128009)作为padding
+- 添加自动验证，如果配置错误会抛出异常
 
 #### Line 1713-1749: Penalty Processors
 - 添加`prompt_len`跟踪
