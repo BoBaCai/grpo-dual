@@ -131,11 +131,20 @@ Fairness样本 0: entropy=X.XXX
 ```
 预期：>0.5（如果≈0说明仍有问题）
 
-#### ✅ EOS数量正常
+#### ✅ EOT token数量正常
 ```
-Full包含 X 个<|eot_id|>
+Token统计:
+  Prompt: X个<|eot_id|> tokens, Y个padding
+  Response: Z个<|eot_id|> tokens
 ```
-预期：≤3（如果36/79/148说明模板重复/错误）
+预期：
+- Prompt: 2个（system结束 + user结束）+ padding（可能很多，因为pad_token_id=eos_token_id）
+- Response: ≤1个（回答结束）
+
+如果看到：
+- `pad_token_id == eot_token_id` → **正常**（LLaMA-3标准配置）
+- Prompt有50+个eot + 50+个padding → **正常**（短prompt的LEFT padding显示）
+- Response有10+个eot → **异常**（模型在回答中反复生成eot）
 
 ### ⚠️ 异常立即停止训练
 
