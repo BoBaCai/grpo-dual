@@ -1216,8 +1216,8 @@ class HaluEvalAdapter:
 
             # 【修复】提取真实的knowledge片段作为证据，而非占位符
             answer = self._pick(it,'right_answer')
-            # 提取knowledge的一部分（前50字符）作为真实引用
-            know_snippet = know[:50] + "..." if len(know) > 50 else know
+            # 提取knowledge的一部分（QA平均341字符，取150字符约占44%）
+            know_snippet = know[:150] + "..." if len(know) > 150 else know
             target = f"Answer: {answer}\nEvidence: \"{know_snippet}\""
             meta.update({"has_knowledge":True})
 
@@ -1230,7 +1230,8 @@ class HaluEvalAdapter:
 
             # 【修复】提取真实的knowledge片段作为证据
             response = self._pick(it,'right_response')
-            know_snippet = know[:50] + "..." if len(know) > 50 else know
+            # Dialogue knowledge格式类似QA，使用相同长度150字符
+            know_snippet = know[:150] + "..." if len(know) > 150 else know
             target = f"Answer: {response}\nEvidence: \"{know_snippet}\""
             meta.update({"has_knowledge":True})
 
@@ -1244,7 +1245,8 @@ class HaluEvalAdapter:
                       f"DOCUMENT:\n{doc}\n\nProduce:\nSummary: <2-3 sentences>\nEvidence: \"<key quotes>\"")
 
             # 【修复】提取document的片段作为证据
-            doc_snippet = doc[:80] + "..." if len(doc) > 80 else doc
+            # Document平均3297字符，截断为1000后，取200字符evidence（占20%）
+            doc_snippet = doc[:200] + "..." if len(doc) > 200 else doc
             target = f"Summary: {gold}\nEvidence: \"{doc_snippet}\""
             meta.update({"has_knowledge":True, "hallucinated_summary": hallucinated})
 

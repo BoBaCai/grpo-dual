@@ -36,13 +36,19 @@ Unknown选项: answer_info.ans2 = ["Can't be determined", "unknown"]
 
 ## HaluEval数据集分析
 
-### 基本统计
+### 基本统计（已验证）
 ```
-QA子集:            10,000样本
+QA子集:            10,000样本，平均knowledge长度: 341字符
 Dialogue子集:      10,000样本
-Summarization子集: 10,000样本
+Summarization子集: 10,000样本，平均document长度: 3297字符（max: 9252）
 General子集:       4,507样本
 总计:              34,507样本
+
+文件大小:
+- QA: 5.9 MB
+- Dialogue: 6.7 MB
+- Summarization: 44.8 MB
+- General: 3.2 MB
 ```
 
 ### 各子集字段结构
@@ -50,7 +56,7 @@ General子集:       4,507样本
 #### 1. QA子集
 ```json
 {
-  "knowledge": str,              // 背景知识（平均长度？）
+  "knowledge": str,              // 背景知识（平均341字符）
   "question": str,
   "right_answer": str,           // 短答案："Arthur's Magazine"
   "hallucinated_answer": str     // 错误答案："First for Women was started first."
@@ -58,14 +64,15 @@ General子集:       4,507样本
 ```
 
 **关键特征**:
-- ✅ 有knowledge可以grounding
+- ✅ 有knowledge可以grounding（平均341字符）
 - ✅ right_answer是短答案格式
 - ✅ 有hallucinated版本可用于对比学习
+- ⚠️ 之前snippet只取50字符（仅15%），已调整为150字符（44%）
 
 #### 2. Dialogue子集
 ```json
 {
-  "knowledge": str,
+  "knowledge": str,              // 格式类似QA（平均长度未统计，假设相似）
   "dialogue_history": str,
   "right_response": str,         // 完整句子
   "hallucinated_response": str
@@ -73,22 +80,24 @@ General子集:       4,507样本
 ```
 
 **关键特征**:
-- ✅ 有knowledge
+- ✅ 有knowledge（格式类似QA）
 - ✅ right_response是完整句子（不是短答案）
+- ⚠️ 已调整snippet为150字符（与QA一致）
 
 #### 3. Summarization子集
 ```json
 {
-  "document": str,               // 平均7000+字符！
+  "document": str,               // 平均3297字符，最大9252字符
   "right_summary": str,          // 平均310字符
   "hallucinated_summary": str    // 平均356字符
 }
 ```
 
 **关键特征**:
-- ⚠️ Document非常长（示例7145字符）
+- ⚠️ Document很长（平均3297字符）
+- ✅ 当前SUMM_MAX_DOC_CHARS=1000（约30%原文）合理
+- ⚠️ 之前evidence snippet只取80字符（8%），已调整为200字符（20%）
 - ✅ Summary长度合理（300+字符）
-- ✅ 当前SUMM_MAX_DOC_CHARS=1000（约14%原文）应该足够
 
 #### 4. General子集 ⚠️ 特殊
 ```json
@@ -108,76 +117,65 @@ General子集:       4,507样本
 
 ### HaluEval在trainer.py中的处理
 
-#### QA子集 (1187-1199)
+#### QA子集 (1210-1222)
 ```python
 # ✅ 正确使用right_answer
 answer = self._pick(it,'right_answer')
-know_snippet = know[:50] + "..." if len(know) > 50 else know
+# 基于实际统计（平均341字符），调整为150字符（占44%）
+know_snippet = know[:150] + "..." if len(know) > 150 else know
 target = f"Answer: {answer}\nEvidence: \"{know_snippet}\""
 ```
 
-**潜在问题**:
-- Knowledge snippet只取50字符，可能需要根据实际平均长度调整
+**已修复**:
+- ✅ Knowledge snippet: 50 → 150字符（基于实际平均长度341字符）
 
-#### Dialogue子集 (1201-1212)
+#### Dialogue子集 (1224-1236)
 ```python
 # ✅ 正确使用right_response
 response = self._pick(it,'right_response')
-know_snippet = know[:50] + "..." if len(know) > 50 else know
+# 与QA保持一致，调整为150字符
+know_snippet = know[:150] + "..." if len(know) > 150 else know
 target = f"Answer: {response}\nEvidence: \"{know_snippet}\""
 ```
 
-**潜在问题**:
-- 同上，snippet可能过短
+**已修复**:
+- ✅ Knowledge snippet: 50 → 150字符（与QA一致）
 
-#### Summarization子集 (1214-1226)
+#### Summarization子集 (1238-1251)
 ```python
 # ✅ 正确使用right_summary
 doc = doc[:1000] + "..." if len(doc) > 1000 else doc  # SUMM_MAX_DOC_CHARS
-doc_snippet = doc[:80] + "..."
+# 基于实际统计（平均3297，截断为1000），evidence取200字符（占20%）
+doc_snippet = doc[:200] + "..." if len(doc) > 200 else doc
 target = f"Summary: {gold}\nEvidence: \"{doc_snippet}\""
 ```
 
-**潜在问题**:
-- Evidence snippet只有80字符，而document已截断为1000字符
-- 可能需要增加evidence snippet长度
+**已修复**:
+- ✅ Evidence snippet: 80 → 200字符（基于截断后1000字符的20%）
 
-#### General子集 (1251-1257) ❌ 有问题
+#### General子集 (1253-1270) ✅ 已修复
 ```python
-# ❌ 问题：完全忽略了chatgpt_response和hallucination标签
-prompt = f"USER: {uq}\n\nIf you cannot ground...\nProduce:\nAnswer: <response>\nEvidence: \"insufficient\""
-target = "Answer: I need more information to provide an accurate answer.\nEvidence: \"insufficient\""
-meta.update({"has_knowledge":False})
-```
-
-**问题分析**:
-1. **忽略了真实数据**: chatgpt_response和hallucination标签未被使用
-2. **固定target不合理**: 所有General样本都学习同样的"I need more information"
-3. **失去训练价值**: 无法学习区分有/无hallucination的回答
-
-**建议修复方案**:
-
-**选项A**: 使用hallucination标签训练
-```python
-hallucination = self._pick(it, "hallucination")
-chatgpt_response = self._pick(it, "chatgpt_response")
+# ✅ 使用hallucination标签决定target
+chatgpt_resp = self._pick(it,"chatgpt_response")
+hallucination = self._pick(it,"hallucination","label")  # "yes"/"no"
 
 if hallucination == "no":
-    # 无hallucination，使用ChatGPT回答
-    target = f"Answer: {chatgpt_response}\nEvidence: \"Based on general knowledge\""
+    # 无hallucination，使用ChatGPT的回答（截断200字符）
+    resp_truncated = chatgpt_resp[:200] + "..." if len(chatgpt_resp) > 200 else chatgpt_resp
+    target = f"Answer: {resp_truncated}\nEvidence: \"Based on general knowledge\""
+    meta.update({"has_knowledge":False, "has_hallucination":False})
 else:
-    # 有hallucination，教模型拒绝
+    # 有hallucination，教模型保守回答
     target = "Answer: I need more information to provide an accurate answer.\nEvidence: \"insufficient\""
+    meta.update({"has_knowledge":False, "has_hallucination":True})
 ```
 
-**选项B**: 完全跳过General子集
-```python
-# 在HaluEvalAdapter.load_samples()中：
-if sub == "general":
-    continue  # 跳过General子集
-```
-
-**推荐**: 选项A更好，因为可以利用4507个样本学习区分有/无hallucination
+**已修复**:
+- ✅ 使用hallucination标签区分有/无hallucination样本
+- ✅ hallucination="no"时使用chatgpt_response（实际内容）
+- ✅ hallucination="yes"时教模型保守回答
+- ✅ 添加has_hallucination标志到meta，供评估器使用
+- ✅ 4507个General样本现在得到有效利用
 
 ---
 
