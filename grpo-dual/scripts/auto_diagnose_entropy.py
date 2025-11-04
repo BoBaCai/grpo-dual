@@ -391,33 +391,34 @@ class DiagnosticEngine:
 # 主函数
 # ============================================================================
 
-def main():
-    parser = argparse.ArgumentParser(description='自动化 Entropy 崩溃诊断')
-    parser.add_argument('--log', type=str, help='训练日志文件路径')
-    parser.add_argument('--test-base-model', type=str, help='Base model 名称/路径')
+def diagnose(log_path=None, base_model=None):
+    """
+    诊断函数（可在 notebook 中直接调用）
 
-    args = parser.parse_args()
-
-    if not args.log and not args.test_base_model:
-        print("❌ 请指定 --log 或 --test-base-model")
+    Args:
+        log_path: 训练日志文件路径
+        base_model: Base model 名称/路径
+    """
+    if not log_path and not base_model:
+        print("❌ 请指定 log_path 或 base_model")
         print("\n用法:")
-        print("  python scripts/auto_diagnose_entropy.py --log train.log")
-        print("  python scripts/auto_diagnose_entropy.py --test-base-model MODEL_NAME")
-        print("  python scripts/auto_diagnose_entropy.py --log train.log --test-base-model MODEL_NAME")
-        sys.exit(1)
+        print("  diagnose(log_path='train.log')")
+        print("  diagnose(base_model='meta-llama/Llama-3.2-1B-Instruct')")
+        print("  diagnose(log_path='train.log', base_model='MODEL_NAME')")
+        return None
 
     engine = DiagnosticEngine()
 
     # 分析训练日志
-    if args.log:
-        parser = LogParser(args.log)
+    if log_path:
+        parser = LogParser(log_path)
         if parser.parse():
             stats = parser.get_stats()
             engine.analyze_training_log(stats)
 
     # 测试 base model
-    if args.test_base_model:
-        tester = BaseModelTester(args.test_base_model)
+    if base_model:
+        tester = BaseModelTester(base_model)
         result = tester.test()
         if result:
             engine.analyze_base_model(result)
@@ -428,6 +429,34 @@ def main():
     print("\n" + "="*80)
     print("✅ 诊断完成")
     print("="*80)
+
+    return engine
+
+def main():
+    """命令行入口（检测 notebook 环境）"""
+    # 检测是否在 notebook 环境
+    try:
+        get_ipython()
+        in_notebook = True
+    except NameError:
+        in_notebook = False
+
+    if in_notebook:
+        print("🔔 检测到 Jupyter notebook 环境")
+        print("\n在 notebook 中使用函数式接口：")
+        print("  from auto_diagnose_entropy import diagnose")
+        print("  diagnose(log_path='train.log')")
+        print("  diagnose(base_model='MODEL_NAME')")
+        return
+
+    # 命令行模式
+    parser = argparse.ArgumentParser(description='自动化 Entropy 崩溃诊断')
+    parser.add_argument('--log', type=str, help='训练日志文件路径')
+    parser.add_argument('--test-base-model', type=str, help='Base model 名称/路径')
+
+    args = parser.parse_args()
+
+    diagnose(log_path=args.log, base_model=args.test_base_model)
 
 if __name__ == "__main__":
     main()
