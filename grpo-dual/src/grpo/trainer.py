@@ -1860,7 +1860,10 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
             return_dict_in_generate=False,
         )
     # §3: 拆回每个 prompt 的 k 条，并准确检测截断
-    src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)
+    # 【关键修复】使用原始输入长度（含padding），而非非padding token计数
+    # 这是LEFT PADDING下正确提取response的关键！
+    original_input_len = inputs["input_ids"].shape[1]
+    src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)  # 仅用于诊断
     texts, lengths, prompt_lens, truncated_flags = [], [], [], []
 
     # 【关键诊断】边界检查（前2步）
@@ -1871,7 +1874,9 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
         print(f"out.shape={out.shape}, src_lens[:3]={src_lens[:3].tolist()}")
 
     for i in range(out.shape[0]):
-        response_tokens = out[i, src_lens[i]:]
+        # 【关键修复】使用original_input_len而非src_lens[i]
+        # src_lens[i]计数非padding tokens，但切片需要位置边界（含padding的总长度）
+        response_tokens = out[i, original_input_len:]
         decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
 
         # 【关键诊断】详细边界分析（前2步，前2样本）
@@ -1883,20 +1888,20 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
             # Full sequence (含special tokens)
             full_with_special = tokenizer.decode(out[i], skip_special_tokens=False)
 
-            # Prompt部分 (含special tokens)
-            prompt_tokens = out[i, :src_lens[i]]
+            # Prompt部分 (含special tokens) - 使用original_input_len
+            prompt_tokens = out[i, :original_input_len]
             prompt_with_special = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
 
             # Response部分 (含special tokens)
             response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
 
-            # Token级细节：边界附近±5个token
-            boundary_tokens_ids = out[i, max(0, src_lens[i]-5):min(out.shape[1], src_lens[i]+10)].tolist()
+            # Token级细节：边界附近±5个token - 使用original_input_len
+            boundary_tokens_ids = out[i, max(0, original_input_len-5):min(out.shape[1], original_input_len+10)].tolist()
             boundary_tokens_str = [tokenizer.decode([tid]) for tid in boundary_tokens_ids]
 
             print(f"\n{'─'*70}")
             print(f"样本 {i} (原始prompt索引{original_idx}):")
-            print(f"  Prompt长度: {src_lens[i]} tokens")
+            print(f"  Prompt长度(含padding): {original_input_len} tokens (非padding: {src_lens[i]} tokens)")
             print(f"  Response长度: {response_tokens.shape[0]} tokens")
             print(f"\n  格式化Prompt(末尾60字符):")
             print(f"    {formatted_prompt[-60:]}")
