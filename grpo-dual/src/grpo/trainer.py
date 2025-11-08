@@ -2930,6 +2930,40 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
         t_adv = _t.time() - t_adv0
 
+        # 【C2修复】组内std监控：检测并警告reward完全相同的组（会导致梯度信号为0）
+        zero_gradient_groups = 0
+        B = len(batch)
+        K = config.K_ROLLOUTS
+        for i in range(B):
+            group_rewards = rewards_list[i*K : (i+1)*K]
+            group_std = np.std(group_rewards)
+
+            if group_std < 0.01:  # std过小，组内几乎相同
+                zero_gradient_groups += 1
+
+                # 前20步详细打印
+                if step < 20:
+                    print(f"⚠️ [Step {step+1}] 组{i} reward std过小({group_std:.6f})，该组梯度≈0")
+                    print(f"   Rewards: {[f'{r:.3f}' for r in group_rewards]}")
+                    print(f"   Responses preview:")
+                    for j in range(K):
+                        idx = i * K + j
+                        resp_preview = all_resps[idx][:80].replace('\n', ' ')
+                        print(f"     [{j}] {resp_preview}...")
+
+                # 注意：这里不需要手动设置adv=0，因为compute_group_advantages已经会自动产生≈0
+                # 这里只是监控和警告
+
+        # 统计并报告
+        if zero_gradient_groups > 0:
+            ratio = zero_gradient_groups / B
+            print(f"\n⚠️ [Step {step+1}] {zero_gradient_groups}/{B} 组({ratio:.1%})的reward std<0.01，梯度信号被抹平")
+            if ratio > 0.5:
+                print(f"   ⚠️⚠️⚠️ 超过50%的组无梯度！A+B修复可能未生效，检查：")
+                print(f"   1. MIN_NEW_TOKENS是否=5？")
+                print(f"   2. 模板检测器是否在工作？（看provider分布）")
+                print(f"   3. 生成内容是否仍然高度相似？")
+
         # 【优先级C：Reward统计监控】分析Fairness vs Hallucination的reward分布和信号强度
         if step < 20:
             fairness_indices_all = [i for i, task in enumerate(task_list) if task == "fairness"]
