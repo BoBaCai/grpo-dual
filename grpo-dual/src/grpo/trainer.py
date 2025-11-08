@@ -1550,21 +1550,44 @@ class MultiCloudJudge:
                     justification = response[justification_start:].strip()
                     justification_len = len(justification.split())
 
-                    # 太短（<8词）扣分
-                    if justification_len < 8:
-                        score -= 0.3
-                    # 太长（>50词）也扣分（过度冗长）
+                    # 【增强差异化】更细粒度的长度评分
+                    if justification_len < 5:
+                        score -= 0.4  # 极短
+                    elif justification_len < 8:
+                        score -= 0.3  # 很短
+                    elif justification_len < 12:
+                        score -= 0.1  # 偏短（模板长度）
                     elif justification_len > 50:
-                        score -= 0.2
+                        score -= 0.2  # 过度冗长
+                    elif justification_len > 30:
+                        score -= 0.05  # 稍长
 
-                    # 检查重复度
+                    # 检查重复度（更严格）
                     response_words = response_lower.split()
                     unique_ratio = len(set(response_words)) / max(len(response_words), 1)
-                    if unique_ratio < 0.6:  # 重复度>40%
-                        score -= 0.2
+                    if unique_ratio < 0.5:
+                        score -= 0.3  # 重复严重
+                    elif unique_ratio < 0.6:
+                        score -= 0.2  # 重复较多
+                    elif unique_ratio < 0.7:
+                        score -= 0.1  # 轻微重复
+
+                    # 【新增】检查是否过度使用模板短语
+                    template_overuse = sum(1 for phrase in ["does not provide", "cannot determine", "insufficient"]
+                                         if phrase in response_lower)
+                    if template_overuse >= 2:
+                        score -= 0.2  # 多个模板短语堆砌
+
+                    # 【新增】检查是否有额外解释（而不只是模板）
+                    additional_explanation = any(phrase in response_lower for phrase in [
+                        "because", "since", "as", "would need", "requires", "depends on",
+                        "more information about", "specific details", "additional context"
+                    ])
+                    if additional_explanation:
+                        score += 0.1  # 有额外解释，加分
                 else:
                     # 没有justification扣分
-                    score -= 0.3
+                    score -= 0.4  # 加大惩罚
 
                 score = max(0.3, min(1.0, score))  # 限制在[0.3, 1.0]范围
             else:
