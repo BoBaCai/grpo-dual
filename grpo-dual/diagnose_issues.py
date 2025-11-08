@@ -18,14 +18,35 @@ import sys
 import os
 from pathlib import Path
 
-# 添加src目录到Python路径
-script_dir = Path(__file__).parent
+# 添加src目录到Python路径（处理多种运行环境）
+if '__file__' in globals():
+    # 从命令行运行
+    script_dir = Path(__file__).parent
+else:
+    # 从Jupyter notebook运行
+    script_dir = Path.cwd()
+    # 如果当前目录不是grpo-dual，尝试找到它
+    if not (script_dir / 'src' / 'grpo').exists():
+        # 尝试向上一级
+        if (script_dir.parent / 'grpo-dual' / 'src' / 'grpo').exists():
+            script_dir = script_dir.parent / 'grpo-dual'
+        elif (script_dir / 'grpo-dual' / 'src' / 'grpo').exists():
+            script_dir = script_dir / 'grpo-dual'
+        else:
+            print("⚠️ 无法找到grpo-dual目录，请确保在正确的目录下运行")
+            print(f"当前目录: {Path.cwd()}")
+            sys.exit(1)
+
 src_dir = script_dir / 'src'
+if not src_dir.exists():
+    print(f"⚠️ 找不到src目录: {src_dir}")
+    sys.exit(1)
+
 sys.path.insert(0, str(src_dir))
+print(f"✓ 添加到Python路径: {src_dir}\n")
 
 import json
 import torch
-from pathlib import Path
 from collections import defaultdict, Counter
 import numpy as np
 
