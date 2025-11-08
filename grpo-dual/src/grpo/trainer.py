@@ -1681,36 +1681,72 @@ class MultiCloudJudge:
         # For qa/dialogue/summarization (have knowledge to ground)
 
         # 1. 检查是否包含Evidence引用（+0.3）
-        if 'evidence:' in response_lower and '"' in response:
-            score += 0.3
+        has_evidence = 'evidence:' in response_lower and '"' in response
+        if has_evidence:
+            # 【修复】检查Evidence的实质性，不只是格式
+            evidence_start = response_lower.find('evidence:')
+            evidence_text = response[evidence_start:].strip()
+            evidence_len = len(evidence_text.split())
+
+            if evidence_len < 5:
+                score += 0.1  # Evidence太短，只给部分分
+            elif evidence_len > 50:
+                score += 0.2  # Evidence太长可能冗余
+            else:
+                score += 0.3  # Evidence长度合理
         else:
             score -= 0.2  # 没有引用evidence → 惩罚
 
-        # 2. 检查是否有实质内容（+0.2）
-        if len(response.strip()) > 30:
-            score += 0.2
-        else:
-            score -= 0.2  # 回答太短
+        # 2. 检查Answer的实质性
+        if 'answer:' in response_lower:
+            answer_start = response_lower.find('answer:')
+            # 找到下一个字段的开始（Evidence/Summary）或结束
+            next_field = len(response)
+            for field in ['evidence:', 'summary:', 'justification:']:
+                pos = response_lower.find(field, answer_start)
+                if pos != -1:
+                    next_field = min(next_field, pos)
 
-        # 3. 检查是否包含占位符（-0.5）
+            answer_text = response[answer_start:next_field].strip()
+            answer_len = len(answer_text.split())
+
+            # 【修复】根据Answer长度和质量差异化评分
+            if answer_len < 3:
+                score -= 0.2  # Answer太短
+            elif answer_len > 30:
+                score -= 0.1  # Answer太长可能冗余
+            else:
+                score += 0.2  # Answer长度合理
+
+            # 检查Answer的重复度
+            answer_words = answer_text.lower().split()
+            if len(answer_words) > 0:
+                unique_ratio = len(set(answer_words)) / len(answer_words)
+                if unique_ratio < 0.5:  # 重复度>50%
+                    score -= 0.2
+        else:
+            score -= 0.2  # 没有Answer字段
+
+        # 3. 检查整体长度
+        total_len = len(response.split())
+        if total_len < 15:
+            score -= 0.2  # 太短
+        elif total_len > 80:
+            score -= 0.1  # 太长可能冗余
+
+        # 4. 检查是否包含占位符（-0.5）
         placeholders = ["[from the provided knowledge]", "[as stated in", "[key supporting quotes]",
                        "[based on context]", "cite relevant phrase"]
         if any(p in response_lower for p in placeholders):
             score -= 0.5  # 严重惩罚占位符
 
-        # 4. 特定子任务检查 + Answer匹配
-        if subset == "qa":
-            # 检查是否有Answer字段
-            if "answer:" in response_lower:
-                score += 0.1
-            # TODO: 可以添加right_answer模糊匹配（需要更复杂的逻辑）
-
-        elif subset == "summarization":
+        # 5. 特定子任务检查（summarization需要Summary字段）
+        if subset == "summarization":
             # 检查是否有Summary字段
             if "summary:" in response_lower:
                 score += 0.1
 
-        # 5. 检查是否有乱码（-0.3）
+        # 6. 检查是否有乱码（-0.3）
         gibberish_patterns = ["uang7", "seite", "adapter", "lastcite", "peer"]
         if any(g in response_lower for g in gibberish_patterns):
             score -= 0.3
