@@ -2236,15 +2236,16 @@ def generate_one_greedy(model, tokenizer, device, prompt: str) -> str:
 # =============================================================================
 def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> str:
     """
-    §1: 为LLaMA-3-Instruct应用正确的聊天模板
-    避免手拼字符串导致模型不知道何时停止
+    §1: 应用聊天模板（支持Instruct和Base model）
+    - Instruct model：使用内置chat_template
+    - Base model：使用简单格式
     """
     messages = []
     if system_message:
         messages.append({"role": "system", "content": system_message})
     messages.append({"role": "user", "content": prompt})
 
-    # 使用tokenizer的聊天模板
+    # 尝试使用tokenizer的聊天模板（Instruct model）
     try:
         formatted = tokenizer.apply_chat_template(
             messages,
@@ -2253,9 +2254,12 @@ def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> s
         )
         return formatted
     except Exception as e:
-        # 兜底：如果tokenizer不支持chat_template，返回原始prompt
-        print(f"⚠️ 聊天模板应用失败: {e}，使用原始prompt")
-        return prompt
+        # Base model没有chat_template，使用简单格式
+        print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+        if system_message:
+            return f"### System\n{system_message}\n\n### User\n{prompt}\n\n### Assistant\n"
+        else:
+            return f"### User\n{prompt}\n\n### Assistant\n"
 
 def get_eos_token_ids(tokenizer) -> List[int]:
     """

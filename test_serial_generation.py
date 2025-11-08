@@ -68,16 +68,26 @@ def main():
         print(f"Prompt: {prompt[:100]}...")
         print()
 
-        # 应用chat template
+        # 应用chat template（支持Instruct和Base model）
         messages = [
             {"role": "system", "content": "You are a helpful, accurate, and unbiased assistant."},
             {"role": "user", "content": prompt}
         ]
-        formatted_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+
+        try:
+            # Instruct model有内置chat_template
+            formatted_prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            print("✓ 使用Instruct model的chat template")
+        except Exception as e:
+            # Base model没有chat_template，使用简单格式
+            print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+            system_msg = messages[0]["content"]
+            user_msg = messages[1]["content"]
+            formatted_prompt = f"### System\n{system_msg}\n\n### User\n{user_msg}\n\n### Assistant\n"
 
         # 串行生成K个候选
         candidates = []
