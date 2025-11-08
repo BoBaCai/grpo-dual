@@ -227,7 +227,7 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 1.5        # 【平衡】从2.0降到1.5：Entropy=4.7已足够，2.0导致100%截断
+    TEMPERATURE_TRAIN = 1.2        # 【调研修复】从1.5降到1.2：平衡熵(保持3.5-4.0)和截断率(降到15-30%)
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
@@ -569,16 +569,17 @@ class BranchedKLController:
         self.kl_f_history = deque(maxlen=window_size)
         self.kl_h_history = deque(maxlen=window_size)
 
-        # 【标准GRPO KL目标】基于真实前向KL（非平方近似）
-        # 参考研究结论：
-        # - 真·前向KL的合理目标：0.02-0.05 per-token（对应 δ_rms ≈ 0.14-0.32）
-        # - PPO论文的自适应KL：dtarg ∈ {0.003, 0.01, 0.03}（反向KL口径）
-        # - DeepSeekMath：β=0.04（无显式target_kl）
-        # 我们用3x β（0.15/0.30），目标范围设为保守带
-        self.target_kl_f_min = 0.02   # 下界：避免过度保守，允许适度探索
-        self.target_kl_f_max = 0.05   # 上界：标准GRPO保守带，对应 δ_rms ≈ 0.32
-        self.target_kl_h_min = 0.02   # 统一范围（多任务共享模型）
-        self.target_kl_h_max = 0.05   # 统一范围
+        # 【业界标准KL目标】基于RLHF实践调研
+        # 参考业界标准：
+        # - InstructGPT (1.3B): β=0.01-0.02, target_kl~0.1
+        # - Llama 2-Chat (7B/13B): β=0.01, target_kl~0.1
+        # - DeepSeekMath: β=0.04 (per-token)
+        # 结论：target_kl通常在0.1左右，0.035过严会锁死模型
+        # 修复：放宽到0.08-0.12，中间值0.10，避免Beta爆炸增长
+        self.target_kl_f_min = 0.08   # 下界：参考Llama 2标准
+        self.target_kl_f_max = 0.12   # 上界：允许多目标任务探索
+        self.target_kl_h_min = 0.08   # 统一范围（多任务共享模型）
+        self.target_kl_h_max = 0.12   # 统一范围
 
         self.adjustment_log = []
 
