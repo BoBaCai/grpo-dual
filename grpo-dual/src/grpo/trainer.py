@@ -1048,7 +1048,11 @@ class BBQAdapter:
                 print(f"✗ {fp.name} 解析为空")
                 continue
 
-            # 【修复】自适应采样：根据实际数据分布调整，但优先disambig
+            # 【关键修复】强制提高disambiguated样本权重，减少ambiguous导致的零梯度
+            # 理由：
+            # 1. Ambiguous样本是二元任务（选unknown=1.0，否则-1.0），难以产生reward差异
+            # 2. Disambiguated样本有A/B/C多选，candidates可能选不同答案 → 自然产生梯度
+            # 3. 参考BBQ官方：disambiguated样本是测试"克服bias"的核心，更有训练价值
             ambig_samples = []
             disambig_samples = []
             for it in lines:
@@ -1058,39 +1062,25 @@ class BBQAdapter:
                     disambig_samples.append(it)
 
             want = per_cat
-            total_available = len(ambig_samples) + len(disambig_samples)
 
-            # 计算实际可用比例
-            if total_available > 0:
-                actual_disambig_ratio = len(disambig_samples) / total_available
-                actual_ambig_ratio = len(ambig_samples) / total_available
-            else:
-                actual_disambig_ratio = 0.5
-                actual_ambig_ratio = 0.5
-
-            # 【策略】如果disambig>=60%，采样70% disambig；否则按实际比例但最少50% disambig
-            if actual_disambig_ratio >= 0.6:
-                target_disambig_ratio = 0.7
-            elif actual_disambig_ratio >= 0.5:
-                target_disambig_ratio = 0.6
-            else:
-                # disambig不足50%，尽量多采但不强制
-                target_disambig_ratio = max(0.5, actual_disambig_ratio)
+            # 【策略】固定采样比例：75% disambiguated, 25% ambiguous
+            # 确保大部分训练样本都有梯度信号
+            target_disambig_ratio = 0.75
+            target_ambig_ratio = 0.25
 
             n_disambig = int(want * target_disambig_ratio)
-            n_ambig = want - n_disambig
+            n_ambig = int(want * target_ambig_ratio)
 
             # 采样
             picked = []
-            n_disambig_actual = min(n_disambig, len(disambig_samples))
-            n_ambig_actual = min(n_ambig, len(ambig_samples))
-
             if disambig_samples:
+                n_disambig_actual = min(n_disambig, len(disambig_samples))
                 picked.extend(random.sample(disambig_samples, n_disambig_actual))
             if ambig_samples:
+                n_ambig_actual = min(n_ambig, len(ambig_samples))
                 picked.extend(random.sample(ambig_samples, n_ambig_actual))
 
-            # 如果不足want，从另一类补充
+            # 如果disambig不足，从ambig补充（确保总数达到want）
             if len(picked) < want:
                 remaining = want - len(picked)
                 rest = [x for x in lines if x not in picked]
