@@ -227,8 +227,10 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 1.15       # 【平衡修复】从1.3降到1.15：平衡熵(1.4-3.9✓)和截断率(25-100%→15-40%)
-                                   # 验证结果：1.3时熵恢复但截断率过高，降到1.15平衡
+    TEMPERATURE_TRAIN = 1.0        # 【Option A配合修复】从1.15降到1.0：配合细粒度reasoning评分，不需要过高温度
+                                   # 理由：(1)细粒度评分可以区分reasoning质量差异，不依赖文本多样性
+                                   #      (2)降低temperature减少截断率(25-75%→10-30%)
+                                   #      (3)稳定熵值(0.38-3.0剧烈波动→0.8-2.0稳定)
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
@@ -1605,19 +1607,20 @@ class MultiCloudJudge:
 
     def _assess_reasoning_quality(self, sample: Sample, response: str) -> float:
         """
-        【激进版】评估reasoning质量，产生分数差异
+        【细粒度版本】评估reasoning质量，产生更大的分数差异
 
-        评估标准（更严格）：
-        1. 检测通用模板短语 → 直接判定为差劲
-        2. 是否引用context中的具体实体/名词
-        3. Justification是否有实质内容（非重复、非空话）
-        4. 输出长度范围更窄（10-40词）
+        新增评估标准（Option A）：
+        1. Context引用的深度（不只是有没有引用）
+           - 引用了多少个关键实体（数量差异）
+           - 是否引用了因果关系/逻辑连接词
+        2. 推理链的完整性
+           - 是否有明确的"因为...所以..."
+           - 是否只是断言答案
+        3. 引用的精确性
+           - 是否精确引用原文（带引号）
+           - 是否模糊复述
 
-        返回：
-        - 1.0: 优秀reasoning（引用具体实体+实质内容+无模板）
-        - 0.6: 一般reasoning（满足部分条件）
-        - 0.3: 差劲reasoning（模板化严重）
-        - -0.5: 垃圾输出（通用逃避短语）
+        返回：分数范围 [0.3, 1.0]，更细的梯度
         """
         response_lower = response.lower()
         context = sample.prompt.lower() if hasattr(sample, 'prompt') else ""
@@ -1641,58 +1644,119 @@ class MultiCloudJudge:
 
         for phrase in evasive_phrases:
             if phrase in response_lower:
-                return -0.5  # 【激进惩罚】直接负分，强制模型避免这些短语
+                return 0.3  # 【修改】从-0.5改为0.3，避免负分导致与错误答案混淆
 
         score = 1.0  # 从满分开始
 
-        # 标准1：是否引用了context中的具体实体/名词（更严格）
-        # 提取context中的大写词（人名、地名等）或专有名词
+        # ===== 新增：标准1 - Context引用的深度 =====
         import re
         context_entities = set(re.findall(r'\b[A-Z][a-z]+\b', sample.prompt if hasattr(sample, 'prompt') else ""))
         response_entities = set(re.findall(r'\b[A-Z][a-z]+\b', response))
-
         cited_entities = context_entities & response_entities
 
+        # 1.1 根据引用的实体数量给分（细粒度）
         if len(cited_entities) == 0:
-            score -= 0.4  # 【加强】没有引用具体实体 → 扣0.4分
+            score -= 0.4  # 完全没有引用
+        elif len(cited_entities) == 1:
+            score -= 0.15  # 只引用1个实体
+        elif len(cited_entities) == 2:
+            score -= 0.05  # 引用2个实体
+        # len >= 3: 不扣分（充分引用）
 
-        # 标准2：Justification长度检查（更严格：10-40词）
+        # 1.2 检查是否引用了因果关系/逻辑词（新增）
+        causal_words = ["because", "since", "as", "therefore", "thus", "so", "hence",
+                       "due to", "leads to", "results in", "consequently"]
+        has_causal = any(word in response_lower for word in causal_words)
+        if has_causal:
+            score += 0.1  # 有因果逻辑 → 加分
+
+        # ===== 新增：标准2 - 推理链的完整性 =====
+        # 2.1 检查是否有完整的"X导致Y"或"因为X所以Y"结构
+        complete_reasoning_patterns = [
+            (r'because\s+\w+.*?,?\s+(so|therefore|thus)', 0.15),  # "because X, so Y"
+            (r'since\s+\w+.*?,?\s+(so|therefore|thus)', 0.15),    # "since X, so Y"
+            (r'as\s+\w+.*?,?\s+(so|therefore|thus)', 0.15),       # "as X, so Y"
+            (r'\w+\s+leads to\s+\w+', 0.1),                        # "X leads to Y"
+            (r'\w+\s+results in\s+\w+', 0.1),                      # "X results in Y"
+        ]
+
+        reasoning_bonus = 0
+        for pattern, bonus in complete_reasoning_patterns:
+            if re.search(pattern, response_lower):
+                reasoning_bonus = max(reasoning_bonus, bonus)  # 取最大的bonus
+
+        score += reasoning_bonus
+
+        # 2.2 检查是否只是断言答案（没有推理）
+        # 如果justification很短且没有因果词，判定为断言
         if "justification:" in response_lower:
             justification_start = response_lower.find("justification:") + len("justification:")
             justification = response[justification_start:].strip()
             justification_len = len(justification.split())
 
-            if justification_len < 10:
-                score -= 0.3  # 【加强】太短（<10词）→ 扣0.3分
-            elif justification_len > 40:
-                score -= 0.2  # 太长（>40词）→ 扣0.2分
+            if justification_len < 10 and not has_causal:
+                score -= 0.2  # 太短且没有推理 → 扣分
+            elif justification_len < 5:
+                score -= 0.3  # 极短 → 重罚
         else:
-            score -= 0.4  # 【加强】没有justification → 扣0.4分
+            score -= 0.4  # 没有justification
 
-        # 标准3：检查模板短语（扩展列表）
+        # ===== 新增：标准3 - 引用的精确性 =====
+        # 3.1 检查是否有精确引用（带引号）
+        has_quotes = '"' in response or '"' in response or '"' in response
+        if has_quotes:
+            score += 0.1  # 精确引用 → 加分
+
+        # 3.2 检查是否有原文片段（3个词以上的连续匹配）
+        # 提取context和response的3-gram
+        def get_ngrams(text, n=3):
+            words = text.lower().split()
+            return set(tuple(words[i:i+n]) for i in range(len(words)-n+1))
+
+        if hasattr(sample, 'prompt') and sample.prompt:
+            context_3grams = get_ngrams(sample.prompt, 3)
+            response_3grams = get_ngrams(response, 3)
+            common_3grams = context_3grams & response_3grams
+
+            if len(common_3grams) >= 3:
+                score += 0.1  # 多处精确引用原文 → 加分
+            elif len(common_3grams) == 0:
+                score -= 0.1  # 完全没有原文引用，只是复述 → 扣分
+
+        # ===== 保留原有的标准4：长度检查 =====
+        if "justification:" in response_lower:
+            justification_start = response_lower.find("justification:") + len("justification:")
+            justification = response[justification_start:].strip()
+            justification_len = len(justification.split())
+
+            if justification_len > 50:
+                score -= 0.2  # 过长
+            elif justification_len > 40:
+                score -= 0.1  # 稍长
+
+        # ===== 保留原有的标准5：模板短语检查（轻微调整） =====
         template_phrases = [
             "as stated in the context",
             "according to the context",
             "the context states that",
             "based on the context",
             "it is stated that",
-            "it is mentioned that",
-            "as mentioned",
-            "the text says",
-            "the passage indicates"
+            "it is mentioned that"
         ]
         template_count = sum(1 for phrase in template_phrases if phrase in response_lower)
-        if template_count >= 1:  # 【加强】出现1次就扣分
-            score -= 0.2 * template_count  # 每个模板短语扣0.2分
+        if template_count >= 2:  # 【放宽】出现2次或以上才扣分
+            score -= 0.15  # 【降低惩罚】模板短语过度使用
 
-        # 标准4：检查实质内容（非重复词）
+        # ===== 保留原有的标准6：重复度检查 =====
         response_words = response_lower.split()
         unique_ratio = len(set(response_words)) / max(len(response_words), 1)
-        if unique_ratio < 0.6:  # 重复度>40%
-            score -= 0.3
+        if unique_ratio < 0.5:
+            score -= 0.3  # 重复严重
+        elif unique_ratio < 0.6:
+            score -= 0.15  # 重复较多
 
-        # 【激进】分数范围扩大到[-0.5, 1.0]，允许负分
-        score = max(-0.5, min(1.0, score))
+        # 【关键】分数范围限制在[0.3, 1.0]，产生更大的差异
+        score = max(0.3, min(1.0, score))
 
         return score
 
