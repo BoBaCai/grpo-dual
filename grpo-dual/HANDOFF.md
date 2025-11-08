@@ -1151,10 +1151,58 @@ plt.savefig('training_trends.png')
   - Hallucination任务的reward std应>0.2
   - 零梯度组比例应<20%
 
+**2025-11-08 (Session 6 - 🔥 使用Ground Truth评估内容质量):**
+- 🔍 **调研HaluEval官方文档**
+  - 发现数据集应包含knowledge/right_answer/hallucinated_answer字段
+  - 当前adapter加载了这些字段，但只用于构建SFT target
+  - 从未保存到meta → Judge无法访问！
+- 🐛 **发现根本问题：Judge无法验证内容正确性**
+  - 只检查格式（Answer/Evidence字段、长度）
+  - 无法区分"瞎编但格式正确"和"内容正确"
+  - 导致零梯度组（所有candidates瞎编但都拿高分）
+- ✅ **实施CRITICAL FIX (Commit 92c2fc3):**
+
+  **修复1: HaluEvalAdapter保存Ground Truth到meta**
+  ```python
+  # Line 1226-1232: qa子集
+  meta.update({
+      "knowledge": know,
+      "right_answer": answer,
+      "hallucinated_answer": hallucinated_answer,
+      ...
+  })
+
+  # 同样修复dialogue, summarization, general子集
+  ```
+
+  **修复2: 新增_check_content_against_ground_truth()方法**
+  - 检测口语化/瞎编开头（"yes there", "well maybe", "i think"）→ -0.3
+  - 检测模糊泛泛描述（"good performance", "in general", "thrills"）→ -0.2
+  - 检查Answer包含right_answer的关键词（长度>3）→ +0.3
+  - 检查Evidence引用knowledge（n-gram匹配）→ +0.2
+  - 检查是否更接近hallucinated_answer → -0.2
+  - 适配qa/dialogue/summarization三个子集
+
+  **修复3: 集成到_evaluate_halueval()**
+  - Bonus分数范围：[-0.5, +0.5]
+  - 最终分数仍clip到[-1.0, 1.0]
+
+- 📊 **预期效果：**
+  - ✅ 瞎编responses（格式正确但内容错）：0.3-0.5分
+  - ✅ 正确responses（格式+内容都对）：0.8-1.0分
+  - ✅ Reward std：0.000 → >0.2
+  - ✅ 零梯度组：50% → <20%
+- 💡 **重要意义：**
+  - 这是基于HaluEval官方文档的标准做法
+  - 比启发式规则更可靠（有ground truth支撑）
+  - 直接解决零梯度根因（无法区分内容质量）
+
 **待验证（下次训练）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
 - [ ] 模型是否开始真正学习（不再锁死）
-- [ ] 是否需要进一步调整超参（ENTROPY_COEF, beta）
+- [ ] Hallucination任务的reward std是否>0.2
+- [ ] 零梯度组比例是否<20%
+- [ ] 是否需要进一步调整超参（ENTROPY_COEF, beta, Temperature, KL目标）
 - [ ] 最终训练效果和收敛情况
 
 ---
