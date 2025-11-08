@@ -227,10 +227,10 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 0.9        # 【修复】从1.2降到0.9，配合更强的惩罚
-    TOP_K_TRAIN = 100              # 【修复】启用top_k=100，限制低频乱码token
-    TOP_P_TRAIN = 0.9              # 【修复】从0.95收紧到0.9
-    REP_PENALTY_TRAIN = 1.18       # 【修复】从1.05提升到1.18，强力去重
+    TEMPERATURE_TRAIN = 1.1        # 【激进】从0.9提升到1.1，增强随机性对抗熵塌陷
+    TOP_K_TRAIN = 150              # 【激进】从100提升到150，扩大候选空间
+    TOP_P_TRAIN = 0.95             # 【激进】从0.9放宽到0.95，允许更多低概率token
+    REP_PENALTY_TRAIN = 1.25       # 【激进】从1.18提升到1.25，更强力去重
 
     PRESENCE_PENALTY = 0.7         # 【修复】从0.3提升到0.7，惩罚模板化输出
     FREQUENCY_PENALTY = 0.3        # 【修复】从0.2提升到0.3
@@ -1525,63 +1525,94 @@ class MultiCloudJudge:
 
     def _assess_reasoning_quality(self, sample: Sample, response: str) -> float:
         """
-        【新增】评估reasoning质量，产生分数差异
+        【激进版】评估reasoning质量，产生分数差异
 
-        评估标准：
-        1. 是否引用context中的关键信息
-        2. Justification长度是否合理
-        3. 是否避免模板化表达
+        评估标准（更严格）：
+        1. 检测通用模板短语 → 直接判定为差劲
+        2. 是否引用context中的具体实体/名词
+        3. Justification是否有实质内容（非重复、非空话）
+        4. 输出长度范围更窄（10-40词）
 
         返回：
-        - 1.0: 优秀reasoning（引用具体+长度合理+非模板）
-        - 0.7: 一般reasoning（满足部分条件）
-        - 0.5: 差劲reasoning（太短/太模板化/没引用）
+        - 1.0: 优秀reasoning（引用具体实体+实质内容+无模板）
+        - 0.6: 一般reasoning（满足部分条件）
+        - 0.3: 差劲reasoning（模板化严重）
+        - -0.5: 垃圾输出（通用逃避短语）
         """
         response_lower = response.lower()
         context = sample.prompt.lower() if hasattr(sample, 'prompt') else ""
 
-        score = 1.0  # 从满分开始，逐步扣分
+        # 【激进】先检测通用逃避短语（用户诊断中反复出现的）
+        evasive_phrases = [
+            "does not provide sufficient information",
+            "cannot be determined",
+            "not enough information",
+            "insufficient information",
+            "unable to determine",
+            "context does not",
+            "not specified",
+            "unclear from the context",
+            "ambiguous",
+            "cannot infer",
+            "not explicitly stated",
+            "not clear",
+            "not mentioned"
+        ]
 
-        # 标准1：检查是否引用了context中的关键信息
-        # 提取context中的实体词（简单启发式：非停用词）
-        context_words = set(context.split())
-        stop_words = {"the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for", "of", "and", "or"}
-        context_keywords = context_words - stop_words
+        for phrase in evasive_phrases:
+            if phrase in response_lower:
+                return -0.5  # 【激进惩罚】直接负分，强制模型避免这些短语
 
-        # 检查response是否引用了至少一个context关键词
-        response_words = set(response_lower.split())
-        cited_keywords = context_keywords & response_words
+        score = 1.0  # 从满分开始
 
-        if len(cited_keywords) == 0:
-            score -= 0.3  # 没有引用context → 扣0.3分
+        # 标准1：是否引用了context中的具体实体/名词（更严格）
+        # 提取context中的大写词（人名、地名等）或专有名词
+        import re
+        context_entities = set(re.findall(r'\b[A-Z][a-z]+\b', sample.prompt if hasattr(sample, 'prompt') else ""))
+        response_entities = set(re.findall(r'\b[A-Z][a-z]+\b', response))
 
-        # 标准2：Justification长度检查
-        # 提取justification部分（在"justification:"之后）
+        cited_entities = context_entities & response_entities
+
+        if len(cited_entities) == 0:
+            score -= 0.4  # 【加强】没有引用具体实体 → 扣0.4分
+
+        # 标准2：Justification长度检查（更严格：10-40词）
         if "justification:" in response_lower:
             justification_start = response_lower.find("justification:") + len("justification:")
             justification = response[justification_start:].strip()
             justification_len = len(justification.split())
 
-            if justification_len < 5:
-                score -= 0.2  # 太短（<5词）→ 扣0.2分
-            elif justification_len > 50:
-                score -= 0.1  # 太长（>50词）→ 扣0.1分
+            if justification_len < 10:
+                score -= 0.3  # 【加强】太短（<10词）→ 扣0.3分
+            elif justification_len > 40:
+                score -= 0.2  # 太长（>40词）→ 扣0.2分
         else:
-            score -= 0.3  # 没有justification → 扣0.3分
+            score -= 0.4  # 【加强】没有justification → 扣0.4分
 
-        # 标准3：检查是否过度模板化
+        # 标准3：检查模板短语（扩展列表）
         template_phrases = [
             "as stated in the context",
             "according to the context",
             "the context states that",
-            "based on the context"
+            "based on the context",
+            "it is stated that",
+            "it is mentioned that",
+            "as mentioned",
+            "the text says",
+            "the passage indicates"
         ]
         template_count = sum(1 for phrase in template_phrases if phrase in response_lower)
-        if template_count >= 2:
-            score -= 0.1  # 过度使用模板短语 → 扣0.1分
+        if template_count >= 1:  # 【加强】出现1次就扣分
+            score -= 0.2 * template_count  # 每个模板短语扣0.2分
 
-        # 确保分数在合理范围内
-        score = max(0.5, min(1.0, score))  # clamp到[0.5, 1.0]
+        # 标准4：检查实质内容（非重复词）
+        response_words = response_lower.split()
+        unique_ratio = len(set(response_words)) / max(len(response_words), 1)
+        if unique_ratio < 0.6:  # 重复度>40%
+            score -= 0.3
+
+        # 【激进】分数范围扩大到[-0.5, 1.0]，允许负分
+        score = max(-0.5, min(1.0, score))
 
         return score
 
@@ -2174,42 +2205,81 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
 
         # 为这个prompt生成k个候选
         for candidate_idx in range(k):
-            # 创建step_counter（每次生成都独立）
-            step_counter = [step] if step is not None else None
-            processors = build_safe_logits_processors(step_counter, eos_ids)
+            # 【去重机制】最多重试3次，如果新候选与已有candidates太相似就重新生成
+            max_retries = 3
+            retry_count = 0
+            decoded = None
 
-            # 单独tokenize这一个prompt
-            inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
-                             truncation=True, max_length=config.SFT_MAXLEN).to(device)
+            while retry_count <= max_retries:
+                # 创建step_counter（每次生成都独立）
+                step_counter = [step] if step is not None else None
+                processors = build_safe_logits_processors(step_counter, eos_ids)
 
-            # 【独立生成】每次调用generate，random state都会变化
-            with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
-                    do_sample=True,
-                    temperature=config.TEMPERATURE_TRAIN,
-                    top_k=config.TOP_K_TRAIN,
-                    top_p=config.TOP_P_TRAIN,
-                    repetition_penalty=config.REP_PENALTY_TRAIN,
-                    no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,
-                    logits_processor=processors,
-                    num_return_sequences=1,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=eos_ids,
-                    use_cache=True,
-                    return_dict_in_generate=False,
-                )
+                # 单独tokenize这一个prompt
+                inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                                 truncation=True, max_length=config.SFT_MAXLEN).to(device)
 
-            # 提取response（只有一个，因为num_return_sequences=1）
-            original_input_len = inputs["input_ids"].shape[1]
-            src_len = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).item()
-            if prompt_len is None:
-                prompt_len = src_len
+                # 【独立生成】每次调用generate，random state都会变化
+                with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
+                    out = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
+                        do_sample=True,
+                        temperature=config.TEMPERATURE_TRAIN,
+                        top_k=config.TOP_K_TRAIN,
+                        top_p=config.TOP_P_TRAIN,
+                        repetition_penalty=config.REP_PENALTY_TRAIN,
+                        no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,
+                        logits_processor=processors,
+                        num_return_sequences=1,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=eos_ids,
+                        use_cache=True,
+                        return_dict_in_generate=False,
+                    )
 
-            response_tokens = out[0, original_input_len:]
-            decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
+                # 提取response（只有一个，因为num_return_sequences=1）
+                original_input_len = inputs["input_ids"].shape[1]
+                src_len = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).item()
+                if prompt_len is None:
+                    prompt_len = src_len
+
+                response_tokens = out[0, original_input_len:]
+                decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+                # 【去重检查】计算与已有candidates的相似度
+                is_duplicate = False
+                if len(candidates_texts) > 0:
+                    # 使用Jaccard相似度（词汇集合的交集/并集）
+                    new_words = set(decoded.lower().split())
+
+                    for existing_text in candidates_texts:
+                        existing_words = set(existing_text.lower().split())
+
+                        if len(new_words) == 0 or len(existing_words) == 0:
+                            continue
+
+                        intersection = len(new_words & existing_words)
+                        union = len(new_words | existing_words)
+                        jaccard_sim = intersection / union if union > 0 else 0
+
+                        # 【超激进阈值】相似度>0.65就视为重复（强制多样性）
+                        if jaccard_sim > 0.65:
+                            is_duplicate = True
+                            break
+
+                # 如果不重复，或已经重试max_retries次，接受这个candidate
+                if not is_duplicate or retry_count >= max_retries:
+                    if is_duplicate and retry_count >= max_retries and step is not None and step < 3:
+                        print(f"⚠️ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: {max_retries}次重试后仍重复，保留")
+                    elif is_duplicate == False and retry_count > 0 and step is not None and step < 3:
+                        print(f"✓ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count+1}次生成成功（去重）")
+                    break
+                else:
+                    retry_count += 1
+                    if step is not None and step < 3:
+                        print(f"🔄 [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count}次重试（Jaccard>{0.75}）")
 
             # 【调试日志】只在前2步、前2个prompt、前2个候选时打印
             if step is not None and step < 2 and prompt_idx < 2 and candidate_idx < 2:
