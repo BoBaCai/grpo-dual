@@ -975,6 +975,31 @@ plt.savefig('training_trends.png')
   - 即使正确答案，根据reasoning质量得分0.3-1.0
   - 应产生reward_std>0.1，即使在简单问题上
   - **如果这还不行，根因不在Judge/采样，需要重新审视架构**
+- 🔥 **用户再次反馈：仍然100%组无梯度，发现根本原因**
+- 🎯 **用户诊断核心问题（Mode Collapse）：**
+  - Max prob: 0.999988（几乎deterministic）
+  - 熵: 0.018-0.055（灾难性低）
+  - 100%组reward std=0（零梯度）
+  - 去重失败：3次重试后仍Jaccard>0.75
+  - EOS抑制器一直在阻止early stopping
+  - 模型在生成1-3个token时就想停止
+- 💡 **根本原因：Logits裁剪发生在temperature之前！**
+  - SanityLogitsProcessor: `scores.clamp(-50, 50)`
+  - Flow: raw_logits → clip(-50,50) → /temp → softmax
+  - 即使temp=1.1，softmax(50/1.1)≈softmax(45.5)≈0.9999+
+  - **Temperature根本没有生效！**
+- ✅ **核选项修复（真正解决根因）：**
+  - ✅ 禁用logits裁剪（-50,50 → -1000,1000），只防溢出不限制分布
+  - ✅ Temperature提升到2.0（对抗Llama-3-Instruct高置信度）
+  - ✅ 进一步放松采样（top_k=200, top_p=0.98, rep_penalty=1.3）
+- ✅ Commit b812b25推送（NUCLEAR OPTION: Fix logits clipping）
+- 📊 **预期效果（核选项）：**
+  - Max prob应降至<0.95（现在0.999988）
+  - 熵应升至>0.5（现在0.018-0.055）
+  - 去重应成功（Jaccard<0.65）
+  - Reward std应>0.05（现在0.000000）
+  - 非零梯度组应>50%（现在0%）
+  - **如果这还不行，问题在SFT阶段模板太强/LoRA太弱/需全量微调**
 
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
