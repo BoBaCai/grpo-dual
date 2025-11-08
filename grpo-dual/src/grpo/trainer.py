@@ -227,10 +227,11 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 1.1        # 【激进】从0.9提升到1.1，增强随机性对抗熵塌陷
-    TOP_K_TRAIN = 150              # 【激进】从100提升到150，扩大候选空间
-    TOP_P_TRAIN = 0.95             # 【激进】从0.9放宽到0.95，允许更多低概率token
-    REP_PENALTY_TRAIN = 1.25       # 【激进】从1.18提升到1.25，更强力去重
+    TEMPERATURE_TRAIN = 2.0        # 【核选项】从1.1提升到2.0，强力对抗logits裁剪的影响
+                                   # 即使logits被裁剪到50，softmax(50/2.0)=softmax(25)仍有一定随机性
+    TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
+    TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
+    REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
 
     PRESENCE_PENALTY = 0.7         # 【修复】从0.3提升到0.7，惩罚模板化输出
     FREQUENCY_PENALTY = 0.3        # 【修复】从0.2提升到0.3
@@ -2059,7 +2060,9 @@ class SanityLogitsProcessor(torch.nn.Module):
     def forward(self, input_ids, scores):
         scores = scores.nan_to_num(neginf=-1e4, posinf=1e4)
         scores = scores - scores.max(dim=-1, keepdim=True).values
-        scores = scores.clamp(-50, 50)
+        # 【核选项】完全禁用裁剪，让temperature真正生效
+        # scores = scores.clamp(-50, 50)  # ← 这行导致Max prob: 0.999988！
+        scores = scores.clamp(-1000, 1000)  # 只防止极端数值溢出，不限制分布
         all_neg_inf = torch.isneginf(scores).all(dim=-1, keepdim=True)
         if all_neg_inf.any():
             argmax = scores.argmax(dim=-1, keepdim=True)
