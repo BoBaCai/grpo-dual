@@ -970,6 +970,100 @@ class TrainingMetrics:
         return summary
 
 # =============================================================================
+# 零梯度组监控（Session 9.1 补充）
+# =============================================================================
+def expected_zero_gradient_rate(p: float, K: int) -> float:
+    """
+    计算理论零梯度率
+
+    Args:
+        p: 成功率（从训练日志统计）
+        K: 组大小
+
+    Returns:
+        expected_rate: 理论零梯度率 (p^K + (1-p)^K)
+    """
+    return p**K + (1-p)**K
+
+
+def monitor_zero_gradient_groups(
+    rewards: np.ndarray,
+    tasks: List[str],
+    K: int = 4,
+    step: int = None
+) -> Dict[str, float]:
+    """
+    监控零梯度组（集成到训练循环）
+
+    Args:
+        rewards: 所有样本的 reward (shape: [B*K])
+        tasks: 每组的任务类型 (shape: [B])
+        K: 组大小
+        step: 当前训练步数
+
+    Returns:
+        stats: 统计信息字典
+    """
+    B = len(tasks)
+
+    # 按任务类型分组统计
+    fairness_stds = []
+    halu_stds = []
+    fairness_rewards = []
+    halu_rewards = []
+
+    for i in range(B):
+        group_rewards = rewards[i*K : (i+1)*K]
+        group_std = np.std(group_rewards)
+
+        if tasks[i] == "fairness":
+            fairness_stds.append(group_std)
+            fairness_rewards.extend(group_rewards)
+        else:
+            halu_stds.append(group_std)
+            halu_rewards.extend(group_rewards)
+
+    # 统计零梯度组
+    zero_grad_f = sum(1 for s in fairness_stds if s < 0.01)
+    zero_grad_h = sum(1 for s in halu_stds if s < 0.01)
+
+    # 计算成功率和期望零梯度率
+    fairness_success_rate = (np.array(fairness_rewards) > 0.5).mean() if fairness_rewards else 0.5
+    halu_success_rate = (np.array(halu_rewards) > 0.5).mean() if halu_rewards else 0.5
+
+    expected_zero_grad_f = expected_zero_gradient_rate(fairness_success_rate, K)
+    expected_zero_grad_h = expected_zero_gradient_rate(halu_success_rate, K)
+
+    # 打印统计信息（每 10 步）
+    if step is not None and step % 10 == 0:
+        print(f"\n📊 零梯度组监控 (Step {step}):")
+        print(f"  Fairness:")
+        print(f"    实际: {zero_grad_f}/{len(fairness_stds)} ({zero_grad_f/len(fairness_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_f:.1%} (成功率 p={fairness_success_rate:.2f})")
+        print(f"    状态: ", end="")
+
+        actual_ratio_f = zero_grad_f / len(fairness_stds) if fairness_stds else 0
+        if actual_ratio_f <= expected_zero_grad_f * 1.2:
+            print("✅ 正常")
+        elif actual_ratio_f <= expected_zero_grad_f * 1.5:
+            print("⚠️ 略高，关注")
+        else:
+            print("🚨 异常高，检查 reward 逻辑")
+
+        print(f"  Hallucination:")
+        print(f"    实际: {zero_grad_h}/{len(halu_stds)} ({zero_grad_h/len(halu_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_h:.1%} (成功率 p={halu_success_rate:.2f})")
+
+    return {
+        'zero_grad_f_ratio': zero_grad_f / len(fairness_stds) if fairness_stds else 0,
+        'zero_grad_h_ratio': zero_grad_h / len(halu_stds) if halu_stds else 0,
+        'expected_zero_grad_f': expected_zero_grad_f,
+        'expected_zero_grad_h': expected_zero_grad_h,
+        'fairness_success_rate': fairness_success_rate,
+        'halu_success_rate': halu_success_rate,
+    }
+
+# =============================================================================
 # 更健壮的 JSON 读取（数组 / JSONL / 拼接对象）
 # =============================================================================
 def read_json_flex(path: Path) -> List[Dict]:
@@ -1066,10 +1160,11 @@ class BBQAdapter:
 
             want = per_cat
 
-            # 【策略】固定采样比例：75% disambiguated, 25% ambiguous
-            # 确保大部分训练样本都有梯度信号
-            target_disambig_ratio = 0.75
-            target_ambig_ratio = 0.25
+            # 【Session 9.1 更新】调整采样比例：67% disambiguated, 33% ambiguous
+            # 理由：根据零梯度组理论分析，disambig样本成功率更高（p=0.8），能减少零梯度组比例
+            # 原策略 75/25 → 新策略 67/33（略微提高ambig以保留探索性）
+            target_disambig_ratio = 0.67
+            target_ambig_ratio = 0.33
 
             n_disambig = int(want * target_disambig_ratio)
             n_ambig = int(want * target_ambig_ratio)
@@ -3393,6 +3488,14 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         t_adv0 = _t.time()
         adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
         t_adv = _t.time() - t_adv0
+
+        # 【Session 9.1 新增】零梯度组监控：实际 vs 理论对比
+        zero_grad_stats = monitor_zero_gradient_groups(
+            rewards=np.array(rewards_list),
+            tasks=task_list,
+            K=config.K_ROLLOUTS,
+            step=step
+        )
 
         # 【C2修复】组内std监控：检测并警告reward完全相同的组（会导致梯度信号为0）
         zero_gradient_groups = 0
