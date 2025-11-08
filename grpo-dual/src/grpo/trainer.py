@@ -3285,15 +3285,29 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
                     print(f"\nCandidate {j+1}:")
                     print(f"  Task: {sample.task}")
+                    print(f"  Subset: {sample.meta.get('subset', 'N/A')}")
                     print(f"  Context condition: {sample.meta.get('context_condition', 'N/A')}")
                     print(f"  Reward: {reward:.3f}")
                     print(f"  Response (前150字符): {response[:150].replace(chr(10), ' ')}...")
 
-                    # 【关键】尝试重新评估以查看reasoning quality分数
+                    # 【增强诊断】重新评估以查看详细评分
                     if sample.task == "fairness" and sample.meta.get("context_condition") == "disambig":
-                        # 手动调用reasoning quality评估
                         result = judge._evaluate_bbq_fairness(sample, response)
                         print(f"  BBQ判分: {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
+
+                    elif sample.task == "hallucination":
+                        # 【新增】Hallucination任务诊断
+                        result = judge._evaluate_halueval(sample, response)
+                        print(f"  HaluEval判分: {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
+
+                        # 打印ground truth信息（如果有）
+                        subset = sample.meta.get("subset", "")
+                        if subset in ["qa", "dialogue", "summarization"]:
+                            knowledge = sample.meta.get("knowledge", "")[:50]
+                            right_ans = sample.meta.get("right_answer") or sample.meta.get("right_response") or sample.meta.get("right_summary", "")
+                            print(f"  Ground Truth - Knowledge: {knowledge}...")
+                            print(f"  Ground Truth - Right Answer: {right_ans[:50] if right_ans else 'N/A'}...")
+
                 print(f"{'='*70}\n")
 
             if ratio > 0.5:
