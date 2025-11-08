@@ -4,6 +4,7 @@
 诊断脚本：回答4个关键技术问题
 
 运行方式：
+cd grpo-dual
 python diagnose_issues.py
 
 输出：
@@ -14,7 +15,13 @@ python diagnose_issues.py
 """
 
 import sys
-sys.path.insert(0, 'src')
+import os
+from pathlib import Path
+
+# 添加src目录到Python路径
+script_dir = Path(__file__).parent
+src_dir = script_dir / 'src'
+sys.path.insert(0, str(src_dir))
 
 import json
 import torch
