@@ -1160,11 +1160,14 @@ class BBQAdapter:
 
             want = per_cat
 
-            # 【Session 9.1 更新】调整采样比例：67% disambiguated, 33% ambiguous
-            # 理由：根据零梯度组理论分析，disambig样本成功率更高（p=0.8），能减少零梯度组比例
-            # 原策略 75/25 → 新策略 67/33（略微提高ambig以保留探索性）
-            target_disambig_ratio = 0.67
-            target_ambig_ratio = 0.33
+            # 【Session 9.1 更新】调整采样比例：80% disambiguated, 20% ambiguous
+            # 理由：
+            # 1. Disambig 样本训练价值更高（有明确的正确答案，提高模型公平性）
+            # 2. 减少 ambig 样本占比，避免模型过度学习"选 unknown"策略
+            # 3. 零梯度组的改善交给 Dynamic Sampling 来处理
+            # 原策略 75/25 → 新策略 80/20（增加 disambig 使用比例）
+            target_disambig_ratio = 0.80
+            target_ambig_ratio = 0.20
 
             n_disambig = int(want * target_disambig_ratio)
             n_ambig = int(want * target_ambig_ratio)

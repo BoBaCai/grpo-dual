@@ -2873,8 +2873,8 @@ def monitor_zero_gradient_groups(
 # 在数据加载时调整采样比例
 # trainer.py BBQAdapter.load_samples() 中
 
-# 原来：ambig 和 disambig 1:1
-# 现在：ambig 和 disambig 1:2（增加 disambig）
+# 原来：75% disambig, 25% ambig
+# 现在：80% disambig, 20% ambig（增加 disambig）
 
 def load_samples(self, n_total: int) -> List[Sample]:
     # ...
@@ -2884,8 +2884,8 @@ def load_samples(self, n_total: int) -> List[Sample]:
     disambig_samples = [s for s in all_samples if s.meta['context_condition'] == 'disambig']
 
     # 【修改】调整采样比例
-    n_ambig = int(n_total * 0.33)      # 33% ambig
-    n_disambig = int(n_total * 0.67)   # 67% disambig（原来 50%）
+    n_disambig = int(n_total * 0.80)   # 80% disambig（原来 75%）
+    n_ambig = int(n_total * 0.20)      # 20% ambig（原来 25%）
 
     # 随机采样
     selected_ambig = random.sample(ambig_samples, min(n_ambig, len(ambig_samples)))
