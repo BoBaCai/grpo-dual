@@ -2619,7 +2619,194 @@ def temporary_no_checkpointing(model):
                 model.enable_input_require_grads()
 
 # 训练用：批量生成（一次生成 B×K）
-def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
+# =============================================================================
+# Phase 2: DAPO 风格动态采样（Session 9.1）
+# =============================================================================
+def quick_reward_estimate(text: str, task: str = "fairness") -> float:
+    """
+    快速 reward 估计（用于多样性检查）
+
+    不需要完整的 Reasoning Quality 评分，只检查关键特征：
+    1. 是否有答案（Answer: A/B/C）
+    2. 是否是逃避语言
+    3. 是否过短
+
+    返回粗略的 reward 估计（足够用于多样性检查）
+    """
+    text_lower = text.lower()
+
+    if task == "fairness":
+        # BBQ 任务：检查是否有答案
+        has_answer = any(f"answer: {opt}" in text_lower for opt in ['a', 'b', 'c'])
+
+        # 检查逃避语言（简化版，只检查最常见的）
+        evasive_keywords = ["cannot determine", "does not provide", "insufficient information"]
+        is_evasive = any(kw in text_lower for kw in evasive_keywords)
+
+        # 检查长度
+        is_too_short = len(text.split()) < 10
+
+        # 快速评分
+        if is_evasive:
+            return 0.3  # 逃避回答
+        elif is_too_short:
+            return 0.4  # 太短
+        elif has_answer:
+            # 进一步区分不同答案
+            if "answer: a" in text_lower:
+                return 0.7
+            elif "answer: b" in text_lower:
+                return 0.8
+            elif "answer: c" in text_lower:
+                return 0.9
+            else:
+                return 0.6
+        else:
+            return 0.5  # 中等
+    else:
+        # Hallucination 任务
+        has_yes = "yes" in text_lower
+        has_no = "no" in text_lower
+        is_too_short = len(text.split()) < 10
+
+        if is_too_short:
+            return 0.3
+        elif has_yes:
+            return 0.7
+        elif has_no:
+            return 0.8
+        else:
+            return 0.5
+
+
+def generate_candidates_with_dynamic_sampling(
+    model,
+    tokenizer,
+    device,
+    formatted_prompt: str,
+    task: str,
+    k: int = 4,
+    max_attempts: int = 8,
+    diversity_threshold: int = 2,
+    max_new_tokens: int = 128,
+    step: int = None,
+) -> Tuple[List[str], List[int], List[bool], int]:
+    """
+    DAPO 风格的动态采样：继续采样直到组内有足够多样性
+
+    Args:
+        formatted_prompt: 已格式化的 prompt
+        task: 任务类型（"fairness" 或 "hallucination"）
+        k: 目标组大小
+        max_attempts: 最大尝试次数
+        diversity_threshold: 至少需要多少种不同的 reward（基于 quick estimate）
+        max_new_tokens: 最大生成长度
+        step: 当前训练步数
+
+    Returns:
+        texts: 生成的文本列表 (len = k)
+        lengths: 每个文本的 token 长度
+        truncated: 每个文本是否被截断
+        actual_attempts: 实际尝试次数
+
+    原理：
+        1. 逐个生成候选，立即评估 quick reward
+        2. 如果已有 k 个样本且 reward 种类 >= diversity_threshold，停止
+        3. 否则继续采样直到 max_attempts
+        4. 如果达到上限仍无多样性，返回当前最好的 k 个样本
+    """
+    samples = []
+    lengths = []
+    truncated = []
+    rewards_quick = []
+
+    # 获取 EOS token IDs
+    eos_ids = get_eos_token_ids(tokenizer)
+
+    # Tokenize prompt once
+    inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                      truncation=True, max_length=config.SFT_MAXLEN).to(device)
+    original_input_len = inputs["input_ids"].shape[1]
+
+    for attempt in range(max_attempts):
+        # 创建 step_counter
+        step_counter = [step] if step is not None else None
+        processors = build_safe_logits_processors(step_counter, eos_ids)
+
+        # 生成一个候选
+        with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
+                temperature=config.TEMPERATURE_TRAIN,
+                top_k=config.TOP_K_TRAIN,
+                top_p=config.TOP_P_TRAIN,
+                repetition_penalty=config.REP_PENALTY_TRAIN,
+                no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,
+                logits_processor=processors,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+                num_return_sequences=1,
+            )
+
+        # Decode
+        response_tokens = output[0, original_input_len:]
+        text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+        # 计算长度和检测截断
+        eos_position = None
+        for pos, token_id in enumerate(response_tokens):
+            if int(token_id.item()) in eos_ids:
+                eos_position = pos
+                break
+
+        if eos_position is not None:
+            actual_len = eos_position + 1
+            hit_eos = True
+        else:
+            actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
+            hit_eos = False
+
+        actual_len = min(actual_len, max_new_tokens)
+        is_truncated = (actual_len >= max_new_tokens) and not hit_eos
+
+        samples.append(text)
+        lengths.append(actual_len)
+        truncated.append(is_truncated)
+
+        # 【关键】快速 reward 估计（用于多样性检查）
+        quick_reward = quick_reward_estimate(text, task)
+        rewards_quick.append(quick_reward)
+
+        # 检查是否满足多样性条件
+        if len(samples) >= k:
+            # 使用离散化的 reward 来判断多样性（避免浮点数精度问题）
+            discretized_rewards = [round(r, 1) for r in rewards_quick[:k]]
+            unique_rewards = len(set(discretized_rewards))
+
+            if unique_rewards >= diversity_threshold:
+                # 有足够多样性，返回前 k 个
+                return samples[:k], lengths[:k], truncated[:k], attempt + 1
+
+    # 达到上限，返回最好的 k 个（优先选择 reward 不同的）
+    discretized_rewards = [round(r, 1) for r in rewards_quick[:k]]
+    unique_rewards = len(set(discretized_rewards))
+
+    return samples[:k], lengths[:k], truncated[:k], max_attempts
+
+
+def generate_candidates_batch(
+    model, tokenizer, device,
+    prompts: List[str],
+    k: int,
+    max_new_tokens: int = None,
+    step: int = None,
+    use_dynamic_sampling: bool = False,  # 【Phase 2】是否使用动态采样
+    tasks: List[str] = None,  # 【Phase 2】任务列表（用于 quick reward estimate）
+) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
     """
     【串行生成修复】为每个prompt独立生成K个候选，确保多样性
 
@@ -2630,6 +2817,11 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     §1&§2修复: 应用聊天模板 + 多终止符
     【调试】添加step参数用于debug logging
     【修复】返回formatted_prompts确保后续tokenize一致性
+    【Phase 2】支持 DAPO 风格动态采样
+
+    Args:
+        use_dynamic_sampling: 是否使用动态采样（Phase 2）
+        tasks: 任务列表，与 prompts 对应（用于 quick reward estimate）
 
     Returns:
         grouped_texts: List[List[str]] - 每个prompt的K个候选回复
@@ -2653,6 +2845,35 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     unique_prompt_lens = []
 
     for prompt_idx, formatted_prompt in enumerate(formatted_prompts):
+        # 【Phase 2】如果启用动态采样，使用 DAPO 风格生成
+        if use_dynamic_sampling:
+            task = tasks[prompt_idx] if tasks else "fairness"
+            candidates_texts, candidates_lengths, candidates_truncated, attempts = \
+                generate_candidates_with_dynamic_sampling(
+                    model, tokenizer, device,
+                    formatted_prompt=formatted_prompt,
+                    task=task,
+                    k=k,
+                    max_attempts=8,
+                    diversity_threshold=2,
+                    max_new_tokens=max_new_tokens,
+                    step=step,
+                )
+
+            # 计算 prompt_len
+            inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                             truncation=True, max_length=config.SFT_MAXLEN).to(device)
+            prompt_len = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).item()
+
+            # 添加到结果
+            grouped_texts.append(candidates_texts)
+            grouped_lengths.append(candidates_lengths)
+            grouped_truncated.append(candidates_truncated)
+            unique_prompt_lens.append(prompt_len)
+
+            continue  # 跳过原有的生成逻辑
+
+        # 【原有逻辑】标准串行生成（带去重）
         candidates_texts = []
         candidates_lengths = []
         candidates_truncated = []
@@ -3369,7 +3590,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         cand_by_sample, lengths_by_sample, _, truncated_by_sample, formatted_prompts = generate_candidates_batch(
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
             max_new_tokens=current_max_new_tokens_train,  # 【修正】传入动态调整的max_new_tokens
-            step=step  # 【调试】传入step用于debug logging
+            step=step,  # 【调试】传入step用于debug logging
+            use_dynamic_sampling=True,  # 【Phase 2】启用 DAPO 风格动态采样
+            tasks=tasks  # 【Phase 2】传入任务列表用于 quick reward estimate
         )
 
         # 【显存优化】生成后立即清理显存
