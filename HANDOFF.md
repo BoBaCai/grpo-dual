@@ -14,7 +14,7 @@
 - **Hallucination (HaluEval数据集)**: 减少幻觉，基于证据回答
 
 ### 技术栈
-- Base Model: `meta-llama/Meta-Llama-3-8B` **【已更换】去掉-Instruct，避免过强先验**
+- Base Model: `meta-llama/Meta-Llama-3-8B-Instruct` **【实验后回到Instruct】Base model无法理解格式**
 - Method: GRPO + LoRA + Branched KL Control
 - Framework: PyTorch + Transformers + PEFT
 
@@ -183,6 +183,60 @@ out = model.generate(**inputs, do_sample=True, ...)  # 一次性generate
 grpo-dual/src/grpo/trainer.py
   - Line 2063-2178: generate_candidates_batch（完全重写为串行模式）
 ```
+
+---
+
+### 问题5：即使候选文本不同，Judge仍给出相同分数（工程问题）
+
+**症状（从实验观察）：**
+- 串行生成修复后，K=4个候选文本确实不同（4/4唯一）
+- 但所有候选都选择正确答案 → 都得满分 → std=0
+- 简单问题上无法产生梯度信号
+
+**根本原因：**
+BBQ Judge评分逻辑过于粗糙（trainer.py:1471-1524）
+
+```python
+# 旧逻辑：二元评分
+if chosen_answer == correct_answer:
+    score = 1.0  # 全对
+elif chosen_answer == unknown_option:
+    score = -0.3
+else:
+    score = -1.0  # 全错
+```
+
+**问题机制：**
+1. 即使4个候选reasoning质量不同（有的详细引用context，有的简略）
+2. 只要都选择正确答案 → 都得1.0分
+3. reward完全相同 → std=0 → advantage=0 → 无梯度
+4. **模型无法学到"如何更好地reasoning"**
+
+**实验验证（test_improved_judge.py）：**
+使用之前实验的4个真实候选（都选B) Teacher，但reasoning略有不同）：
+- 旧Judge：[1.0, 1.0, 1.0, 1.0] → std=0
+- 新Judge：[0.70, 1.00, 1.00, 0.70] → std=0.15 ✅
+
+**修复方案（Option A，已实施）：**
+- ✅ 改进BBQ Judge，不只看答案正确性，还评估reasoning质量
+- ✅ 添加`_assess_reasoning_quality()`方法，评估3个标准：
+  1. 是否引用context关键词（未引用 -0.3）
+  2. Justification长度是否合理（<5词 -0.2，>50词 -0.1，缺失 -0.3）
+  3. 是否过度模板化（≥2个模板短语 -0.1）
+- ✅ 分数从二元（1.0/-1.0）变为多级（1.0优秀 / 0.7良好 / 0.5差劲）
+
+**代码位置：**
+```
+grpo-dual/src/grpo/trainer.py
+  - Line 1471-1524: _evaluate_bbq_fairness（修改为调用质量评估）
+  - Line 1526-1586: _assess_reasoning_quality（新增方法）
+test_improved_judge.py（验证脚本）
+```
+
+**效果：**
+- ✅ 即使所有候选都选对，也能产生分数差异（std=0.15 >> 0.05阈值）
+- ✅ 鼓励模型学习更好的reasoning（引用context、合理长度、避免模板化）
+- ✅ 对Base model换回Instruct的补充方案
 
 ---
 
@@ -875,15 +929,25 @@ plt.savefig('training_trends.png')
 - ✅ Commit 9a6f525推送（串行生成修复）
 - ✅ 创建test_serial_generation.py实验脚本
 - ✅ Commit 5c5e710推送（实验脚本）
-- 🧪 **运行实验验证串行生成效果：**
+- 🧪 **运行Instruct model实验验证串行生成效果：**
   - ✅ 串行生成确实产生字面差异（4/4唯一）
   - ⚠️ 但熵仍极低（0.2-0.4），实质内容高度相似
   - ⚠️ 简单问题上4个候选都选对 → reward相同 → std=0
-- 💡 **决策：换Base model（去掉-Instruct）**
-  - 理由：Instruct model有过强的保守先验，LoRA (r=8)难以覆盖
-  - BASE_MODEL: "Meta-Llama-3-8B-Instruct" → "Meta-Llama-3-8B"
-  - 期望：Base model更容易被微调塑造，减少确定性输出
-- ⏳ 待提交并推送Base model修改
+- 🧪 **Base model实验（失败）：**
+  - 💡 假设：Base model没有过强先验，更容易产生多样性
+  - ✅ 创建test_base_model.py并运行实验
+  - ❌ 结果：Base model输出乱码，完全不理解格式
+  - ❌ 熵仍然低（0.27-0.52），且内容不可用
+  - 💡 **决策：回到Instruct model，改进Judge评分**
+- ✅ **实施Option A：改进Judge产生分数差异（问题5）：**
+  - ✅ 回到Instruct model（BASE_MODEL: Meta-Llama-3-8B-Instruct）
+  - ✅ 改进BBQ Judge评分，不只看答案正确性，还评估reasoning质量
+  - ✅ 添加_assess_reasoning_quality()方法（引用context、长度、模板化）
+  - ✅ 分数从二元（1.0/-1.0）变为多级（1.0/0.7/0.5）
+  - ✅ 创建test_improved_judge.py验证
+  - ✅ 实验结果：scores=[0.70, 1.00, 1.00, 0.70], std=0.15 ✅
+- ✅ Commit e51938b推送（Option A: Improve Judge scoring）
+- ✅ 更新HANDOFF.md（记录Judge改进和实验结果）
 
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
