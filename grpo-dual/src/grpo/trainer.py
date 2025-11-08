@@ -2867,20 +2867,23 @@ def _tokenize_concat(tokenizer, prompts: List[str], responses: List[str], respon
 
 def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
     """
-    【Plan C修复】废除组内z-score标准化，改用更鲁棒的方案
+    【业界标准修复】正确处理零方差组
+
+    参考：
+    - DeepSeekMath/原始GRPO论文：零方差组自然产生0梯度
+    - HuggingFace TRL：监控frac_reward_zero_std，跳过std=0的组
+    - 数学正确性：无相对信息 → 无更新
 
     原问题：
     - 组内z-score: adv = (r - mean) / std
-    - 当K个候选reward相同时，std=0 → adv≈0 → 梯度为0
+    - 当K个候选reward相同时，std=0 → 除零问题
 
-    新方案：
-    - 检测std < 0.01（整组同奖）→ 直接用reward作为advantage
-    - 否则：用组内中心化（r - mean），不除std，保留reward scale
+    错误方案（之前）：
+    - std < 0.01时用reward作为advantage → 数学错误，引入绝对值信息
 
-    这样：
-    1. 避免了除以0导致的梯度抹平
-    2. 保留了GRPO的组内相对优势概念（有多样性时）
-    3. 退化到安全模式（无多样性时）
+    正确方案（业界标准）：
+    - std < 0.01：设置advantage=0，跳过该组（无学习信号）
+    - std >= 0.01：标准GRPO组归一化 (r - mean) / std
     """
     Bk = rewards.numel()
     assert Bk % k == 0
@@ -2893,13 +2896,14 @@ def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
         group_std = group_rewards.std()
 
         if group_std < 0.01:
-            # 【修复】整组同奖，直接用reward（已经过全局归一化）
-            group_adv = group_rewards
+            # 【业界标准】零方差组无学习信号，跳过
+            # 数学原理：K个候选reward相同 → 无相对优势可言 → advantage应为0
+            group_adv = torch.zeros_like(group_rewards)
         else:
-            # 【修复】有多样性，用中心化（不除std）
-            # 保留相对优势的概念，同时保持reward的原始scale
+            # 【标准GRPO】组内归一化
+            # adv = (r - mean) / std，确保组内advantage期望为0，std为1
             group_mean = group_rewards.mean()
-            group_adv = group_rewards - group_mean
+            group_adv = (group_rewards - group_mean) / group_std.clamp_min(1e-6)
 
         advantages.append(group_adv)
 
