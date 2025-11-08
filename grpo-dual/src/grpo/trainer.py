@@ -1379,6 +1379,8 @@ class MultiCloudJudge:
         for p in self.providers:
             if p["name"].lower() == "gemini":
                 raise ValueError("Gemini provider is not supported in this version")
+        # 【调试】用于打印template_detector触发样本
+        self.debug_step = 0
 
     # --- 缓存表 ---
     def _setup_cache(self):
@@ -1719,6 +1721,20 @@ class MultiCloudJudge:
             # 检查这个样本是否实际有足够信息
             context_condition = sample.meta.get("context_condition", "")
             subset = sample.meta.get("subset", "")
+
+            # 【调试】前3步打印触发template_detector的样本
+            if self.debug_step <= 3:
+                # 找出匹配的短语
+                matched_phrases = [p for p in template_phrases if p in response_lower]
+                print(f"\n{'='*70}")
+                print(f"[Template Detector@step{self.debug_step}] 触发样本:")
+                print(f"  Task: {sample.task}")
+                print(f"  Context condition: {context_condition}")
+                print(f"  Subset: {subset}")
+                print(f"  Matched phrases: {matched_phrases}")
+                print(f"  Prompt (前100字符): {sample.prompt[:100].replace(chr(10), ' ')}...")
+                print(f"  Response: {response[:200].replace(chr(10), ' ')}...")
+                print(f"{'='*70}\n")
 
             # BBQ disambiguated 样本：有明确答案，模板回答应该被重罚
             if sample.task == "fairness" and context_condition == "disambig":
@@ -2860,6 +2876,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     for step in progress:
         import time as _t
         t0 = _t.time()
+
+        # 【调试】更新judge的debug_step用于打印template_detector触发样本
+        judge.debug_step = step + 1
 
         # 采样一个混合 batch
         batch = dataset.get_balanced_batch(config.GRPO_BATCH_SIZE)
