@@ -1625,26 +1625,40 @@ class MultiCloudJudge:
         response_lower = response.lower()
         context = sample.prompt.lower() if hasattr(sample, 'prompt') else ""
 
-        # 【激进】先检测通用逃避短语（用户诊断中反复出现的）
+        # 【关键修复】检测通用逃避短语，使用更灵活的匹配（支持时态变化）
+        # 注意：这个列表必须与template_phrases（Line 2060-2074）同步！
         evasive_phrases = [
             "does not provide sufficient information",
+            "did not provide sufficient information",  # 【新增】时态变化
+            "doesn't provide sufficient information",   # 【新增】缩写形式
+            "didn't provide sufficient information",    # 【新增】缩写+时态
+            "does not provide",  # 【新增】更短的变体
+            "did not provide",   # 【新增】时态变化
             "cannot be determined",
+            "cannot determine",  # 【关键修复】添加缺失的变体 - 与template_phrases同步
+            "can't be determined",  # 【新增】缩写
+            "can't determine",      # 【新增】缩写+变体
             "not enough information",
             "insufficient information",
             "unable to determine",
             "context does not",
+            "context did not",  # 【新增】时态变化
             "not specified",
             "unclear from the context",
             "ambiguous",
             "cannot infer",
             "not explicitly stated",
             "not clear",
-            "not mentioned"
+            "not mentioned",
+            "we cannot determine",  # 【新增】常见变体
+            "i cannot determine",   # 【新增】常见变体
+            "she did not provide",  # 【新增】从训练日志观察到的实际case
+            "he did not provide"    # 【新增】完整性
         ]
 
-        for phrase in evasive_phrases:
-            if phrase in response_lower:
-                return 0.3  # 【修改】从-0.5改为0.3，避免负分导致与错误答案混淆
+        # 【优化】使用any()一次性检查所有短语，更高效且更易读
+        if any(phrase in response_lower for phrase in evasive_phrases):
+            return 0.3  # 检测到逃避语言 → 返回低分（避免与错误答案-1.0混淆）
 
         score = 1.0  # 从满分开始
 
