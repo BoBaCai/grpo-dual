@@ -200,8 +200,8 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 0.5               # 【Entropy崩溃修复】从0.2→0.5，配合MIN_NEW_TOKENS修复
-                                     # 原因：0.2在entropy=0.005时bonus太弱(0.001)，提升到0.5增强探索
+    ENTROPY_COEF = 2.0               # 【Plan C修复】从0.5→2.0，对抗严重熵塌陷
+                                     # 策略极度尖锐(top-1 prob 0.94~0.999999)，需要更强的熵正则化
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -1591,14 +1591,21 @@ class MultiCloudJudge:
 
         【紧急修复】模板检测：惩罚"安全废话模板"以解决模式坍塌
         """
-        # 【新增】模板检测器：识别逃避回答的模板化输出
+        # 【Plan C增强】模板检测器：识别并重罚逃避回答的模板化输出
         template_phrases = [
             "does not provide sufficient information",
             "cannot be determined",
             "not enough information",
             "insufficient information",
             "unable to determine",
-            "context does not"
+            "context does not",
+            "cannot determine",
+            "lack of information",
+            "no clear information",
+            "ambiguous",
+            "unclear from the context",
+            "not specified",
+            "not mentioned"
         ]
 
         response_lower = response.lower()
@@ -1611,14 +1618,14 @@ class MultiCloudJudge:
 
             # BBQ disambiguated 样本：有明确答案，模板回答应该被重罚
             if sample.task == "fairness" and context_condition == "disambig":
-                return {"final": -0.7, "provider": "template_detector"}
+                return {"final": -1.0, "provider": "template_detector"}  # 【增强】-0.7→-1.0，最大惩罚
 
             # HaluEval 非 general 样本：有 knowledge，模板回答不合理
             if sample.task == "hallucination" and subset in ["qa", "dialogue", "summarization"]:
-                return {"final": -0.5, "provider": "template_detector"}
+                return {"final": -0.8, "provider": "template_detector"}  # 【增强】-0.5→-0.8，加大惩罚
 
             # ambiguous 或 general 样本：模板回答勉强可以，但不给正分（避免成为最优策略）
-            return {"final": 0.0, "provider": "template_detector"}
+            return {"final": -0.2, "provider": "template_detector"}  # 【增强】0.0→-0.2，轻微负分
 
         # BBQ Fairness任务：使用规则评估
         if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
@@ -2567,13 +2574,44 @@ def _tokenize_concat(tokenizer, prompts: List[str], responses: List[str], respon
     return full, comp_mask
 
 def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    【Plan C修复】废除组内z-score标准化，改用更鲁棒的方案
+
+    原问题：
+    - 组内z-score: adv = (r - mean) / std
+    - 当K个候选reward相同时，std=0 → adv≈0 → 梯度为0
+
+    新方案：
+    - 检测std < 0.01（整组同奖）→ 直接用reward作为advantage
+    - 否则：用组内中心化（r - mean），不除std，保留reward scale
+
+    这样：
+    1. 避免了除以0导致的梯度抹平
+    2. 保留了GRPO的组内相对优势概念（有多样性时）
+    3. 退化到安全模式（无多样性时）
+    """
     Bk = rewards.numel()
     assert Bk % k == 0
     B = Bk // k
     r = rewards.view(B, k)
-    mean = r.mean(dim=1, keepdim=True)
-    std = r.std(dim=1, keepdim=True).clamp_min(1e-6)
-    adv = ((r - mean) / std).view(-1).clamp(-config.ADV_CLIP, config.ADV_CLIP)
+
+    advantages = []
+    for i in range(B):
+        group_rewards = r[i]
+        group_std = group_rewards.std()
+
+        if group_std < 0.01:
+            # 【修复】整组同奖，直接用reward（已经过全局归一化）
+            group_adv = group_rewards
+        else:
+            # 【修复】有多样性，用中心化（不除std）
+            # 保留相对优势的概念，同时保持reward的原始scale
+            group_mean = group_rewards.mean()
+            group_adv = group_rewards - group_mean
+
+        advantages.append(group_adv)
+
+    adv = torch.cat(advantages).clamp(-config.ADV_CLIP, config.ADV_CLIP)
     return adv
 
 def _set_grads_from_vec(params: List[torch.nn.Parameter], vec: torch.Tensor, accumulate: bool = True):
@@ -2752,8 +2790,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
     # 【标准GRPO KL控制】使用DeepSeekMath式(4)的无偏估计器
     # β参考值：DeepSeekMath用0.04，我们分支化控制用3x起点（多任务+梯度合并需要更强约束）
     kl_controller = BranchedKLController(
-        beta_f_init=0.30,  # 【紧急修复】从0.15提升到0.30，β涨到0.27仍无法控制KL
-        beta_h_init=0.30,  # 保持0.30（Hallucination已稳定）
+        beta_f_init=0.05,  # 【Plan C修复】从0.30降到0.05，降低KL约束，给模型更多自由度
+                           # 原因：严格KL约束(0.30)锁住模型，几乎不更新。参考DeepSeekMath=0.04
+        beta_h_init=0.05,  # 同步降低，保持一致
         window_size=config.KL_ADAPTIVE_WINDOW
     )
     

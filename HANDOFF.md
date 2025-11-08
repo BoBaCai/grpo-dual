@@ -2,7 +2,7 @@
 
 **Last Updated:** 2025-11-08
 **Current Branch:** `claude/open-trainer-py-011CUp9RqkPbRBQPMVzBRuJ3`
-**Status:** A+B修复已完成，等待训练验证
+**Status:** Plan C全面修复已完成（Advantage计算+熵奖励+KL约束+模板检测增强）
 
 ---
 
@@ -206,6 +206,79 @@ if zero_gradient_groups > 0:
 
 ---
 
+### Commit: (待提交) "Implement Plan C: fix advantage calculation and enhance exploration"
+
+**基于Pi专家的训练日志诊断，实施全面修复：**
+
+#### 修改4: Advantage计算修复（最核心！）
+```python
+# trainer.py:2569-2608
+# 原逻辑：组内z-score标准化
+adv = (r - mean) / std  # std=0时梯度为0
+
+# 新逻辑：检测std，退化到安全模式
+if group_std < 0.01:
+    # 整组同奖，直接用reward（已过全局归一化）
+    group_adv = group_rewards
+else:
+    # 有多样性，用中心化（不除std，保留scale）
+    group_adv = group_rewards - group_mean
+```
+
+**效果：**
+- ✅ 避免除以0导致的梯度抹平（即使K个候选完全相同）
+- ✅ 保留GRPO组内相对优势概念（有多样性时）
+- ✅ reward已过全局归一化，可直接当advantage使用
+- ✅ 退化模式：无多样性时，至少有一致的梯度方向（鼓励/抑制）
+
+#### 修改5: 增强熵正则化
+```python
+# trainer.py:203
+ENTROPY_COEF = 2.0  # 从0.5→2.0
+```
+
+**原因：** 策略极度尖锐(top-1 prob 0.94~0.999999)，需要更强的熵奖励对抗塌陷
+
+**效果：** Loss中entropy项权重增大4倍，显著鼓励探索
+
+#### 修改6: 降低KL约束
+```python
+# trainer.py:2786-2788
+beta_f_init = 0.05  # 从0.30→0.05
+beta_h_init = 0.05  # 从0.30→0.05
+```
+
+**原因：**
+- 严格KL约束(β=0.30)锁住模型，几乎不更新
+- 参考DeepSeekMath使用0.04
+- 给模型更多自由度偏离参考模型
+
+**效果：** KL惩罚降低6倍，模型可以更大胆地探索
+
+#### 修改7: 模板检测器增强
+```python
+# trainer.py:1595-1628
+# 扩展短语列表：6种→13种
+template_phrases = [
+    "does not provide sufficient information",
+    "cannot be determined",
+    # ... 新增7种
+    "ambiguous", "unclear from the context", "not specified", ...
+]
+
+# 加大惩罚力度：
+- BBQ disambiguated: -0.7 → -1.0（最大负分）
+- HaluEval qa/dialogue/summarization: -0.5 → -0.8
+- Ambiguous/general: 0.0 → -0.2（轻微负分）
+```
+
+**效果：**
+- 更全面的模板识别
+- 更强的惩罚信号
+- 配合Advantage修复，即使全组是模板也能产生梯度
+
+---
+
 ## 📊 当前训练状态
 
 ### 配置 (trainer.py:126-286)
@@ -233,29 +306,29 @@ N_HALU_TRAIN = 400
 FAIRNESS_REWARD_SCALE = 0.7
 HALLUCINATION_REWARD_SCALE = 1.0
 
-# KL控制（分支化）
-beta_f_init = 0.30  # Fairness
-beta_h_init = 0.30  # Hallucination
+# 熵正则化（Plan C增强）
+ENTROPY_COEF = 2.0  # ⚡ 从0.5提升到2.0，对抗严重熵塌陷
+
+# KL控制（分支化，Plan C降低）
+beta_f_init = 0.05  # ⚡ 从0.30降到0.05，给模型更多自由度
+beta_h_init = 0.05  # ⚡ 从0.30降到0.05
 ```
 
 ### 待观察指标（前50步最关键）
 
-#### 🔥🔥🔥 优先级0：C2组内std监控（最关键！每步都看）
+#### 🔥🔥🔥 优先级0：训练是否真正开始学习（观察前10步）
 ```
-⚠️ [Step X] Y/B 组(Z%)的reward std<0.01，梯度信号被抹平
+⚠️ [Step X] Y/B 组(Z%)的reward std<0.01
 ```
-**期望：**
-- ✅ <20%的组无梯度（A+B修复生效）
-- ⚠️ 20-50%的组无梯度（部分生效，可以继续观察）
-- ❌ >50%的组无梯度（A+B未生效，需要Plan C1）
+**Plan C已实施，即使检测到零梯度组，也不影响训练（已修复advantage计算）**
 
-**如果>50%无梯度，说明：**
-1. MIN_NEW_TOKENS仍然太大，或未生效
-2. 模板检测器未工作（检查provider分布）
-3. 生成仍然高度相似（检查responses）
-4. **需要立即实施Plan C1（全局baseline重构）**
+**新的关注点：**
+1. **模型是否开始探索？** 观察生成多样性（不再全是"insufficient information"）
+2. **熵是否上升？** Entropy从<0.5上升到>1.0
+3. **KL是否合理？** beta=0.05下，KL应该在0.1-0.5之间（比之前大）
+4. **Reward是否有波动？** 不应该全是常数
 
-**关键：** 这是Pi发现的最致命问题，直接决定训练能否进行！
+**关键：** Plan C已修复advantage计算，即使std<0.01也有梯度。现在要看的是模型是否真的在动。
 
 #### 🔥 优先级1：熵是否恢复（前5步）
 ```
@@ -378,13 +451,26 @@ for sample in bbq[:100]:
 
 ---
 
-### Plan C1: 全局Baseline重构（如果C2监控显示>50%组无梯度）
+### ~~Plan C1: 全局Baseline重构~~ ✅ 已实施为Plan C修改4
 
-**触发条件：** C2监控显示>50%的组reward std<0.01
+**状态：** ✅ 已完成（实施了混合方案：检测std并退化）
 
-**代码位置：** trainer.py:2569-2577 (compute_group_advantages)
+**代码位置：** trainer.py:2569-2608 (compute_group_advantages)
 
-**修复方案（方案1：使用全局EMA baseline）：**
+**实施的方案（混合方案）：**
+```python
+# 检测std，选择合适的advantage计算方式
+if group_std < 0.01:
+    # 整组同奖 → 直接用reward（避免除以0）
+    group_adv = group_rewards
+else:
+    # 有多样性 → 用中心化（保留scale）
+    group_adv = group_rewards - group_mean
+```
+
+**下面是原计划的其他方案（供参考）：**
+
+**备选方案1：使用全局EMA baseline：**
 ```python
 # 在grpo_train函数初始化时添加
 global_baseline_ema = {"fairness": 0.0, "hallucination": 0.0}
@@ -442,32 +528,35 @@ if (~std_too_small).any():
 
 ---
 
-## 🎯 决策树（20步后）
+## 🎯 决策树（20步后）- Plan C已实施版
 
-### 第一步：检查C2监控（最关键！）
-
-```
-先看C2监控输出
-│
-├─ >50%组无梯度（reward std<0.01）
-│  └─> 🚨 致命！A+B修复未生效
-│     ├─ 检查：MIN_NEW_TOKENS是否=5？
-│     ├─ 检查：模板检测器是否工作？
-│     ├─ 检查：生成是否仍高度相似？
-│     └─> ⚡ 立即实施Plan C1（全局baseline重构）
-│
-├─ 20-50%组无梯度
-│  └─> ⚠️ A+B部分生效，继续观察
-│     └─> 如果20步后仍>30%，考虑Plan C1方案2
-│
-└─ <20%组无梯度
-   └─> ✅ A+B+C2成功！继续看Fairness vs Hallucination对比
-```
-
-### 第二步：如果C2正常（<20%无梯度），再看任务表现
+### 第一步：模型是否在学习？（前10步）
 
 ```
-训练20步后观察结果（C2正常的前提下）
+观察前10步的关键指标
+│
+├─ 熵仍然很低（<0.5）+ 生成仍高度相似 + KL几乎为0
+│  └─> 🚨 致命！模型被锁死
+│     ├─ 可能原因1：ENTROPY_COEF=2.0仍不够，继续增大到5.0
+│     ├─ 可能原因2：beta=0.05仍太大，降到0.01
+│     ├─ 可能原因3：基座模型先验太强，考虑增加temperature
+│     └─> ⚡ 调整超参后重新训练
+│
+├─ 熵有上升（0.5→1.0）+ 生成有多样性 + KL在0.1-0.5
+│  └─> ✅ Plan C生效！模型开始探索
+│     └─> 继续观察20-50步，看是否收敛
+│
+└─ 熵剧烈波动 + Reward崩溃（全是极端值）
+   └─> ⚠️ 探索过头，不稳定
+      ├─ 降低ENTROPY_COEF（2.0→1.0）
+      ├─ 或增大beta（0.05→0.10）
+      └─> 重新训练
+```
+
+### 第二步：如果模型开始学习，观察任务表现（20-50步）
+
+```
+训练20步后观察结果
 │
 ├─ Fairness恢复 + Hallucination恢复
 │  └─> ✅✅✅ 完全成功，继续训练到100-200步
@@ -477,7 +566,7 @@ if (~std_too_small).any():
 │     └─> 实施Plan B1（过滤general）或B3（降低权重）
 │
 ├─ Fairness仍弱 + Hallucination仍弱
-│  └─> 🔍 其他问题（不是C2的问题）
+│  └─> 🔍 其他问题
 │     └─> 实施Plan B4（检查截断）
 │     └─> 检查ambig/disambig采样比例
 │
@@ -485,7 +574,7 @@ if (~std_too_small).any():
    └─> 🤔 不太可能，深入诊断BBQ
 ```
 
-**关键：** Pi的发现表明，C2监控的结果直接决定训练能否进行。如果>50%组无梯度，其他一切都是空谈，必须先修复这个！
+**关键：** Plan C已修复advantage计算，现在关注点是模型是否真的在动（熵上升、生成多样化）。
 
 ---
 
@@ -687,16 +776,27 @@ plt.savefig('training_trends.png')
 
 ## 📝 更新日志
 
-**2025-11-08:**
+**2025-11-08 (Session 1):**
 - ✅ 完成A+B修复（MIN_NEW_TOKENS降低 + 模板检测器）
 - ✅ Commit f140a1c推送到远程分支
 - ✅ 整理Pi专家的数据集分析
-- ✅ 准备Plan B方案（待训练结果决定）
-- 📋 创建本交接文档
+- ✅ 添加C2监控（零梯度组检测）
+- ✅ Commit 7294249推送（C2监控 + HANDOFF创建）
+
+**2025-11-08 (Session 2 - 当前):**
+- ✅ 接收Pi专家的训练日志诊断（6点总结）
+- ✅ **实施Plan C全面修复：**
+  - ✅ 修改compute_group_advantages（避免梯度抹平）
+  - ✅ 增强熵正则化（ENTROPY_COEF: 0.5→2.0）
+  - ✅ 降低KL约束（beta: 0.30→0.05）
+  - ✅ 增强模板检测器（13种短语，更大惩罚）
+- 🔄 更新HANDOFF.md（记录Plan C实施细节）
+- ⏳ 待提交并推送
 
 **待更新（训练完成后）：**
-- [ ] 前20步的实际观察结果
-- [ ] 是否需要实施Plan B（哪个）
+- [ ] 前10步的实际观察结果（关注熵是否上升）
+- [ ] 模型是否开始真正学习（不再锁死）
+- [ ] 是否需要进一步调整超参（ENTROPY_COEF, beta）
 - [ ] 最终训练效果和收敛情况
 
 ---
