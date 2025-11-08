@@ -1940,50 +1940,21 @@ class EOSSuppressionProcessor(torch.nn.Module):
         self.eos_token_ids = eos_token_ids if isinstance(eos_token_ids, list) else [eos_token_ids]
         self.min_new_tokens = min_new_tokens
         self.prompt_len = None  # 在第一次调用时记录
-        self.call_count = 0  # 调用计数器（调试用）
-        print(f"[EOS Suppressor] 初始化: min_new_tokens={min_new_tokens}, eos_token_ids={eos_token_ids}")
+        # print(f"[EOS Suppressor] 初始化: min_new_tokens={min_new_tokens}, eos_token_ids={eos_token_ids}")
 
     def forward(self, input_ids, scores):
-        self.call_count += 1
-
-        # 第一次调用：记录prompt长度（只打印一次）
+        # 第一次调用：记录prompt长度
         if self.prompt_len is None:
             self.prompt_len = input_ids.shape[-1]
-            if self.call_count == 1:  # 只在真正第一次打印
-                print(f"[EOS Suppressor] 首次调用: prompt_len={self.prompt_len}, batch={input_ids.shape[0]}, min={self.min_new_tokens}")
 
         # 计算已生成的token数（不包括prompt）
         generated_len = input_ids.shape[-1] - self.prompt_len
-
-        # 只在前3次调用打印详细信息
-        if self.call_count <= 3:
-            print(f"\n[EOS Supp] Call#{self.call_count}: gen={generated_len}/{self.min_new_tokens}")
-
-            # 【修复】在修改前立即clone保存真实的before状态
-            eos_before_dict = {}
-            for eos_id in self.eos_token_ids:
-                if eos_id is not None:
-                    eos_before_dict[eos_id] = scores[:, eos_id].detach().clone().cpu().numpy()
-                    print(f"  EOS {eos_id} before: {eos_before_dict[eos_id]}")
 
         # 如果还没达到最小生成长度，禁止EOS
         if generated_len < self.min_new_tokens:
             for eos_id in self.eos_token_ids:
                 if eos_id is not None:
-                    # 设置为极小值，确保不会被选中
                     scores[:, eos_id] = -float('inf')
-
-            if self.call_count <= 3:
-                # 【修复】修改后立即clone保存真实的after状态
-                for eos_id in self.eos_token_ids:
-                    if eos_id is not None:
-                        eos_after = scores[:, eos_id].detach().clone().cpu().numpy()
-                        print(f"  EOS {eos_id} after:  {eos_after}")
-                        blocked = (eos_after == -float('inf')).sum()
-                        print(f"  ✓ 已阻止 {blocked}/{len(eos_after)} 个样本")
-        else:
-            if self.call_count <= 3:
-                print(f"  → 允许EOS (gen={generated_len} >= min={self.min_new_tokens})")
 
         return scores
 
@@ -2112,8 +2083,6 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     构建logits处理器列表
     【修复】只添加自定义 processor（Penalty + Sanity）
     Temperature/TopK/TopP 直接传给 generate()，避免警告
-    【调试】在clip前后都打印，诊断真实分布
-    【暂时禁用clip】LogitsClipping导致固定max_prob=0.1465
     【强制约束】添加 EOSSuppressionProcessor 禁止过早EOS
     """
     lp = LogitsProcessorList()
@@ -2122,16 +2091,8 @@ def build_safe_logits_processors(step_counter=None, eos_token_ids=None):
     if eos_token_ids is not None:
         lp.append(EOSSuppressionProcessor(eos_token_ids, min_new_tokens=config.MIN_NEW_TOKENS_TRAIN))
 
-    # 🔍 调试1: clip之前（看真实logits）
-    if step_counter is not None:
-        lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter, label="raw"))
-
-    # 🔧 裁剪logits（暂时禁用，因为导致0.1465固定值）
+    # 🔧 裁剪logits（已禁用）
     lp.append(LogitsClippingProcessor(max_value=50.0))  # enabled=False
-
-    # 🔍 调试2: clip之后（验证是否被裁剪）
-    # if step_counter is not None:
-    #     lp.append(DebugLogitsProcessor(config.TEMPERATURE_TRAIN, step_counter, label="post-clip"))
 
     # 只添加自定义的penalty处理器
     if config.PRESENCE_PENALTY != 0.0:
@@ -2274,25 +2235,25 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
 
                 # 如果不重复，或已经重试max_retries次，接受这个candidate
                 if not is_duplicate or retry_count >= max_retries:
-                    if is_duplicate and retry_count >= max_retries and step is not None and step < 3:
-                        print(f"⚠️ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: {max_retries}次重试后仍重复，保留")
-                    elif is_duplicate == False and retry_count > 0 and step is not None and step < 3:
-                        print(f"✓ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count+1}次生成成功（去重）")
+                    # if is_duplicate and retry_count >= max_retries and step is not None and step < 3:
+                    #     print(f"⚠️ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: {max_retries}次重试后仍重复，保留")
+                    # elif is_duplicate == False and retry_count > 0 and step is not None and step < 3:
+                    #     print(f"✓ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count+1}次生成成功（去重）")
                     break
                 else:
                     retry_count += 1
-                    if step is not None and step < 3:
-                        print(f"🔄 [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count}次重试（Jaccard>{0.75}）")
+                    # if step is not None and step < 3:
+                    #     print(f"🔄 [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count}次重试（Jaccard>{0.75}）")
 
-            # 【调试日志】只在前2步、前2个prompt、前2个候选时打印
-            if step is not None and step < 2 and prompt_idx < 2 and candidate_idx < 2:
-                response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
-                print(f"\n{'─'*70}")
-                print(f"[串行生成] Step {step}, Prompt {prompt_idx}, Candidate {candidate_idx}:")
-                print(f"  Prompt长度: {original_input_len} tokens (非padding: {src_len})")
-                print(f"  Response长度: {response_tokens.shape[0]} tokens")
-                print(f"  Response (前100字符): {decoded[:100]}")
-                print(f"  Response (含special, 前80字符): {response_with_special[:80]}")
+            # 【已禁用】调试日志
+            # if step is not None and step < 2 and prompt_idx < 2 and candidate_idx < 2:
+            #     response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
+            #     print(f"\n{'─'*70}")
+            #     print(f"[串行生成] Step {step}, Prompt {prompt_idx}, Candidate {candidate_idx}:")
+            #     print(f"  Prompt长度: {original_input_len} tokens (非padding: {src_len})")
+            #     print(f"  Response长度: {response_tokens.shape[0]} tokens")
+            #     print(f"  Response (前100字符): {decoded[:100]}")
+            #     print(f"  Response (含special, 前80字符): {response_with_special[:80]}")
 
             # 计算长度和检测截断
             eos_position = None
@@ -2994,28 +2955,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                     # 只计算生成部分的平均熵（使用comp_mask）
                     entropy_per_sample = (entropy_per_pos * comp_mask_diag).sum(dim=1) / comp_mask_diag.sum(dim=1).clamp_min(1.0)
 
-                print(f"\n{'='*70}")
-                print(f"[Fairness诊断@step{step+1}] 发现 {len(fairness_indices)} 个Fairness样本（共{len(task_list)}个）")
-                print(f"{'='*70}")
-                # 只打印前3个Fairness样本，避免输出过长
-                for idx in fairness_indices[:3]:
-                    prompt_preview = all_prompts[idx][:100].replace('\n', ' ')
-                    resp_preview = all_resps[idx][:150].replace('\n', ' ')
-                    entropy_val = entropy_per_sample[idx].item()
-                    print(f"\n样本 #{idx} (batch内索引{idx_map[idx]}):")
-                    print(f"  Prompt: {prompt_preview}...")
-                    print(f"  Generated: {resp_preview}...")
-                    print(f"  Length: {all_lengths[idx]} tokens")
-                    print(f"  Truncated: {all_truncated[idx]}")
-                    print(f"  Reward (原始): {rewards_before_norm[idx].item():.3f}")
-                    print(f"  Reward (归一化后): {rewards[idx].item():.3f}")
-                    print(f"  Entropy: {entropy_val:.3f} {'⚠️ 熵塌陷!' if entropy_val < 0.5 else '✓ 正常' if entropy_val > 1.5 else '⚠️ 偏低'}")
-                if len(fairness_indices) > 3:
-                    print(f"\n... 还有 {len(fairness_indices) - 3} 个Fairness样本未显示")
-                    # 打印整体熵统计
-                    fairness_entropies = entropy_per_sample[fairness_indices]
-                    print(f"  Fairness整体熵统计: mean={fairness_entropies.mean():.3f}, min={fairness_entropies.min():.3f}, max={fairness_entropies.max():.3f}")
-                print(f"{'='*70}\n")
+                # 【精简】只打印熵统计，不打印每个样本详情
+                fairness_entropies = entropy_per_sample[fairness_indices]
+                mean_ent = fairness_entropies.mean().item()
+                min_ent = fairness_entropies.min().item()
+                print(f"[Fairness诊断@step{step+1}] Entropy: mean={mean_ent:.3f}, min={min_ent:.3f}, max={fairness_entropies.max():.3f} {'⚠️ 熵塌陷!' if mean_ent < 0.5 else '✓' if mean_ent > 1.5 else '⚠️ 偏低'}")
 
         # ——一次性分词 + 计算 ref_lp（复用）——
         t_tok0 = _t.time()
@@ -3059,19 +3003,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
             if group_std < 0.01:  # std过小，组内几乎相同
                 zero_gradient_groups += 1
-
-                # 前20步详细打印
-                if step < 20:
-                    print(f"⚠️ [Step {step+1}] 组{i} reward std过小({group_std:.6f})，该组梯度≈0")
-                    print(f"   Rewards: {[f'{r:.3f}' for r in group_rewards]}")
-                    print(f"   Responses preview:")
-                    for j in range(K):
-                        idx = i * K + j
-                        resp_preview = all_resps[idx][:80].replace('\n', ' ')
-                        print(f"     [{j}] {resp_preview}...")
-
-                # 注意：这里不需要手动设置adv=0，因为compute_group_advantages已经会自动产生≈0
-                # 这里只是监控和警告
+                # 【精简】不打印每组详情，只在最后统计
 
         # 统计并报告
         if zero_gradient_groups > 0:
@@ -3083,84 +3015,31 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 print(f"   2. 模板检测器是否在工作？（看provider分布）")
                 print(f"   3. 生成内容是否仍然高度相似？")
 
-        # 【优先级C：Reward统计监控】分析Fairness vs Hallucination的reward分布和信号强度
+        # 【精简】Reward统计监控
         if step < 20:
             fairness_indices_all = [i for i, task in enumerate(task_list) if task == "fairness"]
             halu_indices_all = [i for i, task in enumerate(task_list) if task == "hallucination"]
 
             if len(fairness_indices_all) > 0 and len(halu_indices_all) > 0:
-                # 使用归一化前的reward进行分析（更能反映原始scale）
                 f_rewards = rewards_before_norm[fairness_indices_all]
                 h_rewards = rewards_before_norm[halu_indices_all]
-
-                # 使用归一化后的reward和advantage计算梯度信号强度
                 f_rewards_norm = rewards[fairness_indices_all]
                 h_rewards_norm = rewards[halu_indices_all]
                 f_adv = adv[fairness_indices_all]
                 h_adv = adv[halu_indices_all]
 
-                # 梯度信号强度 = |reward| × |advantage|（决定了实际的梯度大小）
                 f_signal = (f_rewards_norm.abs() * f_adv.abs()).mean().item()
                 h_signal = (h_rewards_norm.abs() * h_adv.abs()).mean().item()
 
-                print(f"\n{'='*70}")
-                print(f"[Reward Scale诊断@step{step+1}]")
-                print(f"{'='*70}")
-                print(f"样本分布: Fairness={len(fairness_indices_all)}, Hallucination={len(halu_indices_all)}")
-                print(f"\nReward统计（归一化前，原始scale）:")
-                print(f"  Fairness:      mean={f_rewards.mean().item():+.3f}, std={f_rewards.std().item():.3f}, range=[{f_rewards.min().item():+.3f}, {f_rewards.max().item():+.3f}]")
-                print(f"  Hallucination: mean={h_rewards.mean().item():+.3f}, std={h_rewards.std().item():.3f}, range=[{h_rewards.min().item():+.3f}, {h_rewards.max().item():+.3f}]")
+                print(f"[Reward Scale@step{step+1}] F: std={f_rewards.std().item():.3f}, H: std={h_rewards.std().item():.3f} | Signal: F={f_signal:.4f}, H={h_signal:.4f}")
 
-                print(f"\n梯度信号强度（|reward_norm| × |advantage|）:")
-                print(f"  Fairness signal:      {f_signal:.4f}")
-                print(f"  Hallucination signal: {h_signal:.4f}")
-
-                # 【修复】检查信号是否过弱（避免division by zero和无意义建议）
-                eps = 1e-6
-                signal_threshold = 1e-5  # 信号太弱时不给建议
-
-                if f_signal < signal_threshold and h_signal < signal_threshold:
-                    print(f"  信号强度比例: N/A (两者均过弱 <{signal_threshold})")
-                    print(f"\n  ⚠️  两个任务的信号强度均过弱 - 无需调整scale")
-                elif f_signal < signal_threshold:
-                    print(f"  信号强度比例: N/A (Fairness过弱 <{signal_threshold})")
-                    print(f"\n  ⚠️  Fairness信号过弱 - 可能该batch全为Hallucination样本")
-                elif h_signal < signal_threshold:
-                    print(f"  信号强度比例: N/A (Hallucination过弱 <{signal_threshold})")
-                    print(f"\n  ⚠️  Hallucination信号过弱 - 可能该batch全为Fairness样本")
-                else:
-                    # 有效信号：计算比值并使用EMA平滑
-                    ratio_raw = f_signal / (h_signal + eps)
-
-                    # EMA平滑（alpha=0.7表示较快适应，0.3保留历史）
-                    if reward_scale_ema is None:
-                        reward_scale_ema = ratio_raw  # 首次直接使用
-                    else:
-                        reward_scale_ema = 0.7 * ratio_raw + 0.3 * reward_scale_ema
-
-                    print(f"  信号强度比例 (raw): {ratio_raw:.2f}")
-                    print(f"  信号强度比例 (EMA): {reward_scale_ema:.2f}")
-
-                    # 基于EMA判断和建议（限幅调整幅度）
-                    if reward_scale_ema > 3.0:
-                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的3倍 - 严重失衡")
-                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.8 (降低20%)")
-                    elif reward_scale_ema > 2.0:
-                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的2倍 - 中度失衡")
-                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.85 (降低15%)")
-                    elif reward_scale_ema > 1.5:
-                        print(f"\n  ⚠️  Fairness信号强度持续高于Hallucination的1.5倍 - 轻度失衡")
-                        print(f"  建议: FAIRNESS_REWARD_SCALE × 0.9 (降低10%)")
-                    elif reward_scale_ema < 0.5:  # 1/2
-                        print(f"\n  ⚠️  Fairness信号强度持续低于Hallucination一半 - 需要提升")
-                        print(f"  建议: FAIRNESS_REWARD_SCALE × 1.2 (提升20%)")
-                    elif reward_scale_ema < 0.67:  # 1/1.5
-                        print(f"\n  ⚠️  Fairness信号强度持续偏低 - 可能需要提升")
-                        print(f"  建议: FAIRNESS_REWARD_SCALE × 1.1 (提升10%)")
-                    else:
-                        print(f"\n  ✓ 信号强度基本平衡（EMA={reward_scale_ema:.2f}在0.67-1.5之间）")
-
-                print(f"{'='*70}\n")
+                # 【精简】只在明显失衡时警告
+                if f_signal > 1e-5 and h_signal > 1e-5:
+                    ratio = f_signal / h_signal
+                    if ratio > 3.0:
+                        print(f"  ⚠️  严重失衡: F/H={ratio:.1f}")
+                    elif ratio < 0.33:
+                        print(f"  ⚠️  严重失衡: F/H={ratio:.2f}")
 
         # ——MU_UPDATES（old_lp 快照一次；每次仅重算 cur_lp）——
         t_mu0 = _t.time()
