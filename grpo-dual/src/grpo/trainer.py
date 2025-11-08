@@ -1750,14 +1750,14 @@ class MultiCloudJudge:
 
                 if right_overlap > 0:
                     bonus += min(0.3, 0.1 * right_overlap)  # 每个关键词+0.1，最多+0.3
-                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
-                    # 【修复】有实质内容但完全不匹配ground truth → 瞎编
+                elif len(model_answer.split()) > 3 and len(right_keywords) > 0:
+                    # 【关键修复】降低阈值：10→3，大部分回答都会被检查
                     bonus -= 0.4
 
                 if halluc_overlap > right_overlap:
                     bonus -= 0.2  # 更接近错误答案
 
-            # 检查Evidence是否引用knowledge
+            # 检查Evidence是否引用knowledge（只在Answer正确时给额外加分）
             if knowledge and model_evidence:
                 # 提取knowledge的关键短语（3-5词的n-gram）
                 know_words = knowledge.split()
@@ -1766,7 +1766,9 @@ class MultiCloudJudge:
                 # 检查model_evidence中是否包含这些短语
                 evidence_contains_knowledge = any(trigram in model_evidence for trigram in list(know_trigrams)[:20])  # 检查前20个
                 if evidence_contains_knowledge:
-                    bonus += 0.2
+                    # 【关键修复】只在Answer匹配时给额外加分
+                    if right_overlap > 0:
+                        bonus += 0.2
                 elif len(model_evidence) > 20 and '"' not in model_evidence:
                     bonus -= 0.1  # 有Evidence但不引用knowledge
 
@@ -1782,17 +1784,19 @@ class MultiCloudJudge:
 
                 if overlap > 0:
                     bonus += min(0.3, 0.1 * overlap)
-                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
-                    # 【修复】有实质内容但完全不匹配ground truth → 瞎编
+                elif len(model_answer.split()) > 3 and len(right_keywords) > 0:
+                    # 【关键修复】降低阈值：10→3，大部分回答都会被检查
                     bonus -= 0.4
 
-            # 检查是否引用knowledge
+            # 检查是否引用knowledge（只在Answer正确时给额外加分）
             if knowledge and model_evidence:
                 know_words = knowledge.split()
                 know_bigrams = set(' '.join(know_words[i:i+2]) for i in range(len(know_words)-1))
                 evidence_grounded = any(bigram in model_evidence for bigram in list(know_bigrams)[:30])
                 if evidence_grounded:
-                    bonus += 0.2
+                    # 【关键修复】只在Answer匹配时给额外加分，避免"瞎编Answer+正确Evidence"拿高分
+                    if overlap > 0:
+                        bonus += 0.2
                 elif len(model_evidence.split()) > 10:
                     # 【修复】有Evidence但不引用knowledge → 可能瞎编
                     bonus -= 0.3
@@ -1809,8 +1813,8 @@ class MultiCloudJudge:
 
                 if overlap >= 2:
                     bonus += 0.2
-                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
-                    # 【修复】有实质内容但关键主题词匹配<2 → 可能偏离主题
+                elif len(model_answer.split()) > 3 and len(right_keywords) > 0:
+                    # 【关键修复】降低阈值：10→3，大部分回答都会被检查
                     bonus -= 0.3
 
             # 检查是否引用document
@@ -1834,8 +1838,8 @@ class MultiCloudJudge:
         subset = sample.meta.get("subset", "")
         response_lower = response.lower()
 
-        # 基础分数
-        score = 0.5
+        # 基础分数（降低以留出ground truth惩罚空间）
+        score = 0.3  # 【关键修复】从0.5降到0.3，避免格式分+ground truth加分后立即clip到1.0
 
         # Special handling for General subset (no knowledge to ground)
         if subset == "general":
