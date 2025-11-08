@@ -2,7 +2,7 @@
 
 **Last Updated:** 2025-11-08
 **Current Branch:** `claude/open-trainer-py-011CUp9RqkPbRBQPMVzBRuJ3`
-**Status:** Plan C全面修复已完成（Advantage计算+熵奖励+KL约束+模板检测增强）
+**Status:** 关键工程问题修复完成（串行生成 + Advantage计算 + 熵奖励 + KL约束 + 模板检测增强）
 
 ---
 
@@ -137,6 +137,52 @@ grpo-dual/src/grpo/trainer.py
 1. **KL控制过严：** 目标KL=0.035过小，实际KL=2.x，β却继续增大 → 锁死策略
 2. **Judge逻辑可疑：** 对模板短语的奖励不一致
 3. **缺少熵正则化：** 应该给policy加entropy bonus
+
+---
+
+### 问题4：批量生成导致K个候选相同（工程问题，最致命！）
+
+**症状（从训练日志观察）：**
+- 即使MIN_NEW_TOKENS=5，K=4个候选仍然高度相同
+- 同组内reward全为1或全为-1，std≈0
+- 模板检测器可能在工作，但无效（4个都是模板→4个都得-1→std仍然=0）
+
+**根本原因：**
+发现于 `generate_candidates_batch` (trainer.py:2063-2248)
+
+```python
+# 旧代码（问题）
+batch_prompts = []
+for p in formatted_prompts:
+    batch_prompts.extend([p]*k)  # 每个prompt重复k=4次
+
+inputs = tokenizer(batch_prompts, ...)  # 一次性tokenize所有
+out = model.generate(**inputs, do_sample=True, ...)  # 一次性generate
+```
+
+**问题机制：**
+1. 同一prompt的k个副本在**同一个forward pass**中
+2. 即使`do_sample=True`，在同一个batch中，random state对同一input是相同的
+3. 当模型概率分布极度尖锐（Pi观察到top-1 prob 0.94~0.999999）时：
+   - Sampling几乎总是选择top-1 token
+   - K个候选产生相同输出
+4. **即使有模板检测器，如果4个都是模板→全得-1.0→std=0→无梯度**
+
+**为什么之前没发现：**
+- A+B+C修复都聚焦在"如何让模型不输出模板"
+- 但忽略了"即使模型想输出不同内容，生成机制也不允许"
+- 这是**工程实现问题**，不是超参或算法问题
+
+**修复方案（已实施）：**
+- ✅ 改为串行生成：对每个prompt独立生成k次
+- 每次generate调用，random state都会变化
+- 即使top-1 prob很高，多次采样也能产生差异
+
+**代码位置：**
+```
+grpo-dual/src/grpo/trainer.py
+  - Line 2063-2178: generate_candidates_batch（完全重写为串行模式）
+```
 
 ---
 
@@ -276,6 +322,35 @@ template_phrases = [
 - 更全面的模板识别
 - 更强的惩罚信号
 - 配合Advantage修复，即使全组是模板也能产生梯度
+
+#### 修改8: 串行生成修复（最关键的工程修复！）
+```python
+# trainer.py:2063-2178
+# 旧逻辑：批量生成所有prompt*k（同一forward pass）
+batch_prompts.extend([p]*k)  # 重复k次
+out = model.generate(**inputs)  # 一次性生成
+
+# 新逻辑：对每个prompt串行生成k次
+for prompt_idx, formatted_prompt in enumerate(formatted_prompts):
+    for candidate_idx in range(k):
+        # 每次独立generate，random state变化
+        out = model.generate(**inputs, do_sample=True, ...)
+        # decode and collect...
+```
+
+**原因：**
+- 批量生成时，同一prompt的k个副本在同一forward pass中
+- Random state相同 + 模型概率极度尖锐 → k个输出相同
+- 即使do_sample=True也无效
+
+**效果：**
+- ✅ 每次generate独立采样，即使top-1 prob很高也能产生差异
+- ✅ 直接解决"同组reward相同→std=0→无梯度"的根本原因
+- ✅ 这是工程问题，不是超参问题！
+
+**代价：**
+- 生成时间增加k倍（但batch size=2很小，影响可接受）
+- 比"无法训练"的代价小得多
 
 ---
 
@@ -790,8 +865,14 @@ plt.savefig('training_trends.png')
   - ✅ 增强熵正则化（ENTROPY_COEF: 0.5→2.0）
   - ✅ 降低KL约束（beta: 0.30→0.05）
   - ✅ 增强模板检测器（13种短语，更大惩罚）
-- 🔄 更新HANDOFF.md（记录Plan C实施细节）
-- ⏳ 待提交并推送
+- ✅ Commit f3f5c7d推送（Plan C全面修复）
+- 🔍 **发现工程根本问题：批量生成导致K个候选相同**
+- ✅ **实施串行生成修复（问题4）：**
+  - ✅ 完全重写generate_candidates_batch为串行模式
+  - ✅ 每个prompt独立生成k次，确保random state变化
+  - ✅ 直接解决"同组reward相同→std=0→无梯度"
+- ✅ 更新HANDOFF.md（记录串行生成修复）
+- ⏳ 待提交并推送串行生成修复
 
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）

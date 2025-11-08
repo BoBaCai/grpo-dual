@@ -2062,7 +2062,12 @@ def temporary_no_checkpointing(model):
 # 训练用：批量生成（一次生成 B×K）
 def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
     """
-    批量生成，返回文本、长度和每个prompt的实际token长度
+    【串行生成修复】为每个prompt独立生成K个候选，确保多样性
+
+    关键改变：不再批量生成所有prompt*k，而是对每个prompt串行生成k次
+    原因：批量生成时，同一prompt的k个副本在同一forward中，random state相同，
+         当模型概率分布极度尖锐（top-1 prob >0.999）时，会产生相同输出
+
     §1&§2修复: 应用聊天模板 + 多终止符
     【调试】添加step参数用于debug logging
     【修复】返回formatted_prompts确保后续tokenize一致性
@@ -2084,167 +2089,92 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     # §2: 获取多终止符
     eos_ids = get_eos_token_ids(tokenizer)
 
-    # 创建step_counter（使用list使其可变）
-    step_counter = [step] if step is not None else None
-    processors = build_safe_logits_processors(step_counter, eos_ids)  # 【修正】传入step_counter和eos_ids
-    batch_prompts = []
-    for p in formatted_prompts:  # 使用格式化后的prompts
-        batch_prompts.extend([p]*k)
-    inputs = tokenizer(batch_prompts, return_tensors="pt", padding=True,
-                       truncation=True, max_length=config.SFT_MAXLEN).to(device)
-
-    # 【最终修复】采样参数直接传递给 generate()，避免警告
-    with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
-            do_sample=True,
-            temperature=config.TEMPERATURE_TRAIN,
-            top_k=config.TOP_K_TRAIN,
-            top_p=config.TOP_P_TRAIN,
-            repetition_penalty=config.REP_PENALTY_TRAIN,
-            no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,  # 【新增】防止n-gram重复
-            logits_processor=processors,  # 只包含 Penalty + Sanity
-            num_return_sequences=1,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=eos_ids,  # §2: 多终止符
-            use_cache=True,
-            return_dict_in_generate=False,
-        )
-    # §3: 拆回每个 prompt 的 k 条，并准确检测截断
-    # 【关键修复】使用原始输入长度（含padding），而非非padding token计数
-    # 这是LEFT PADDING下正确提取response的关键！
-    original_input_len = inputs["input_ids"].shape[1]
-    src_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1)  # 仅用于诊断
-    texts, lengths, prompt_lens, truncated_flags = [], [], [], []
-
-    # 【关键诊断】边界检查（前2步）
-    if step is not None and step < 2:
-        print(f"\n{'='*70}")
-        print(f"[模板/边界核查] Step {step}")
-        print(f"{'='*70}")
-        print(f"out.shape={out.shape}, src_lens[:3]={src_lens[:3].tolist()}")
-
-    for i in range(out.shape[0]):
-        # 【关键修复】使用original_input_len而非src_lens[i]
-        # src_lens[i]计数非padding tokens，但切片需要位置边界（含padding的总长度）
-        response_tokens = out[i, original_input_len:]
-        decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
-
-        # 【关键诊断】详细边界分析（前2步，前2样本）
-        if step is not None and step < 2 and i < 2:
-            # 获取对应的原始prompt索引
-            original_idx = i // k
-            formatted_prompt = formatted_prompts[original_idx] if original_idx < len(formatted_prompts) else "[N/A]"
-
-            # Full sequence (含special tokens)
-            full_with_special = tokenizer.decode(out[i], skip_special_tokens=False)
-
-            # Prompt部分 (含special tokens) - 使用original_input_len
-            prompt_tokens = out[i, :original_input_len]
-            prompt_with_special = tokenizer.decode(prompt_tokens, skip_special_tokens=False)
-
-            # Response部分 (含special tokens)
-            response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
-
-            # Token级细节：边界附近±5个token - 使用original_input_len
-            boundary_tokens_ids = out[i, max(0, original_input_len-5):min(out.shape[1], original_input_len+10)].tolist()
-            boundary_tokens_str = [tokenizer.decode([tid]) for tid in boundary_tokens_ids]
-
-            print(f"\n{'─'*70}")
-            print(f"样本 {i} (原始prompt索引{original_idx}):")
-            print(f"  Prompt长度(含padding): {original_input_len} tokens (非padding: {src_lens[i]} tokens)")
-            print(f"  Response长度: {response_tokens.shape[0]} tokens")
-            print(f"\n  格式化Prompt(末尾60字符):")
-            print(f"    {formatted_prompt[-60:]}")
-            print(f"\n  Prompt部分Token级(末尾80字符,含special):")
-            print(f"    {prompt_with_special[-80:]}")
-            print(f"\n  边界附近Token(前5个prompt末尾+后5个response开头):")
-            print(f"    IDs: {boundary_tokens_ids}")
-            print(f"    Decoded: {boundary_tokens_str}")
-            print(f"\n  Response部分(前120字符,含special):")
-            print(f"    {response_with_special[:120]}")
-            print(f"\n  Response部分(前120字符,跳special):")
-            print(f"    {decoded[:120]}")
-
-            # 异常检测
-            # 【修正】分别统计prompt和response中的<|eot_id|>，排除padding干扰
-            prompt_eot_count = prompt_with_special.count('<|eot_id|>')
-            response_eot_count = response_with_special.count('<|eot_id|>')
-
-            # 检查padding是否被解码为<|eot_id|>（LLaMA-3用eos作为pad）
-            # 统计实际的token ID而非字符串
-            pad_id = tokenizer.pad_token_id
-            eot_token_id = tokenizer.convert_tokens_to_ids('<|eot_id|>') if '<|eot_id|>' in tokenizer.get_vocab() else None
-
-            prompt_token_ids = out[i, :original_input_len]
-            response_token_ids = out[i, original_input_len:]
-
-            if eot_token_id is not None:
-                prompt_eot_token_count = (prompt_token_ids == eot_token_id).sum().item()
-                response_eot_token_count = (response_token_ids == eot_token_id).sum().item()
-                prompt_pad_count = (prompt_token_ids == pad_id).sum().item() if pad_id is not None else 0
-
-                print(f"\n  Token统计:")
-                print(f"    Prompt: {prompt_eot_token_count}个<|eot_id|> tokens, {prompt_pad_count}个padding")
-                print(f"    Response: {response_eot_token_count}个<|eot_id|> tokens")
-                print(f"    pad_token_id={pad_id}, eot_token_id={eot_token_id}")
-
-                # 正常情况：prompt应有2个<|eot_id|>（system结束+user结束），response应≤1个（回答结束）
-                if prompt_eot_token_count > 2:
-                    print(f"  ⚠️ 异常: Prompt包含{prompt_eot_token_count}个<|eot_id|> tokens（正常≤2）")
-                if response_eot_token_count > 1:
-                    print(f"  ⚠️ 异常: Response包含{response_eot_token_count}个<|eot_id|> tokens（正常≤1）")
-
-                # 检查padding是否等于eot
-                if pad_id == eot_token_id:
-                    print(f"  ⚠️ 警告: pad_token_id == eot_token_id ({pad_id})，padding会显示为<|eot_id|>")
-
-            if 'system' in decoded[:100].lower() or '<|start_header_id|>' in response_with_special[:50]:
-                print(f"  ⚠️ 异常: Response开头似乎包含chat header")
-
-            print(f"{'─'*70}")
-
-        texts.append(decoded)
-
-        # §3修复: 正确计算长度和检测截断
-        # 找到第一个EOS/EOT的位置（如果有的话）
-        eos_position = None
-        for pos, token_id in enumerate(response_tokens):
-            if int(token_id.item()) in eos_ids:
-                eos_position = pos
-                break
-
-        # 如果找到了EOS，实际长度就是到EOS的位置+1
-        # 否则就是整个序列的长度（去除padding）
-        if eos_position is not None:
-            actual_len = eos_position + 1
-            hit_eos = True
-        else:
-            # 没有EOS，计算非padding的token数量
-            actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
-            hit_eos = False
-
-        # 确保长度不超过max_new_tokens
-        actual_len = min(actual_len, max_new_tokens)
-        lengths.append(actual_len)
-        prompt_lens.append(int(src_lens[i].item()))
-
-        # 截断定义：达到max_new_tokens且没有命中EOS/EOT
-        is_truncated = (actual_len >= max_new_tokens) and not hit_eos
-        truncated_flags.append(is_truncated)
-
+    # 【串行生成】对每个prompt独立生成k个候选
     grouped_texts, grouped_lengths, grouped_truncated = [], [], []
-    for i in range(0, len(texts), k):
-        grouped_texts.append(texts[i:i+k])
-        grouped_lengths.append(lengths[i:i+k])
-        grouped_truncated.append(truncated_flags[i:i+k])
+    unique_prompt_lens = []
 
-    # 返回每个原始prompt的长度（去重）
-    unique_prompt_lens = [prompt_lens[i] for i in range(0, len(prompt_lens), k)]
+    for prompt_idx, formatted_prompt in enumerate(formatted_prompts):
+        candidates_texts = []
+        candidates_lengths = []
+        candidates_truncated = []
+        prompt_len = None  # 记录这个prompt的长度
 
-    # 【修复】返回formatted_prompts以供后续tokenize使用
+        # 为这个prompt生成k个候选
+        for candidate_idx in range(k):
+            # 创建step_counter（每次生成都独立）
+            step_counter = [step] if step is not None else None
+            processors = build_safe_logits_processors(step_counter, eos_ids)
+
+            # 单独tokenize这一个prompt
+            inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                             truncation=True, max_length=config.SFT_MAXLEN).to(device)
+
+            # 【独立生成】每次调用generate，random state都会变化
+            with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
+                out = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
+                    do_sample=True,
+                    temperature=config.TEMPERATURE_TRAIN,
+                    top_k=config.TOP_K_TRAIN,
+                    top_p=config.TOP_P_TRAIN,
+                    repetition_penalty=config.REP_PENALTY_TRAIN,
+                    no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,
+                    logits_processor=processors,
+                    num_return_sequences=1,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=eos_ids,
+                    use_cache=True,
+                    return_dict_in_generate=False,
+                )
+
+            # 提取response（只有一个，因为num_return_sequences=1）
+            original_input_len = inputs["input_ids"].shape[1]
+            src_len = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).item()
+            if prompt_len is None:
+                prompt_len = src_len
+
+            response_tokens = out[0, original_input_len:]
+            decoded = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+            # 【调试日志】只在前2步、前2个prompt、前2个候选时打印
+            if step is not None and step < 2 and prompt_idx < 2 and candidate_idx < 2:
+                response_with_special = tokenizer.decode(response_tokens, skip_special_tokens=False)
+                print(f"\n{'─'*70}")
+                print(f"[串行生成] Step {step}, Prompt {prompt_idx}, Candidate {candidate_idx}:")
+                print(f"  Prompt长度: {original_input_len} tokens (非padding: {src_len})")
+                print(f"  Response长度: {response_tokens.shape[0]} tokens")
+                print(f"  Response (前100字符): {decoded[:100]}")
+                print(f"  Response (含special, 前80字符): {response_with_special[:80]}")
+
+            # 计算长度和检测截断
+            eos_position = None
+            for pos, token_id in enumerate(response_tokens):
+                if int(token_id.item()) in eos_ids:
+                    eos_position = pos
+                    break
+
+            if eos_position is not None:
+                actual_len = eos_position + 1
+                hit_eos = True
+            else:
+                actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
+                hit_eos = False
+
+            actual_len = min(actual_len, max_new_tokens)
+            is_truncated = (actual_len >= max_new_tokens) and not hit_eos
+
+            candidates_texts.append(decoded)
+            candidates_lengths.append(actual_len)
+            candidates_truncated.append(is_truncated)
+
+        # 将这个prompt的k个候选添加到结果中
+        grouped_texts.append(candidates_texts)
+        grouped_lengths.append(candidates_lengths)
+        grouped_truncated.append(candidates_truncated)
+        unique_prompt_lens.append(prompt_len)
+
     return grouped_texts, grouped_lengths, unique_prompt_lens, grouped_truncated, formatted_prompts
 
 # 评估用：支持贪心和采样两种模式
