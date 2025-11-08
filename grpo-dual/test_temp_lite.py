@@ -26,6 +26,7 @@ possible_paths = [
     Path.cwd().parent,                               # 上级目录
     Path.cwd().parent / 'grpo-dual',                 # 上级目录下的grpo-dual
     Path.cwd().parent.parent / 'grpo-dual',          # 上上级目录下的grpo-dual
+    Path('/workspace/data/halueval/grpo-dual/grpo-dual'),  # workspace halueval路径
     Path('/home/user/grpo-dual/grpo-dual'),          # 绝对路径
     Path('/workspace/grpo-dual/grpo-dual'),          # workspace绝对路径
 ]

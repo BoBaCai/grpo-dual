@@ -15,7 +15,7 @@ from collections import defaultdict
 # ============================================================================
 # 手动指定grpo-dual目录（修改这里！）
 # ============================================================================
-GRPO_DUAL_DIR = Path('/home/user/grpo-dual/grpo-dual')
+GRPO_DUAL_DIR = Path('/workspace/data/halueval/grpo-dual/grpo-dual')
 
 print("="*80)
 print("🌡️ Temperature vs Entropy 测试")

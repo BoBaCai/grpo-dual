@@ -10,6 +10,7 @@ print("="*80)
 
 # 所有可能的路径
 possible_paths = [
+    Path('/workspace/data/halueval/grpo-dual/grpo-dual'),  # 最可能的路径
     Path('/workspace/data/halueval/grpo-dual'),
     Path('/workspace/grpo-dual/grpo-dual'),
     Path('/workspace/grpo-dual'),
