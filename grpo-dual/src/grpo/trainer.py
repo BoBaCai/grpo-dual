@@ -3013,6 +3013,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # 【C2修复】组内std监控：检测并警告reward完全相同的组（会导致梯度信号为0）
         zero_gradient_groups = 0
+        zero_gradient_group_idx = None  # 记录第一个零梯度组的索引
         B = len(batch)
         K = config.K_ROLLOUTS
         for i in range(B):
@@ -3020,13 +3021,40 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             group_std = np.std(group_rewards)
 
             if group_std < 0.01:  # std过小，组内几乎相同
+                if zero_gradient_group_idx is None:
+                    zero_gradient_group_idx = i  # 记录第一个
                 zero_gradient_groups += 1
-                # 【精简】不打印每组详情，只在最后统计
 
         # 统计并报告
         if zero_gradient_groups > 0:
             ratio = zero_gradient_groups / B
             print(f"\n⚠️ [Step {step+1}] {zero_gradient_groups}/{B} 组({ratio:.1%})的reward std<0.01，梯度信号被抹平")
+
+            # 【调试】Step 1-3打印第一个零梯度组的详细信息
+            if step < 3 and zero_gradient_group_idx is not None:
+                i = zero_gradient_group_idx
+                print(f"\n{'='*70}")
+                print(f"[零梯度组诊断@step{step+1}] 组{i}的4个candidates:")
+                print(f"{'='*70}")
+                for j in range(K):
+                    idx = i * K + j
+                    sample = batch[i]
+                    response = all_resps[idx]
+                    reward = rewards_list[idx]
+
+                    print(f"\nCandidate {j+1}:")
+                    print(f"  Task: {sample.task}")
+                    print(f"  Context condition: {sample.meta.get('context_condition', 'N/A')}")
+                    print(f"  Reward: {reward:.3f}")
+                    print(f"  Response (前150字符): {response[:150].replace(chr(10), ' ')}...")
+
+                    # 【关键】尝试重新评估以查看reasoning quality分数
+                    if sample.task == "fairness" and sample.meta.get("context_condition") == "disambig":
+                        # 手动调用reasoning quality评估
+                        result = judge._evaluate_bbq_fairness(sample, response)
+                        print(f"  BBQ判分: {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
+                print(f"{'='*70}\n")
+
             if ratio > 0.5:
                 print(f"   ⚠️⚠️⚠️ 超过50%的组无梯度！A+B修复可能未生效，检查：")
                 print(f"   1. MIN_NEW_TOKENS是否=5？")
