@@ -56,7 +56,7 @@ print(f"✓ 添加到Python路径: {src_dir}\n")
 
 # 导入模块
 try:
-    from grpo.trainer import HaluEvalAdapter, BBQAdapter, Sample, GRPOConfig
+    from grpo.trainer import HaluEvalAdapter, BBQAdapter, Sample, Config
     print("✓ 成功导入trainer模块\n")
 except ImportError as e:
     print(f"❌ 导入失败: {e}")
@@ -151,7 +151,7 @@ print("\n" + "="*80)
 print("❓ 问题3: KL目标和Beta增长策略分析")
 print("="*80)
 
-config = GRPOConfig()
+config = Config()
 target_kl = 0.035  # 从trainer.py中的BranchedKLController
 beta_init_f = 0.05
 beta_init_h = 0.05
