@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import sys
 
 # 配置
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
+MODEL_NAME = "meta-llama/Meta-Llama-3-8B"  # 【换Base model】去掉-Instruct
 K_ROLLOUTS = 4
 TEMPERATURE = 0.9
 TOP_K = 100

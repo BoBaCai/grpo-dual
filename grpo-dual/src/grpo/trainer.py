@@ -144,7 +144,7 @@ else:
 # =============================================================================
 class Config:
     # 基础模型
-    BASE_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+    BASE_MODEL = "meta-llama/Meta-Llama-3-8B"  # 【换Base model】去掉-Instruct，避免过强的保守先验
     HF_TOKEN = HF_TOKEN
 
     # 路径（增加 run_id 隔离）

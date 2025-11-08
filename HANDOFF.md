@@ -9,12 +9,12 @@
 ## 📋 项目概述
 
 ### 目标
-使用 GRPO (Group Relative Policy Optimization) 对 Llama-3-8B-Instruct 进行多目标强化学习微调：
+使用 GRPO (Group Relative Policy Optimization) 对 Llama-3-8B 进行多目标强化学习微调：
 - **Fairness (BBQ数据集)**: 减少偏见，公平回答问题
 - **Hallucination (HaluEval数据集)**: 减少幻觉，基于证据回答
 
 ### 技术栈
-- Base Model: `meta-llama/Meta-Llama-3-8B-Instruct`
+- Base Model: `meta-llama/Meta-Llama-3-8B` **【已更换】去掉-Instruct，避免过强先验**
 - Method: GRPO + LoRA + Branched KL Control
 - Framework: PyTorch + Transformers + PEFT
 
@@ -872,7 +872,18 @@ plt.savefig('training_trends.png')
   - ✅ 每个prompt独立生成k次，确保random state变化
   - ✅ 直接解决"同组reward相同→std=0→无梯度"
 - ✅ 更新HANDOFF.md（记录串行生成修复）
-- ⏳ 待提交并推送串行生成修复
+- ✅ Commit 9a6f525推送（串行生成修复）
+- ✅ 创建test_serial_generation.py实验脚本
+- ✅ Commit 5c5e710推送（实验脚本）
+- 🧪 **运行实验验证串行生成效果：**
+  - ✅ 串行生成确实产生字面差异（4/4唯一）
+  - ⚠️ 但熵仍极低（0.2-0.4），实质内容高度相似
+  - ⚠️ 简单问题上4个候选都选对 → reward相同 → std=0
+- 💡 **决策：换Base model（去掉-Instruct）**
+  - 理由：Instruct model有过强的保守先验，LoRA (r=8)难以覆盖
+  - BASE_MODEL: "Meta-Llama-3-8B-Instruct" → "Meta-Llama-3-8B"
+  - 期望：Base model更容易被微调塑造，减少确定性输出
+- ⏳ 待提交并推送Base model修改
 
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
