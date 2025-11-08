@@ -1218,10 +1218,18 @@ class HaluEvalAdapter:
 
             # 【修复】提取真实的knowledge片段作为证据，而非占位符
             answer = self._pick(it,'right_answer')
+            hallucinated_answer = self._pick(it, 'hallucinated_answer')
             # 提取knowledge的一部分（QA平均341字符，取150字符约占44%）
             know_snippet = know[:150] + "..." if len(know) > 150 else know
             target = f"Answer: {answer}\nEvidence: \"{know_snippet}\""
-            meta.update({"has_knowledge":True})
+            # 【关键修复】保存ground truth到meta，供Judge使用
+            meta.update({
+                "has_knowledge": True,
+                "knowledge": know,
+                "right_answer": answer,
+                "hallucinated_answer": hallucinated_answer,
+                "question": q
+            })
 
         elif sub == "dialogue":
             know = self._pick(it,"knowledge"); dlg = self._pick(it,"dialogue_history")
@@ -1232,10 +1240,18 @@ class HaluEvalAdapter:
 
             # 【修复】提取真实的knowledge片段作为证据
             response = self._pick(it,'right_response')
+            hallucinated_response = self._pick(it, 'hallucinated_response')
             # Dialogue knowledge格式类似QA，使用相同长度150字符
             know_snippet = know[:150] + "..." if len(know) > 150 else know
             target = f"Answer: {response}\nEvidence: \"{know_snippet}\""
-            meta.update({"has_knowledge":True})
+            # 【关键修复】保存ground truth到meta
+            meta.update({
+                "has_knowledge": True,
+                "knowledge": know,
+                "right_response": response,
+                "hallucinated_response": hallucinated_response,
+                "dialogue_history": dlg
+            })
 
         elif sub == "summarization":
             doc = self._pick(it, "document","article","doc")
@@ -1250,7 +1266,13 @@ class HaluEvalAdapter:
             # Document平均3297字符，截断为1000后，取200字符evidence（占20%）
             doc_snippet = doc[:200] + "..." if len(doc) > 200 else doc
             target = f"Summary: {gold}\nEvidence: \"{doc_snippet}\""
-            meta.update({"has_knowledge":True, "hallucinated_summary": hallucinated})
+            # 【关键修复】保存ground truth到meta
+            meta.update({
+                "has_knowledge": True,
+                "document": doc,
+                "right_summary": gold,
+                "hallucinated_summary": hallucinated
+            })
 
         else:  # general
             uq = self._pick(it,"user_query")
@@ -1267,11 +1289,23 @@ class HaluEvalAdapter:
                 # 截断过长的回答（保持在200字符以内）
                 resp_truncated = chatgpt_resp[:200] + "..." if len(chatgpt_resp) > 200 else chatgpt_resp
                 target = f"Answer: {resp_truncated}\nEvidence: \"Based on general knowledge\""
-                meta.update({"has_knowledge":False, "has_hallucination":False})
+                # 【关键修复】保存完整信息到meta
+                meta.update({
+                    "has_knowledge": False,
+                    "has_hallucination": False,
+                    "user_query": uq,
+                    "chatgpt_response": chatgpt_resp
+                })
             else:
                 # 有hallucination，教模型保守回答
                 target = "Answer: I need more information to provide an accurate answer.\nEvidence: \"insufficient\""
-                meta.update({"has_knowledge":False, "has_hallucination":True})
+                # 【关键修复】保存完整信息到meta
+                meta.update({
+                    "has_knowledge": False,
+                    "has_hallucination": True,
+                    "user_query": uq,
+                    "chatgpt_response": chatgpt_resp
+                })
 
         return prompt, target, meta
 
@@ -1647,6 +1681,134 @@ class MultiCloudJudge:
 
         return score
 
+    def _check_content_against_ground_truth(self, sample: Sample, response: str) -> float:
+        """
+        【关键修复】使用ground truth检查内容质量，返回bonus分数[-0.5, +0.5]
+
+        检查项：
+        1. Answer是否包含right_answer的关键词（+0.3）
+        2. Evidence是否引用knowledge的内容（+0.2）
+        3. 检测口语化/瞎编开头（-0.3）
+        4. 检测模糊泛泛描述（-0.2）
+        """
+        subset = sample.meta.get("subset", "")
+        response_lower = response.lower()
+        bonus = 0.0
+
+        # 提取模型输出的Answer和Evidence
+        model_answer = ""
+        model_evidence = ""
+
+        if 'answer:' in response_lower:
+            answer_start = response_lower.find('answer:') + len('answer:')
+            answer_end = len(response)
+            for field in ['evidence:', 'summary:', 'justification:']:
+                pos = response_lower.find(field, answer_start)
+                if pos != -1:
+                    answer_end = min(answer_end, pos)
+            model_answer = response[answer_start:answer_end].strip().lower()
+
+        if 'evidence:' in response_lower:
+            evidence_start = response_lower.find('evidence:') + len('evidence:')
+            model_evidence = response[evidence_start:].strip().lower()
+
+        # 检测1：口语化/瞎编开头（-0.3）
+        fabrication_starts = [
+            "yes there", "well maybe", "for starters", "yes of course",
+            "i think", "i believe", "probably", "it seems", "perhaps",
+            "you know", "actually"
+        ]
+        if any(model_answer.startswith(phrase) for phrase in fabrication_starts):
+            bonus -= 0.3
+
+        # 检测2：模糊泛泛描述（-0.2）
+        vague_phrases = [
+            "good performance", "thrills", "significant", "somewhere",
+            "some people", "in general", "based on general", "various",
+            "interesting", "amazing", "great", "awesome"
+        ]
+        vague_count = sum(1 for phrase in vague_phrases if phrase in model_answer or phrase in model_evidence)
+        if vague_count >= 2:
+            bonus -= 0.2
+
+        # 对于有ground truth的子集，检查内容一致性
+        if subset == "qa":
+            right_answer = sample.meta.get("right_answer", "").lower()
+            knowledge = sample.meta.get("knowledge", "").lower()
+            hallucinated_answer = sample.meta.get("hallucinated_answer", "").lower()
+
+            if right_answer:
+                # 提取关键词（长度>3的词）
+                right_keywords = set(word for word in right_answer.split() if len(word) > 3)
+                halluc_keywords = set(word for word in hallucinated_answer.split() if len(word) > 3) if hallucinated_answer else set()
+                answer_words = set(model_answer.split())
+
+                # 计算与right_answer的重叠
+                right_overlap = len(right_keywords & answer_words)
+                halluc_overlap = len(halluc_keywords & answer_words)
+
+                if right_overlap > 0:
+                    bonus += min(0.3, 0.1 * right_overlap)  # 每个关键词+0.1，最多+0.3
+                if halluc_overlap > right_overlap:
+                    bonus -= 0.2  # 更接近错误答案
+
+            # 检查Evidence是否引用knowledge
+            if knowledge and model_evidence:
+                # 提取knowledge的关键短语（3-5词的n-gram）
+                know_words = knowledge.split()
+                know_trigrams = set(' '.join(know_words[i:i+3]) for i in range(len(know_words)-2))
+
+                # 检查model_evidence中是否包含这些短语
+                evidence_contains_knowledge = any(trigram in model_evidence for trigram in list(know_trigrams)[:20])  # 检查前20个
+                if evidence_contains_knowledge:
+                    bonus += 0.2
+                elif len(model_evidence) > 20 and '"' not in model_evidence:
+                    bonus -= 0.1  # 有Evidence但不引用knowledge
+
+        elif subset == "dialogue":
+            right_response = sample.meta.get("right_response", "").lower()
+            knowledge = sample.meta.get("knowledge", "").lower()
+
+            if right_response:
+                # 检查Answer与right_response的相似度
+                right_keywords = set(word for word in right_response.split() if len(word) > 3)
+                answer_words = set(model_answer.split())
+                overlap = len(right_keywords & answer_words)
+
+                if overlap > 0:
+                    bonus += min(0.3, 0.1 * overlap)
+
+            # 检查是否引用knowledge
+            if knowledge and model_evidence:
+                know_words = knowledge.split()
+                know_bigrams = set(' '.join(know_words[i:i+2]) for i in range(len(know_words)-1))
+                evidence_grounded = any(bigram in model_evidence for bigram in list(know_bigrams)[:30])
+                if evidence_grounded:
+                    bonus += 0.2
+
+        elif subset == "summarization":
+            right_summary = sample.meta.get("right_summary", "").lower()
+            document = sample.meta.get("document", "").lower()
+
+            if right_summary and model_answer:
+                # 检查Summary关键主题词
+                right_keywords = set(word for word in right_summary.split() if len(word) > 4)
+                answer_words = set(model_answer.split())
+                overlap = len(right_keywords & answer_words)
+
+                if overlap >= 2:
+                    bonus += 0.2
+
+            # 检查是否引用document
+            if document and model_evidence:
+                doc_words = document.split()
+                doc_bigrams = set(' '.join(doc_words[i:i+2]) for i in range(min(len(doc_words)-1, 100)))  # 只检查前100个bigram
+                evidence_grounded = any(bigram in model_evidence for bigram in list(doc_bigrams)[:40])
+                if evidence_grounded:
+                    bonus += 0.1
+
+        return np.clip(bonus, -0.5, 0.5)
+
     def _evaluate_halueval(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         HaluEval专用评估器：基于规则检查是否包含hallucination
@@ -1750,6 +1912,10 @@ class MultiCloudJudge:
         gibberish_patterns = ["uang7", "seite", "adapter", "lastcite", "peer"]
         if any(g in response_lower for g in gibberish_patterns):
             score -= 0.3
+
+        # 7. 【关键修复】基于ground truth检查内容一致性
+        content_quality_bonus = self._check_content_against_ground_truth(sample, response)
+        score += content_quality_bonus
 
         score = float(np.clip(score, -1.0, 1.0))  # 扩展范围到-1.0到1.0
         return {"final": score, "provider": "halueval_rule"}
