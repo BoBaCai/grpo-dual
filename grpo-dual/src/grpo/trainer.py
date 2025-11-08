@@ -1840,18 +1840,50 @@ class MultiCloudJudge:
         # Special handling for General subset (no knowledge to ground)
         if subset == "general":
             has_hallucination = sample.meta.get("has_hallucination", False)
+            base_score = 0.5
+
             if has_hallucination:
                 # 应该拒绝回答
                 if "need more information" in response_lower or "cannot provide" in response_lower or "insufficient" in response_lower:
-                    score = 1.0  # 正确识别
+                    base_score = 1.0  # 正确识别
                 else:
-                    score = -0.5  # 可能产生hallucination
+                    base_score = -0.5  # 可能产生hallucination
             else:
-                # 可以正常回答
-                if len(response.strip()) > 20:
-                    score = 0.8  # 有实质内容
+                # 可以正常回答，根据长度差异化
+                response_len = len(response.strip().split())
+                if response_len < 10:
+                    base_score = 0.2
+                elif response_len < 30:
+                    base_score = 0.6
+                elif response_len < 60:
+                    base_score = 0.8
                 else:
-                    score = 0.2  # 回答过短
+                    base_score = 0.7  # 太长扣分
+
+            # 【关键修复】增加差异化评分因素，避免零梯度
+            bonus = 0.0
+
+            # 1. 检查词汇重复度
+            words = response_lower.split()
+            if len(words) > 5:
+                unique_ratio = len(set(words)) / len(words)
+                if unique_ratio < 0.5:
+                    bonus -= 0.2  # 重复严重
+                elif unique_ratio > 0.8:
+                    bonus += 0.1  # 词汇丰富
+
+            # 2. 检查模糊语言
+            vague_phrases = ["maybe", "perhaps", "possibly", "somewhat", "kind of", "sort of"]
+            vague_count = sum(1 for phrase in vague_phrases if phrase in response_lower)
+            bonus -= 0.1 * min(vague_count, 3)  # 最多扣0.3
+
+            # 3. 检查格式质量
+            if 'answer:' in response_lower and 'evidence:' in response_lower:
+                bonus += 0.1  # 格式完整
+            elif 'answer:' not in response_lower:
+                bonus -= 0.2  # 缺少Answer字段
+
+            score = base_score + bonus
             return {"final": float(np.clip(score, -1.0, 1.0)), "provider": "halueval_rule"}
 
         # For qa/dialogue/summarization (have knowledge to ground)
