@@ -227,15 +227,14 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 2.0        # 【核选项】从1.1提升到2.0，强力对抗logits裁剪的影响
-                                   # 即使logits被裁剪到50，softmax(50/2.0)=softmax(25)仍有一定随机性
+    TEMPERATURE_TRAIN = 1.5        # 【平衡】从2.0降到1.5：Entropy=4.7已足够，2.0导致100%截断
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
 
     PRESENCE_PENALTY = 0.7         # 【修复】从0.3提升到0.7，惩罚模板化输出
     FREQUENCY_PENALTY = 0.3        # 【修复】从0.2提升到0.3
-    NO_REPEAT_NGRAM_SIZE = 3       # 【新增】禁止3-gram重复，防止"insufficient information"循环
+    NO_REPEAT_NGRAM_SIZE = 0       # 【禁用】从3改为0：3-gram约束太严导致100%截断
     
     # 【移除】LENGTH_PENALTY_TRAIN（只对beam search有效，采样模式下无效）
     
