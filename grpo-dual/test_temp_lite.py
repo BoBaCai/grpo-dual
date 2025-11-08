@@ -21,21 +21,30 @@ print("="*80)
 
 # 搜索可能的grpo-dual位置
 possible_paths = [
-    Path.cwd() / 'grpo-dual',
-    Path.cwd(),
-    Path.cwd().parent / 'grpo-dual',
-    Path('/home/user/grpo-dual/grpo-dual'),
+    Path.cwd(),                                       # 当前就是grpo-dual
+    Path.cwd() / 'grpo-dual',                        # 当前目录下的grpo-dual
+    Path.cwd().parent,                               # 上级目录
+    Path.cwd().parent / 'grpo-dual',                 # 上级目录下的grpo-dual
+    Path.cwd().parent.parent / 'grpo-dual',          # 上上级目录下的grpo-dual
+    Path('/home/user/grpo-dual/grpo-dual'),          # 绝对路径
+    Path('/workspace/grpo-dual/grpo-dual'),          # workspace绝对路径
 ]
 
 grpo_dual_dir = None
 for p in possible_paths:
-    if (p / 'src' / 'grpo' / 'trainer.py').exists():
+    if p.exists() and (p / 'src' / 'grpo' / 'trainer.py').exists():
         grpo_dual_dir = p
         print(f"✓ 找到grpo-dual目录: {p}\n")
         break
 
 if grpo_dual_dir is None:
     print("❌ 无法找到grpo-dual目录！")
+    print(f"当前工作目录: {Path.cwd()}")
+    print("\n搜索过的路径:")
+    for p in possible_paths:
+        exists = "✓" if p.exists() else "✗"
+        has_trainer = "✓" if (p / 'src' / 'grpo' / 'trainer.py').exists() else "✗"
+        print(f"  {exists} {p} (trainer.py: {has_trainer})")
     sys.exit(1)
 
 # 添加到Python路径
