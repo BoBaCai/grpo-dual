@@ -1197,12 +1197,57 @@ plt.savefig('training_trends.png')
   - 比启发式规则更可靠（有ground truth支撑）
   - 直接解决零梯度根因（无法区分内容质量）
 
+**2025-11-08 (Session 6 续 - 🔧 基于RLHF调研调整超参):**
+- 📚 **调研RLHF业界KL目标标准**
+  - InstructGPT (1.3B): β=0.01-0.02, target_kl~0.1
+  - Llama 2-Chat (7B/13B): β=0.01, target_kl~0.1
+  - DeepSeekMath: β=0.04 (per-token)
+  - 结论：target_kl通常在0.1左右，0.035过严
+- 🐛 **发现问题2：KL目标过严锁死模型**
+  - 当前target_kl=0.035（0.02-0.05中间值）
+  - 实际KL_f=0.473（13.5倍），KL_h=0.171（4.9倍）
+  - Beta从0.05爆炸增长到0.269→0.7+
+  - 模型被高Beta锁死，无法探索
+- 🐛 **发现问题3：Temperature过高导致截断**
+  - 当前1.5导致50-100%截断率
+  - 浪费tokens，生成过长废话
+- ✅ **实施修复 (Commit b0d18ce):**
+
+  **修复1: Temperature调整**
+  ```python
+  TEMPERATURE_TRAIN: 1.5 → 1.2  # Line 230
+  ```
+  - 预期熵：保持3.5-4.0（足够多样性）
+  - 预期截断率：15-30%（可接受）
+
+  **修复2: KL目标放宽**
+  ```python
+  # Line 579-582: BranchedKLController
+  target_kl_f_min: 0.02 → 0.08
+  target_kl_f_max: 0.05 → 0.12
+  # 中间值：0.035 → 0.10（符合Llama 2标准）
+  ```
+  - KL=0.473时，Beta增长到0.236（可接受，而非0.7+）
+  - KL=0.171时，Beta增长到0.086（健康）
+  - 给模型足够探索空间
+
+- 📊 **综合预期效果（三项修复）：**
+  1. ✅ **Ground truth修复** → Hallucination reward std >0.2
+  2. ✅ **KL目标放宽** → 避免Beta爆炸锁死模型
+  3. ✅ **Temperature降低** → 截断率15-30%
+
+  综合效果：
+  - 零梯度组：50% → <20%
+  - 模型可以正常探索和学习
+  - 训练稳定收敛
+
 **待验证（下次训练）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
 - [ ] 模型是否开始真正学习（不再锁死）
 - [ ] Hallucination任务的reward std是否>0.2
 - [ ] 零梯度组比例是否<20%
-- [ ] 是否需要进一步调整超参（ENTROPY_COEF, beta, Temperature, KL目标）
+- [ ] Beta是否保持在合理范围（<0.3）
+- [ ] 截断率是否降到15-30%
 - [ ] 最终训练效果和收敛情况
 
 ---
