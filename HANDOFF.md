@@ -1001,6 +1001,31 @@ plt.savefig('training_trends.png')
   - 非零梯度组应>50%（现在0%）
   - **如果这还不行，问题在SFT阶段模板太强/LoRA太弱/需全量微调**
 
+**2025-11-08 (Session 4 - 核选项验证 & 平衡调整):**
+- 🎉 **核选项成功！熵完全恢复：**
+  - ✅ Entropy: mean=3.7-5.1, min=2.2-5.0 (修复前: mean=0.033, min=0.018)
+  - ✅ Logits clipping禁用 + Temperature=2.0成功对抗Instruct模型高置信度
+  - ✅ Reward variance开始出现：Step3 F:std=0.280, Step4-5 F:std=0.700
+- ⚠️ **新问题：100%截断率**
+  - Step3-6几乎所有样本达到max_new_tokens=128硬约束
+  - 原因：temp=2.0太高 + no_repeat_ngram_size=3太严 → 强制生成长回答
+- ✅ **平衡调整（Commit d3648c8）：**
+  - Temperature: 2.0 → 1.5（Entropy=4.7已足够，降温控制长度）
+  - no_repeat_ngram_size: 3 → 0（禁用3-gram约束，太严格）
+  - 保留presence_penalty=0.7和frequency_penalty=0.3
+- ⚠️ **剩余问题：50%组仍零梯度**
+  - Step1: 100%组无梯度 → Step2,4,6: 50%组无梯度（有改善但不够）
+  - 从provider统计看：`template_detector=2/8`仍在触发
+  - 推测：模型用不同表达方式说相同逃避内容（高熵但同义）
+- 🔍 **添加调试日志（Commit 3d88b09）：**
+  - 在Step 1-3打印触发template_detector的样本详情
+  - 显示匹配的短语、prompt、response前段
+  - 用于诊断：逃避短语变体？reasoning quality评分有效性？
+- 📊 **用户精简日志（Commit f4fef4e）：**
+  - 日志从~200行/step压缩到~10行/step
+  - 保留核心警告：熵塌陷、零梯度、严重失衡
+  - 删除：EOS Suppressor详情、串行生成日志、每样本Fairness诊断
+
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
 - [ ] 模型是否开始真正学习（不再锁死）
