@@ -1750,6 +1750,10 @@ class MultiCloudJudge:
 
                 if right_overlap > 0:
                     bonus += min(0.3, 0.1 * right_overlap)  # 每个关键词+0.1，最多+0.3
+                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
+                    # 【修复】有实质内容但完全不匹配ground truth → 瞎编
+                    bonus -= 0.4
+
                 if halluc_overlap > right_overlap:
                     bonus -= 0.2  # 更接近错误答案
 
@@ -1778,6 +1782,9 @@ class MultiCloudJudge:
 
                 if overlap > 0:
                     bonus += min(0.3, 0.1 * overlap)
+                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
+                    # 【修复】有实质内容但完全不匹配ground truth → 瞎编
+                    bonus -= 0.4
 
             # 检查是否引用knowledge
             if knowledge and model_evidence:
@@ -1786,6 +1793,9 @@ class MultiCloudJudge:
                 evidence_grounded = any(bigram in model_evidence for bigram in list(know_bigrams)[:30])
                 if evidence_grounded:
                     bonus += 0.2
+                elif len(model_evidence.split()) > 10:
+                    # 【修复】有Evidence但不引用knowledge → 可能瞎编
+                    bonus -= 0.3
 
         elif subset == "summarization":
             right_summary = sample.meta.get("right_summary", "").lower()
@@ -1799,6 +1809,9 @@ class MultiCloudJudge:
 
                 if overlap >= 2:
                     bonus += 0.2
+                elif len(model_answer.split()) > 10 and len(right_keywords) > 0:
+                    # 【修复】有实质内容但关键主题词匹配<2 → 可能偏离主题
+                    bonus -= 0.3
 
             # 检查是否引用document
             if document and model_evidence:
