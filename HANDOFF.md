@@ -1102,6 +1102,55 @@ plt.savefig('training_trends.png')
   - 零梯度组比例应大幅下降（从50-100% → <20%）
   - Reward std应显著提升
 
+**2025-11-08 (Session 5 续2 - 验证修复并发现HaluEval问题):**
+- ✅ **Ambig样本修复验证成功！**
+  - Step 2: `F: std=0.680` (之前是0.000)
+  - Step 5: `F: std=0.770` (有明显分数差异)
+  - Template detector仍触发ambig样本，但现在走bbq_rule得到差异化评分
+
+- ❌ **发现新问题：Hallucination任务零梯度**
+  - Step 1组1：4个candidates全是`Reward: 1.000` (Hallucination任务)
+  - Step 3组1：4个candidates全是`Reward: 1.000` (Hallucination任务)
+  - 回答内容：完全是胡说八道的hallucination
+  ```
+  "Answer: Good Will Hunting which made film appearance..."
+  "Answer: Besides books isn '68 The Sweet Taste..."
+  "Answer: Well, Leonard B Burnett won an Academy Award..."
+  ```
+
+- 🐛 **Bug #3：halueval_rule只检查格式，不检查内容质量**
+  ```python
+  # 旧评分逻辑：
+  score = 0.5 + 0.3(有Evidence) + 0.2(长度>30) + 0.1(有Answer)
+  # = 1.1 → clip到1.0
+  ```
+  - **问题：** 只要有`Answer:`、`Evidence:`和引号，无论内容是否正确，都拿1.0
+  - **后果：** 4个格式正确的胡说 → 都是1.0 → std=0 → 零梯度
+
+- ✅ **修复方案（Commit e9919dd）：**
+
+  **添加Answer和Evidence质量差异化评分：**
+
+  1. Evidence质量（不只是有无）：
+     - 长度<5词：+0.1（太短）
+     - 长度>50词：+0.2（太冗长）
+     - 长度5-50词：+0.3（合理）
+
+  2. Answer质量（不只是有无）：
+     - 长度<3词：-0.2（太短）
+     - 长度>30词：-0.1（太冗长）
+     - 长度3-30词：+0.2（合理）
+     - 重复度>50%：-0.2（重复严重）
+
+  3. 整体长度：
+     - 总长<15词：-0.2
+     - 总长>80词：-0.1
+
+- 🎯 **预期效果：**
+  - 不同candidates即使都有格式，也会因长度、重复度等差异得到不同分数
+  - Hallucination任务的reward std应>0.2
+  - 零梯度组比例应<20%
+
 **待验证（下次训练）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
 - [ ] 模型是否开始真正学习（不再锁死）
