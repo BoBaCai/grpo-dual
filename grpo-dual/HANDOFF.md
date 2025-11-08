@@ -2627,4 +2627,660 @@ if step % 10 == 0:
 
 ---
 
+## 🚀 Session 9.1: 实施方案最终确定（2025-11-08）
+
+### 背景：DAPO vs BAPO 技术选型
+
+在零梯度组理论分析后，我们调研了两个最新的 GRPO/PPO 改进算法：
+
+#### DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization)
+
+**来源**：ByteDance Seed + Tsinghua AIR
+**GitHub**: https://github.com/BytedTsinghua-SIA/DAPO
+
+**核心特性**：
+- ✅ **Dynamic Sampling**：动态采样直到组内有差异（**直接解决零梯度组问题**）
+- ✅ Decoupled Clipping：解耦的裁剪机制
+- ✅ Token-level Policy Gradient Loss（完整版）
+- ✅ 性能：50% AIME 2024 (Qwen2.5-32B，仅用 50% 训练步数超越 DeepSeek-R1-Zero）
+
+**关键技术**：
+1. **动态采样策略**：如果某组的 K 个样本 reward 全相同，继续采样直到出现差异
+2. **长度稳定控制**：避免生成过长或过短
+3. **Reward 稳定性**：平滑 reward 信号
+4. **熵管理**：维持探索-利用平衡
+
+**适用性分析**：
+- ✅ **Dynamic Sampling 非常适合我们**：直接解决零梯度组问题
+- ✅ 可以模块化集成，不需要改变 GRPO 核心
+- ✅ 和我们在附录中讨论的策略完全一致
+
+#### BAPO (Balanced Policy Optimization with Adaptive Clipping)
+
+**GitHub**: https://github.com/WooooDyy/BAPO
+
+**核心特性**：
+- ⚠️ **Adaptive Clipping**：动态调整 PPO clipping bounds
+- ⚠️ 解决不平衡优化 + 熵崩溃
+- ✅ 性能：87.1% AIME 2024 (32B), 70.8% (7B)
+- ⚠️ 基于 **PPO** 的改进
+
+**关键技术**：
+1. **自适应裁剪边界**：动态调整 (c_low, c_high) 以平衡正负贡献
+2. **可移动范围**：下界 [0.6, 0.9]，上界 [1.2, 3.0]
+3. **迭代调整**：直到正 token 贡献达到目标比例 (ρ₀ = 0.5)
+
+**为什么不适合我们**：
+- ❌ BAPO 是基于 **PPO clipping** 机制的改进
+- ❌ 我们用的是 **GRPO**（用 advantage normalization，不用 clipping）
+- ❌ 两者的 objective 函数不同：
+  - PPO: `L = min(r_θ * A, clip(r_θ, 1-ε, 1+ε) * A)`
+  - GRPO: `L = -log π_θ(y|x) * A`, where `A = (r - μ) / σ`
+- ❌ BAPO 的核心改进（adaptive clipping）在 GRPO 中不适用
+
+---
+
+### 最终决策：保留 GRPO + 分阶段增量改进
+
+#### 决策理由
+
+1. **GRPO 本身没有问题**：
+   - 30-40% 零梯度组是数学正常结果（K=4, p=0.7-0.8）
+   - 问题在于 reward 粒度和采样策略，不是算法本身
+
+2. **DAPO 的 Dynamic Sampling 可以直接借鉴**：
+   - 不需要改变 GRPO 核心算法
+   - 可以作为模块化功能添加
+   - 和我们的分析完全一致
+
+3. **BAPO 不适合我们的场景**：
+   - 基于 PPO，我们用 GRPO
+   - 核心机制（clipping）在 GRPO 中不适用
+
+4. **增量改进更稳健**：
+   - 每次只改一个模块，易于 debug
+   - 可以清晰看到每个改进的效果
+   - 避免"一次性改太多，不知道哪个有用"
+
+#### GRPO 家族内自然演进路线
+
+这是一个**逐步优化的路线图**，不跳出 group-based RL 范式：
+
+```
+📍 当前状态: Session 1-9 已完成
+├─ Session 1-7: GRPO 基础 + 关键工程问题修复
+│  ✅ 串行生成
+│  ✅ Advantage 计算修复
+│  ✅ 模板检测器
+│  ✅ 熵正则化
+│  ✅ KL 控制
+│
+├─ Session 8: 细粒度 Reward
+│  ✅ Reasoning Quality 评分（0.3-1.0）
+│  ✅ Evasive Phrases 检测（27 个变体）
+│  ✅ 期望效果：零梯度组 50-60% → 30-40%
+│
+├─ Session 9: Temperature Scheduler
+│  ✅ Stage-wise 降温（3 阶段）
+│  ✅ Per-task 差异化温度
+│  ✅ 熵和截断率自适应
+│  ✅ 期望效果：截断率 25-75% → <10%, 熵稳定 3-4
+│
+└─ Session 9.1: 零梯度组理论分析 + 实施方案
+   ✅ 理论分析和期望值计算
+   ✅ DAPO/BAPO 技术选型
+   ✅ 最终实施路线
+
+📍 下一步: Session 10 规划
+├─ Phase 1: 监控和验证（本周）
+│  ├─ Priority 1.1: 添加期望零梯度率监控
+│  ├─ Priority 1.2: 验证实际值 vs 理论值
+│  └─ Priority 1.3: 增加 disambiguous 使用比例
+│
+├─ Phase 2: Dynamic Sampling（下周）
+│  ├─ Priority 2.1: 实现 DAPO 风格动态采样
+│  ├─ Priority 2.2: 集成到 generate_candidates_batch
+│  └─ Priority 2.3: 监控生成时间和零梯度组变化
+│
+├─ Phase 3: Baseline 优化（可选，2-3 周后）
+│  ├─ Option A: Shrinkage Baseline（如果零梯度组仍 >40%）
+│  └─ Option B: 调大 K（4→6 或 8，如果算力允许）
+│
+└─ Phase 4: 长期演进（可选，1-2 月后）
+   ├─ 2-GRPO / DPO-style pairwise（如果需要更强对比学习）
+   └─ GSPO（如果需要 sequence-level 优化）
+```
+
+**关键原则**：
+- 每个 Phase 都是**增量改进**，不推倒重来
+- 每次只改一个模块，验证效果后再进行下一步
+- 优先做"投入产出比"最高的改进
+
+---
+
+### 具体实施计划
+
+#### Phase 1: 监控和验证（立即开始，本周完成）
+
+**目标**：建立基线，了解当前状态
+
+**Task 1.1: 添加期望零梯度率监控**
+
+```python
+def expected_zero_gradient_rate(p: float, K: int) -> float:
+    """
+    计算理论零梯度率
+
+    Args:
+        p: 成功率（从训练日志统计）
+        K: 组大小
+
+    Returns:
+        expected_rate: 理论零梯度率 (p^K + (1-p)^K)
+    """
+    return p**K + (1-p)**K
+
+
+def monitor_zero_gradient_groups(
+    rewards: np.ndarray,
+    tasks: List[str],
+    K: int = 4,
+    step: int = None
+) -> Dict[str, float]:
+    """
+    监控零梯度组（集成到训练循环）
+
+    Args:
+        rewards: 所有样本的 reward (shape: [B*K])
+        tasks: 每组的任务类型 (shape: [B])
+        K: 组大小
+        step: 当前训练步数
+
+    Returns:
+        stats: 统计信息字典
+    """
+    B = len(tasks)
+
+    # 按任务类型分组统计
+    fairness_stds = []
+    halu_stds = []
+    fairness_rewards = []
+    halu_rewards = []
+
+    for i in range(B):
+        group_rewards = rewards[i*K : (i+1)*K]
+        group_std = np.std(group_rewards)
+
+        if tasks[i] == "fairness":
+            fairness_stds.append(group_std)
+            fairness_rewards.extend(group_rewards)
+        else:
+            halu_stds.append(group_std)
+            halu_rewards.extend(group_rewards)
+
+    # 统计零梯度组
+    zero_grad_f = sum(1 for s in fairness_stds if s < 0.01)
+    zero_grad_h = sum(1 for s in halu_stds if s < 0.01)
+
+    # 计算成功率和期望零梯度率
+    fairness_success_rate = (np.array(fairness_rewards) > 0.5).mean() if fairness_rewards else 0.5
+    halu_success_rate = (np.array(halu_rewards) > 0.5).mean() if halu_rewards else 0.5
+
+    expected_zero_grad_f = expected_zero_gradient_rate(fairness_success_rate, K)
+    expected_zero_grad_h = expected_zero_gradient_rate(halu_success_rate, K)
+
+    # 打印统计信息（每 10 步）
+    if step is not None and step % 10 == 0:
+        print(f"\n📊 零梯度组监控 (Step {step}):")
+        print(f"  Fairness:")
+        print(f"    实际: {zero_grad_f}/{len(fairness_stds)} ({zero_grad_f/len(fairness_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_f:.1%} (成功率 p={fairness_success_rate:.2f})")
+        print(f"    状态: ", end="")
+
+        actual_ratio_f = zero_grad_f / len(fairness_stds) if fairness_stds else 0
+        if actual_ratio_f <= expected_zero_grad_f * 1.2:
+            print("✅ 正常")
+        elif actual_ratio_f <= expected_zero_grad_f * 1.5:
+            print("⚠️ 略高，关注")
+        else:
+            print("🚨 异常高，检查 reward 逻辑")
+
+        print(f"  Hallucination:")
+        print(f"    实际: {zero_grad_h}/{len(halu_stds)} ({zero_grad_h/len(halu_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_h:.1%} (成功率 p={halu_success_rate:.2f})")
+
+    return {
+        'zero_grad_f_ratio': zero_grad_f / len(fairness_stds) if fairness_stds else 0,
+        'zero_grad_h_ratio': zero_grad_h / len(halu_stds) if halu_stds else 0,
+        'expected_zero_grad_f': expected_zero_grad_f,
+        'expected_zero_grad_h': expected_zero_grad_h,
+        'fairness_success_rate': fairness_success_rate,
+        'halu_success_rate': halu_success_rate,
+    }
+```
+
+**集成位置**：在 `grpo_train` 的每个 step 计算 advantages 之后调用
+
+**Task 1.2: 验证实际值 vs 理论值**
+
+运行训练，观察前 50 步的零梯度组统计：
+- 如果实际 ≈ 期望（±20%）：✅ 正常，继续当前策略
+- 如果实际 > 期望 × 1.5：⚠️ 可能有 reward bug，检查 Judge 逻辑
+
+**Task 1.3: 增加 disambiguous 使用比例**
+
+```python
+# 在数据加载时调整采样比例
+# trainer.py BBQAdapter.load_samples() 中
+
+# 原来：ambig 和 disambig 1:1
+# 现在：ambig 和 disambig 1:2（增加 disambig）
+
+def load_samples(self, n_total: int) -> List[Sample]:
+    # ...
+
+    # 按 context_condition 分组
+    ambig_samples = [s for s in all_samples if s.meta['context_condition'] == 'ambig']
+    disambig_samples = [s for s in all_samples if s.meta['context_condition'] == 'disambig']
+
+    # 【修改】调整采样比例
+    n_ambig = int(n_total * 0.33)      # 33% ambig
+    n_disambig = int(n_total * 0.67)   # 67% disambig（原来 50%）
+
+    # 随机采样
+    selected_ambig = random.sample(ambig_samples, min(n_ambig, len(ambig_samples)))
+    selected_disambig = random.sample(disambig_samples, min(n_disambig, len(disambig_samples)))
+
+    final_samples = selected_ambig + selected_disambig
+    random.shuffle(final_samples)
+
+    print(f"📊 BBQ 采样比例: Ambig {len(selected_ambig)}, Disambig {len(selected_disambig)}")
+
+    return final_samples
+```
+
+**期望效果**：
+- 零梯度组从二元任务占比高 → 更多有梯度的 disambig 样本
+- 预期零梯度组比例下降 5-10 个百分点
+
+---
+
+#### Phase 2: Dynamic Sampling（下周开始）
+
+**目标**：实现 DAPO 风格的动态采样，减少零梯度组
+
+**Task 2.1: 实现动态采样函数**
+
+```python
+def generate_candidates_with_dynamic_sampling(
+    model,
+    tokenizer,
+    device,
+    prompt: str,
+    k: int = 4,
+    max_attempts: int = 8,
+    diversity_threshold: int = 2,
+    temperature: float = 1.0,
+    **generation_kwargs
+) -> Tuple[List[str], List[int], List[bool]]:
+    """
+    DAPO 风格的动态采样：继续采样直到组内有足够多样性
+
+    Args:
+        prompt: 输入提示（已应用 chat template）
+        k: 目标组大小
+        max_attempts: 最大尝试次数
+        diversity_threshold: 至少需要多少种不同的 reward
+        temperature: 采样温度
+        **generation_kwargs: 其他生成参数
+
+    Returns:
+        texts: 生成的文本列表 (len <= k)
+        lengths: 每个文本的 token 长度
+        truncated: 每个文本是否被截断
+
+    原理：
+        1. 逐个生成候选，立即评估 reward
+        2. 如果已有 k 个样本且 reward 种类 >= diversity_threshold，停止
+        3. 否则继续采样直到 max_attempts
+        4. 如果达到上限仍无多样性，返回当前样本（会被标记为零梯度组）
+    """
+    samples = []
+    lengths = []
+    truncated = []
+    rewards_quick = []  # 快速 reward 估计（用于多样性检查）
+
+    # Tokenize prompt
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=896).to(device)
+    prompt_len = inputs['input_ids'].shape[1]
+
+    for attempt in range(max_attempts):
+        # 生成一个候选
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=generation_kwargs.get('max_new_tokens', 128),
+                min_new_tokens=generation_kwargs.get('min_new_tokens', 5),
+                temperature=temperature,
+                top_k=generation_kwargs.get('top_k', 200),
+                top_p=generation_kwargs.get('top_p', 0.98),
+                repetition_penalty=generation_kwargs.get('repetition_penalty', 1.3),
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=get_eos_token_ids(tokenizer),
+            )
+
+        # Decode
+        generated_ids = output[0][prompt_len:]
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        length = len(generated_ids)
+        is_truncated = (length >= generation_kwargs.get('max_new_tokens', 128))
+
+        samples.append(text)
+        lengths.append(length)
+        truncated.append(is_truncated)
+
+        # 【关键】快速 reward 估计（用于多样性检查）
+        # 这里可以用简化的 reward 函数，不需要完整的 Judge
+        # 例如：只检查答案是否正确（不评估 reasoning quality）
+        quick_reward = quick_reward_estimate(text)  # 返回 0/1 或 0.0-1.0
+        rewards_quick.append(quick_reward)
+
+        # 检查是否满足多样性条件
+        if len(samples) >= k:
+            unique_rewards = len(set(rewards_quick))
+            if unique_rewards >= diversity_threshold:
+                # 有足够多样性，返回前 k 个
+                print(f"  ✅ Dynamic sampling: {attempt+1} attempts, "
+                      f"{unique_rewards} unique rewards")
+                return samples[:k], lengths[:k], truncated[:k]
+
+    # 达到上限，返回当前样本
+    unique_rewards = len(set(rewards_quick[:k]))
+    print(f"  ⚠️ Dynamic sampling: max attempts reached, "
+          f"{unique_rewards} unique rewards (threshold={diversity_threshold})")
+    return samples[:k], lengths[:k], truncated[:k]
+
+
+def quick_reward_estimate(text: str) -> float:
+    """
+    快速 reward 估计（用于多样性检查）
+
+    不需要完整的 Reasoning Quality 评分，只检查关键特征：
+    1. 是否有答案（Answer: A/B/C）
+    2. 是否是逃避语言
+    3. 是否过短
+
+    返回粗略的 reward 估计（足够用于多样性检查）
+    """
+    text_lower = text.lower()
+
+    # 检查是否有答案
+    has_answer = any(f"answer: {opt}" in text_lower for opt in ['a', 'b', 'c'])
+
+    # 检查逃避语言（简化版，只检查最常见的）
+    evasive_keywords = ["cannot determine", "does not provide", "insufficient information"]
+    is_evasive = any(kw in text_lower for kw in evasive_keywords)
+
+    # 检查长度
+    is_too_short = len(text.split()) < 10
+
+    # 快速评分
+    if is_evasive or is_too_short:
+        return 0.3
+    elif has_answer:
+        return 1.0  # 假设有答案就可能对（实际 Judge 会进一步细分）
+    else:
+        return 0.5  # 中等
+```
+
+**Task 2.2: 集成到 generate_candidates_batch**
+
+```python
+def generate_candidates_batch(
+    model, tokenizer, device,
+    prompts: List[str],
+    k: int,
+    max_new_tokens: int = None,
+    step: int = None,
+    temperature: float = None,
+    use_dynamic_sampling: bool = False  # 【新增】是否使用动态采样
+) -> Tuple[...]:
+    """
+    为每个 prompt 生成 K 个候选
+
+    Args:
+        use_dynamic_sampling: 是否使用 DAPO 风格的动态采样
+    """
+    if temperature is None:
+        temperature = config.TEMPERATURE_TRAIN
+    if max_new_tokens is None:
+        max_new_tokens = config.MAX_NEW_TOKENS_TRAIN
+
+    grouped_texts = []
+    grouped_lengths = []
+    grouped_truncated = []
+    # ...
+
+    for prompt_idx, formatted_prompt in enumerate(formatted_prompts):
+        if use_dynamic_sampling:
+            # 使用动态采样
+            texts, lengths, truncated = generate_candidates_with_dynamic_sampling(
+                model, tokenizer, device,
+                prompt=formatted_prompt,
+                k=k,
+                max_attempts=8,
+                diversity_threshold=2,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
+                # ... 其他参数
+            )
+        else:
+            # 原来的串行生成（已修复）
+            texts, lengths, truncated = [], [], []
+            for candidate_idx in range(k):
+                # ... 原有逻辑
+                pass
+
+        grouped_texts.append(texts)
+        grouped_lengths.append(lengths)
+        grouped_truncated.append(truncated)
+
+    return ...
+```
+
+**Task 2.3: 监控和调优**
+
+```python
+# 在训练循环中添加监控
+dynamic_sampling_stats = {
+    'total_groups': 0,
+    'diversity_achieved': 0,
+    'max_attempts_reached': 0,
+    'avg_attempts': 0.0
+}
+
+# 每 50 步打印统计
+if step % 50 == 0:
+    print(f"\n🎯 Dynamic Sampling 统计:")
+    print(f"  多样性达成: {dynamic_sampling_stats['diversity_achieved']}/{dynamic_sampling_stats['total_groups']} "
+          f"({dynamic_sampling_stats['diversity_achieved']/dynamic_sampling_stats['total_groups']:.1%})")
+    print(f"  平均尝试次数: {dynamic_sampling_stats['avg_attempts']:.1f}")
+```
+
+**期望效果**：
+- 零梯度组从 40% → 20-30%
+- 生成时间增加 1.2-1.5x（可接受）
+- 有效样本率提升 10-20 个百分点
+
+---
+
+#### Phase 3: Baseline 优化（可选，仅在需要时）
+
+**触发条件**：
+- Dynamic Sampling 实施后零梯度组仍 >40%
+- 且验证理论值后确认不是 reward bug
+
+**Option A: Shrinkage Baseline**
+
+```python
+def compute_advantages_with_shrinkage(
+    rewards: torch.Tensor,
+    tasks: List[str],
+    K: int,
+    alpha: float = 0.1,  # shrinkage 系数
+    global_baseline: Dict[str, float] = None
+) -> torch.Tensor:
+    """
+    使用 Shrinkage Baseline 计算 advantage
+
+    Args:
+        alpha: shrinkage 系数，0=纯局部，1=纯全局
+        global_baseline: 全局 EMA baseline (per-task)
+
+    原理：
+        局部 baseline 往全局 baseline "拉一点"
+        shrunk_baseline = (1-α) * local_mean + α * global_mean
+
+        好处：即使组内全相同（local_mean = reward），
+             只要 global_mean ≠ reward，仍有非零 advantage
+    """
+    B = len(tasks)
+    advantages = torch.zeros_like(rewards)
+
+    for i in range(B):
+        task = tasks[i]
+        group_rewards = rewards[i*K : (i+1)*K]
+
+        # 局部 mean
+        local_mean = group_rewards.mean()
+
+        # 全局 baseline（如果有）
+        if global_baseline and task in global_baseline:
+            global_mean = global_baseline[task]
+            # Shrinkage: 混合局部和全局
+            shrunk_baseline = (1 - alpha) * local_mean + alpha * global_mean
+        else:
+            shrunk_baseline = local_mean
+
+        # 计算 advantage
+        group_std = group_rewards.std()
+        if group_std < 0.01:
+            # 零梯度组：直接用 reward - baseline
+            # 关键：shrunk_baseline 可能 ≠ local_mean，所以有梯度
+            group_adv = group_rewards - shrunk_baseline
+        else:
+            # 正常组：标准化
+            group_adv = (group_rewards - shrunk_baseline) / group_std
+
+        advantages[i*K : (i+1)*K] = group_adv
+
+    return advantages
+
+
+# 需要在训练循环中维护全局 baseline
+global_baseline = {'fairness': 0.0, 'hallucination': 0.0}
+
+# 每步更新
+for task in ['fairness', 'hallucination']:
+    task_mask = [t == task for t in batch_tasks]
+    task_rewards = rewards[task_mask]
+    if len(task_rewards) > 0:
+        global_baseline[task] = 0.99 * global_baseline[task] + 0.01 * task_rewards.mean()
+```
+
+**Option B: 调大 K**
+
+如果算力允许：
+- K=4 → K=6：零梯度率 41% → 26%
+- K=4 → K=8：零梯度率 41% → 17%
+
+**权衡**：
+- 优点：数学上显著降低零梯度率
+- 缺点：生成时间增加 1.5-2x，GPU 显存增加
+
+---
+
+### 实施时间表
+
+| Phase | 任务 | 预计时间 | 优先级 |
+|-------|------|---------|--------|
+| **Phase 1.1** | 添加期望零梯度率监控 | 2 小时 | 🔥 立即 |
+| **Phase 1.2** | 验证实际值 vs 理论值 | 运行训练 50 步 | 🔥 立即 |
+| **Phase 1.3** | 增加 disambiguous 比例 | 1 小时 | 🔥 立即 |
+| **Phase 2.1** | 实现动态采样函数 | 4 小时 | ⭐ 本周 |
+| **Phase 2.2** | 集成到训练循环 | 2 小时 | ⭐ 本周 |
+| **Phase 2.3** | 监控和调优 | 运行训练 100 步 | ⭐ 下周 |
+| **Phase 3.A** | Shrinkage Baseline | 3 小时 | ⚠️ 可选 |
+| **Phase 3.B** | 调大 K | 1 小时 | ⚠️ 可选 |
+
+**总预计时间**：
+- Phase 1（立即）：3 小时 + 运行时间
+- Phase 2（本周）：6 小时 + 运行时间
+- Phase 3（可选）：仅在需要时
+
+---
+
+### 决策树：何时使用哪个改进
+
+```
+开始训练，观察零梯度组
+│
+├─ 实际零梯度组 ≤ 40% 且 ≈ 理论值
+│  └─> ✅ 正常，无需特殊处理
+│     └─> 继续 Session 9 Temperature Scheduler
+│
+├─ 实际零梯度组 40-60% 且 > 理论值 × 1.2
+│  ├─> 检查 reward 是否有 bug（Judge 逻辑）
+│  └─> 实施 Phase 1.3（增加 disambig 比例）
+│     └─> 如果仍 >50%，进入 Phase 2
+│
+├─ 实际零梯度组 >60%
+│  └─> 🚨 立即行动
+│     ├─> Phase 1.3: 增加 disambig 比例
+│     ├─> Phase 2: Dynamic Sampling
+│     └─> 如果仍无改善，Phase 3: Shrinkage Baseline
+│
+└─ 实际零梯度组 ≤ 30%
+   └─> ✅✅✅ 非常好！
+      └─> 继续优化其他指标（reward、熵、截断率）
+```
+
+---
+
+### 参考文献（新增）
+
+6. **DAPO** (ByteDance Seed + Tsinghua AIR)
+   - GitHub: https://github.com/BytedTsinghua-SIA/DAPO
+   - 50% AIME 2024 (Qwen2.5-32B)
+   - Dynamic Sampling + Decoupled Clipping
+
+7. **BAPO** (Balanced Policy Optimization)
+   - GitHub: https://github.com/WooooDyy/BAPO
+   - 87.1% AIME 2024 (32B), 70.8% (7B)
+   - Adaptive Clipping (PPO-based, 不适合 GRPO)
+
+---
+
+### 关键要点总结
+
+1. ✅ **保留 GRPO**，不换算法
+2. ✅ **借鉴 DAPO 的 Dynamic Sampling**
+3. ❌ **不用 BAPO**（PPO-based，不适合 GRPO）
+4. ✅ **增量改进**：监控 → Dynamic Sampling → (可选) Shrinkage Baseline
+5. ✅ **优先级明确**：Phase 1（立即）→ Phase 2（本周）→ Phase 3（可选）
+6. ✅ **每次只改一个模块**，易于 debug 和归因
+
+**下一步行动**：
+1. 立即实施 Phase 1.1：添加零梯度率监控代码
+2. 运行短训练验证理论值
+3. 根据结果决定是否进入 Phase 2
+
+---
+
+**Session 9.1 结束。已明确实施路线：保留 GRPO + DAPO 风格 Dynamic Sampling + 分阶段改进。**
+
+---
+
 **文档结束。如有疑问，请参考 trainer.py 中的详细注释、本文档的相关章节，或查阅 `TEMPERATURE_INTEGRATION_GUIDE.md` 和 `TEMPERATURE_SCHEDULER_SUMMARY.md`。**
