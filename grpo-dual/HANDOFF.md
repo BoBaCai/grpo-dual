@@ -1453,6 +1453,144 @@ plt.savefig('training_trends.png')
   | 18b1371 | Disambig采样权重75% | 1051-1093 |
   | f223d14 | Template_detector修复 + Temp→1.15 | 230, 2034-2041 |
 
+**2025-11-08 (Session 8 - 🎯 细粒度Reasoning Quality评分):**
+
+- 📊 **训练结果分析（Temperature=1.15）：**
+
+  **好消息 ✅：**
+  - Ground Truth修复生效 - Hallucination任务std=0.150-0.763（非零）
+  - Template Detector修复生效 - BBQ样本走bbq_rule评分
+  - 零梯度组比例降至20%（Step 1, Step 3）
+
+  **仍存在的问题 ⚠️：**
+  - 零梯度根因：4个candidates都选对，但reasoning质量评估给出相同分数
+    * Step 1组0: 所有4个candidates都得0.800分（disambig样本，都选C）
+    * Step 3组0: 所有4个candidates都得0.800分（disambig样本，都选B）
+  - 熵严重不稳定：0.38-3.0剧烈波动
+  - 截断率持续过高：25-75%
+
+- 🎯 **问题诊断：Reasoning质量差异不足 (Commit fb38752)**
+
+  **核心发现：**
+  - Temperature=1.15产生的是"文本多样性"，不是"reasoning质量多样性"
+  - 4个candidates：
+    * 文本字面不同（词序、表达方式）
+    * 但reasoning策略相同（都引用context + 选正确答案）
+    * `_assess_reasoning_quality()`发现相同问题 → 都扣-0.2 → 都得0.800
+  - **结论：** 需要更细粒度的reasoning quality评分
+
+  **实施Option A修复：细粒度Reasoning Quality评分 (Line 1606-1759)**
+
+  **新增评估维度：**
+
+  **1. Context引用的深度（细粒度）：**
+  ```python
+  # 根据实体引用数量细化评分
+  if len(cited_entities) == 0:
+      score -= 0.4  # 完全没有引用
+  elif len(cited_entities) == 1:
+      score -= 0.15  # 只引用1个实体
+  elif len(cited_entities) == 2:
+      score -= 0.05  # 引用2个实体
+  # len >= 3: 不扣分（充分引用）
+
+  # 检查因果逻辑词
+  causal_words = ["because", "since", "as", "therefore", "thus", "so", ...]
+  if has_causal:
+      score += 0.1  # 有因果逻辑 → 加分
+  ```
+
+  **2. 推理链的完整性：**
+  ```python
+  # 检查完整推理结构
+  complete_reasoning_patterns = [
+      (r'because\s+\w+.*?,?\s+(so|therefore|thus)', 0.15),  # "because X, so Y"
+      (r'since\s+\w+.*?,?\s+(so|therefore|thus)', 0.15),    # "since X, so Y"
+      (r'\w+\s+leads to\s+\w+', 0.1),                        # "X leads to Y"
+      ...
+  ]
+
+  # 检查是否只是断言（太短且无推理）
+  if justification_len < 10 and not has_causal:
+      score -= 0.2  # 太短且没有推理
+  ```
+
+  **3. 引用的精确性：**
+  ```python
+  # 检查精确引用（带引号）
+  has_quotes = '"' in response or '"' in response
+  if has_quotes:
+      score += 0.1  # 精确引用 → 加分
+
+  # 检查原文片段（3-gram匹配）
+  context_3grams = get_ngrams(sample.prompt, 3)
+  response_3grams = get_ngrams(response, 3)
+  common_3grams = context_3grams & response_3grams
+
+  if len(common_3grams) >= 3:
+      score += 0.1  # 多处精确引用原文
+  elif len(common_3grams) == 0:
+      score -= 0.1  # 完全没有原文引用，只是复述
+  ```
+
+  **优化的评估标准：**
+  - 长度检查（优化阈值）
+  - 模板短语检查（放宽到2次才扣分，降低惩罚到-0.15）
+  - 重复度检查（保持严格）
+
+  **关键改进：**
+  - 分数范围从[-0.5, 1.0]调整为[0.3, 1.0]
+  - 逃避短语从返回-0.5改为0.3（避免与错误答案混淆）
+  - 即使4个candidates都选对，也能根据reasoning质量得到0.3-1.0的差异化分数
+
+- 🌡️ **Temperature优化：1.15 → 1.0 (Commit fb38752)**
+
+  **理由：**
+  1. 细粒度评分可以区分reasoning质量，不依赖高文本多样性
+  2. 降低截断率（25-75% → 预期10-30%）
+  3. 稳定熵值（0.38-3.0剧烈波动 → 预期0.8-2.0）
+
+  **代码位置：** Line 230
+  ```python
+  TEMPERATURE_TRAIN: 1.15 → 1.0
+  # 配合细粒度reasoning评分，不需要过高温度
+  ```
+
+- 📊 **预期效果（Option A）：**
+
+  **相比Session 7结束时的训练结果：**
+
+  | 指标 | Session 7结果 | 预期改善 |
+  |------|--------------|---------|
+  | 零梯度组比例 | 20% (Step 1,3) | <10% |
+  | Fairness reward std | 0.000 (零梯度组) | >0.1 (即使都选对) |
+  | 截断率 | 25-75% | 10-30% |
+  | 熵稳定性 | 0.38-3.0剧烈波动 | 0.8-2.0稳定 |
+  | Hallucination std | 0.150-0.763 ✓ | 保持 |
+
+  **差异化评分示例：**
+  - Candidate 1：引用3个实体 + 完整推理链 + 精确引用 → 1.0分
+  - Candidate 2：引用2个实体 + 有因果词 + 无精确引用 → 0.8分
+  - Candidate 3：引用1个实体 + 简短justification + 模糊复述 → 0.6分
+  - Candidate 4：不引用实体 + 只断言答案 + 重复严重 → 0.4分
+
+  **关键突破：**
+  - 解决"都选对但得分相同"的问题
+  - 不再依赖过高temperature产生文本多样性
+  - 从"文本差异"转向"reasoning质量差异"
+
+- 🔬 **代码修改总览：**
+
+  | Commit | 主要修改 | 行号 |
+  |--------|----------|------|
+  | fb38752 | 细粒度Reasoning Quality评分 + Temp→1.0 | 230, 1606-1759 |
+
+  **修改细节：**
+  - `_assess_reasoning_quality()` 完全重写（新增3大评估维度）
+  - TEMPERATURE_TRAIN: 1.15 → 1.0
+  - 新增helper函数：get_ngrams（3-gram匹配）
+  - 新增正则表达式模式：检测完整推理链
+
 ---
 
 **文档结束。如有疑问，请参考trainer.py中的详细注释或重新阅读本文档的相关章节。**
