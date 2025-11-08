@@ -947,7 +947,34 @@ plt.savefig('training_trends.png')
   - ✅ 创建test_improved_judge.py验证
   - ✅ 实验结果：scores=[0.70, 1.00, 1.00, 0.70], std=0.15 ✅
 - ✅ Commit e51938b推送（Option A: Improve Judge scoring）
-- ✅ 更新HANDOFF.md（记录Judge改进和实验结果）
+- ✅ Commit bb009a5推送（Update HANDOFF.md）
+
+**2025-11-08 (Session 3 - 激进修复):**
+- 🔥 **用户反馈："这真的是新日志"** - 前面修复仍不够，问题依然存在
+- 🔍 **用户提供详细诊断（直接翻译版）：**
+  - 熵塌陷严重（0.017-0.055，极低）
+  - Reward std=0（所有candidates得分相同）
+  - 模型输出模板化："The context does not provide sufficient information"
+  - >50%组无梯度
+  - 核心问题："模型学会用单一、安全模板糊弄所有probe → reward常数 → RL无法学习"
+- 🎯 **用户建议5大措施：**
+  1. 增加候选多样性（去重、重采）
+  2. 多级reward（不只1.0/-0.7两档）
+  3. 对模板式输出直接负奖励
+  4. 放宽采样参数（top-p, temperature）
+  5. 精细化reward设计
+- ✅ **实施激进修复（核选项）：**
+  - ✅ 超严格reasoning quality评估（检测13种逃避短语→-0.5，实体引用，长度10-40词，模板短语1次扣分，词汇重复度检查）
+  - ✅ Jaccard去重机制（相似度>0.65→丢弃重采，最多3次重试）
+  - ✅ 激进采样参数（temp=1.1, top_k=150, top_p=0.95, rep_penalty=1.25）
+  - ✅ 创建test_aggressive_judge.py验证
+- ✅ Commit 5495a32推送（AGGRESSIVE FIX: all user-recommended measures）
+- 📊 **预期效果：**
+  - Candidates必须35%+不同（Jaccard<0.65）否则重采
+  - 模板输出得-0.5至-1.0惩罚
+  - 即使正确答案，根据reasoning质量得分0.3-1.0
+  - 应产生reward_std>0.1，即使在简单问题上
+  - **如果这还不行，根因不在Judge/采样，需要重新审视架构**
 
 **待更新（训练完成后）：**
 - [ ] 前10步的实际观察结果（关注熵是否上升）
