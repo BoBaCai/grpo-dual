@@ -227,7 +227,7 @@ class Config:
                                    # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
                                    # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
 
-    TEMPERATURE_TRAIN = 1.2        # 【调研修复】从1.5降到1.2：平衡熵(保持3.5-4.0)和截断率(降到15-30%)
+    TEMPERATURE_TRAIN = 1.0        # 【修复】从1.2降到1.0：减少截断率(目标<20%)，保持熵在1.5-2.5
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
@@ -3284,8 +3284,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             ratio = zero_gradient_groups / B
             print(f"\n⚠️ [Step {step+1}] {zero_gradient_groups}/{B} 组({ratio:.1%})的reward std<0.01，梯度信号被抹平")
 
-            # 【调试】Step 1-3打印第一个零梯度组的详细信息
-            if step < 3 and zero_gradient_group_idx is not None:
+            # 【调试】前20步打印第一个零梯度组的详细信息
+            if step < 20 and zero_gradient_group_idx is not None:
                 i = zero_gradient_group_idx
                 print(f"\n{'='*70}")
                 print(f"[零梯度组诊断@step{step+1}] 组{i}的4个candidates:")
