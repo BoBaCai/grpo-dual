@@ -2063,14 +2063,20 @@ class MultiCloudJudge:
             for path in possible_paths:
                 if (path / "llm_judge_prompts_v2.py").exists():
                     judges_dir = path
+                    print(f"[LLM Judge] 找到 llm_judge_prompts_v2.py 在: {path}")
                     break
 
             # 如果都找不到，默认使用当前目录
             if judges_dir is None:
                 judges_dir = cwd
+                print(f"[LLM Judge] 未找到 llm_judge_prompts_v2.py，使用默认路径: {cwd}")
 
-        if str(judges_dir) not in sys.path:
-            sys.path.insert(0, str(judges_dir))
+        # 确保路径在 sys.path 最前面（优先级最高）
+        judges_dir_str = str(judges_dir)
+        if judges_dir_str in sys.path:
+            sys.path.remove(judges_dir_str)
+        sys.path.insert(0, judges_dir_str)
+        print(f"[LLM Judge] 已添加到 sys.path[0]: {judges_dir_str}")
 
         if config.LLM_JUDGE_VERSION == "v2":
             from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
