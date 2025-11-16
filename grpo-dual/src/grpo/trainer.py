@@ -2040,6 +2040,13 @@ class MultiCloudJudge:
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
         # Import prompt templates based on version
+        # 动态添加judges目录到路径
+        import sys
+        from pathlib import Path
+        judges_dir = Path(__file__).parent.parent / "judges"
+        if str(judges_dir) not in sys.path:
+            sys.path.insert(0, str(judges_dir))
+
         if config.LLM_JUDGE_VERSION == "v2":
             from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
         else:  # v1 (default)
