@@ -1516,12 +1516,14 @@ class MultiCloudJudge:
         # 【调试】用于打印template_detector触发样本
         self.debug_step = 0
         # 【新增】缓存 LLM Judge prompt 函数（避免重复导入）
-        self._llm_judge_funcs_cached = False
-        self._llm_judge_import_lock = threading.Lock()  # 导入锁，防止多线程竞态
         self._get_adaptive_bbq_prompt = None
         self._get_adaptive_halueval_prompt = None
         self._get_bbq_fairness_prompt = None
         self._get_halueval_prompt = None
+
+        # 【预加载】如果启用 LLM Judge，在初始化时就加载函数（避免多线程竞态）
+        if config.USE_LLM_JUDGE:
+            self._load_llm_judge_functions()
 
     # --- 缓存表 ---
     def _setup_cache(self):
@@ -2045,16 +2047,129 @@ class MultiCloudJudge:
         - 使用缓存避免重复调用
         - 支持 OpenAI 和 Claude 双云
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
+        - 函数已在 __init__ 中预加载，避免多线程竞态
         """
-        # 只在第一次调用时导入（避免重复导入）- 使用双重检查锁定模式
-        if not self._llm_judge_funcs_cached:
-            with self._llm_judge_import_lock:
-                # 再次检查（其他线程可能已经导入了）
-                if self._llm_judge_funcs_cached:
-                    # 另一个线程已经完成导入，直接返回使用
-                    pass
-                else:
-                    self._load_llm_judge_functions()
+        # 构建 prompt（使用预加载的函数）
+        if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
+            context_condition = sample.meta.get("context_condition", "")
+            unknown_option = sample.meta.get("unknown_option", "C")
+            correct_label = sample.meta.get("label", -1)
+
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = self._get_adaptive_bbq_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta
+                )
+            else:
+                prompt_text = self._get_bbq_fairness_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response
+                )
+
+        elif sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
+            subset = sample.meta.get("subset", "")
+            has_hallucination = sample.meta.get("has_hallucination", False)
+
+            ground_truth = {
+                'knowledge': sample.meta.get('knowledge', ''),
+                'document': sample.meta.get('document', ''),
+                'right_answer': sample.meta.get('right_answer', ''),
+                'right_response': sample.meta.get('right_response', ''),
+                'right_summary': sample.meta.get('right_summary', ''),
+                'hallucinated_answer': sample.meta.get('hallucinated_answer', ''),
+            }
+
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = self._get_adaptive_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta
+                )
+            else:
+                prompt_text = self._get_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
+                    response=response
+                )
+        else:
+            return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+                   else self._evaluate_halueval(sample, response)
+
+        # 缓存检查
+        key = hashlib.sha256(f"llm_judge::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        # 调用 LLM Judge API
+        GLOBAL_JUDGE_BUCKET.acquire()
+
+        for p in self.providers:
+            provider_name = p["name"]
+            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
+                try:
+                    if provider_name == "openai":
+                        from openai import OpenAI
+                        client = OpenAI()
+                        resp = client.chat.completions.create(
+                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("gpt") else "gpt-4o-mini",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            response_format={"type": "json_object"},
+                            messages=[{"role": "user", "content": prompt_text}],
+                            max_tokens=config.LLM_JUDGE_MAX_TOKENS,
+                            timeout=config.JUDGE_TIMEOUT_SEC
+                        )
+                        content = resp.choices[0].message.content
+                    elif provider_name == "claude":
+                        import anthropic, inspect
+                        client = anthropic.Anthropic()
+                        sig = inspect.signature(client.messages.create)
+                        length_kw = "max_output_tokens" if "max_output_tokens" in sig.parameters else "max_tokens"
+                        resp = client.messages.create(
+                            model=config.LLM_JUDGE_MODEL if not config.LLM_JUDGE_MODEL.startswith("gpt") else "claude-3-5-haiku-latest",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            messages=[{"role": "user", "content": prompt_text}],
+                            **{length_kw: config.LLM_JUDGE_MAX_TOKENS}
+                        )
+                        content = resp.content[0].text
+                    else:
+                        continue
+
+                    # 解析 JSON 响应
+                    import json
+                    result = json.loads(content)
+                    score = float(result.get("final", 0.0))
+
+                    # 校准
+                    calibration = config.JUDGE_CALIBRATION.get(provider_name, {"a": 1.0, "b": 0.0})
+                    score = calibration["a"] * score + calibration["b"]
+
+                    result_dict = {"final": np.clip(score, -1.0, 1.0), "provider": provider_name}
+                    self._cache_set(key, result_dict)
+                    return result_dict
+
+                except Exception as e:
+                    if attempt < config.JUDGE_MAX_RETRIES:
+                        continue
+                    else:
+                        # 失败后尝试下一个 provider
+                        break
+
+        # 所有 provider 都失败，使用规则评分兜底
+        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+               else self._evaluate_halueval(sample, response)
 
     def _load_llm_judge_functions(self):
         """
@@ -2157,141 +2272,6 @@ class MultiCloudJudge:
                 self._get_halueval_prompt = llm_judge_prompts.get_halueval_prompt
 
             # 标记已缓存（必须在最后设置，确保所有函数都已赋值）
-            self._llm_judge_funcs_cached = True
-
-        # === 继续 _evaluate_with_llm_judge 方法 ===
-        # 构建 prompt（使用缓存的函数）
-        if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
-            context_condition = sample.meta.get("context_condition", "")
-            unknown_option = sample.meta.get("unknown_option", "C")
-            correct_label = sample.meta.get("label", -1)
-
-            if config.LLM_JUDGE_VERSION == "v2":
-                prompt_text = self._get_adaptive_bbq_prompt(
-                    context_condition=context_condition,
-                    unknown_option=unknown_option,
-                    correct_label=correct_label,
-                    prompt=sample.prompt,
-                    response=response,
-                    meta=sample.meta  # V2 需要 meta 信息进行自适应
-                )
-            else:
-                prompt_text = self._get_bbq_fairness_prompt(
-                    context_condition=context_condition,
-                    unknown_option=unknown_option,
-                    correct_label=correct_label,
-                    prompt=sample.prompt,
-                    response=response
-                )
-
-        elif sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
-            subset = sample.meta.get("subset", "")
-            has_hallucination = sample.meta.get("has_hallucination", False)
-
-            # 构建 ground truth dict
-            ground_truth = {
-                'knowledge': sample.meta.get('knowledge', ''),
-                'document': sample.meta.get('document', ''),
-                'right_answer': sample.meta.get('right_answer', ''),
-                'right_response': sample.meta.get('right_response', ''),
-                'right_summary': sample.meta.get('right_summary', ''),
-                'hallucinated_answer': sample.meta.get('hallucinated_answer', ''),
-            }
-
-            if config.LLM_JUDGE_VERSION == "v2":
-                prompt_text = self._get_adaptive_halueval_prompt(
-                    subset=subset,
-                    has_hallucination=has_hallucination,
-                    ground_truth=ground_truth,
-                    prompt=sample.prompt,
-                    response=response,
-                    meta=sample.meta  # V2 需要 meta 信息
-                )
-            else:
-                prompt_text = self._get_halueval_prompt(
-                    subset=subset,
-                    has_hallucination=has_hallucination,
-                    ground_truth=ground_truth,
-                    prompt=sample.prompt,
-                response=response
-            )
-        else:
-            # Fallback to rule-based for unknown tasks
-            return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
-                   else self._evaluate_halueval(sample, response)
-
-        # 缓存 key
-        key = hashlib.sha256(f"llm_judge::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
-        cached = self._cache_get(key)
-        if cached:
-            return cached
-
-        # 调用 LLM Judge
-        GLOBAL_JUDGE_BUCKET.acquire()
-
-        for p in self.providers:
-            provider_name = p["name"]
-            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
-                try:
-                    if provider_name == "openai":
-                        from openai import OpenAI
-                        client = OpenAI()
-                        resp = client.chat.completions.create(
-                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("gpt") else "gpt-4o-mini",
-                            temperature=config.LLM_JUDGE_TEMPERATURE,
-                            response_format={"type": "json_object"},
-                            messages=[{"role": "user", "content": prompt_text}],
-                            max_tokens=config.LLM_JUDGE_MAX_TOKENS,
-                            timeout=config.JUDGE_TIMEOUT_SEC
-                        )
-                        txt = resp.choices[0].message.content
-
-                    elif provider_name == "claude":
-                        import anthropic, inspect
-                        client = anthropic.Anthropic()
-                        sig = inspect.signature(client.messages.create)
-                        length_kw = "max_output_tokens" if "max_output_tokens" in sig.parameters else "max_tokens"
-                        resp = client.messages.create(
-                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("claude") else "claude-3-5-haiku-latest",
-                            temperature=config.LLM_JUDGE_TEMPERATURE,
-                            messages=[{"role": "user", "content": prompt_text}],
-                            **{length_kw: config.LLM_JUDGE_MAX_TOKENS}
-                        )
-                        parts = []
-                        for blk in getattr(resp, "content", []) or []:
-                            if hasattr(blk, "text"):
-                                parts.append(blk.text)
-                            elif isinstance(blk, dict) and blk.get("type") == "text":
-                                parts.append(blk.get("text", ""))
-                        txt = "".join(parts) if parts else str(resp)
-                    else:
-                        raise ValueError(f"Unknown provider: {provider_name}")
-
-                    # 解析 JSON
-                    obj = extract_json_strict(txt)
-                    score = float(obj.get("final", 0.5))
-
-                    # 不需要校准（prompt 已经指定了 0.0-1.0 范围）
-                    out = {"final": score, "provider": f"llm_judge_{provider_name}"}
-                    self._cache_put(key, out)
-                    return out
-
-                except Exception as e:
-                    if attempt < config.JUDGE_MAX_RETRIES:
-                        wait = 2 ** attempt
-                        time.sleep(wait)
-                        continue
-                    else:
-                        # 所有重试失败，fallback to rule-based
-                        print(f"⚠️ LLM Judge failed after {config.JUDGE_MAX_RETRIES} retries: {e}")
-                        print(f"   Falling back to rule-based scoring...")
-                        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
-                               else self._evaluate_halueval(sample, response)
-
-        # 如果所有 providers 都失败，fallback
-        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
-               else self._evaluate_halueval(sample, response)
-
     def _evaluate_halueval(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         HaluEval专用评估器：基于规则检查是否包含hallucination
