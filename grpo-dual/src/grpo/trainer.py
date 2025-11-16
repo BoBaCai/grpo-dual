@@ -4384,7 +4384,24 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             print(f"  当前max_new_tokens={current_max_new_tokens_train}（已达硬约束上限128）")
             print(f"  建议：(1)降低temperature={config.TEMPERATURE_TRAIN} (2)增大rep_penalty={config.REP_PENALTY_TRAIN}")
             print(f"       (3)增大presence_penalty={config.PRESENCE_PENALTY} (4)或接受10-20%的截断率")
-        
+
+            # 【诊断】打印被截断样本示例
+            print(f"\n📋 [截断样本诊断] 查看被截断的回答内容：")
+            truncated_indices = [i for i, is_trunc in enumerate(all_truncated) if is_trunc]
+            if truncated_indices:
+                # 最多显示3个被截断的样本
+                for idx in truncated_indices[:3]:
+                    task = "Fairness" if task_mask_f[idx] else "Hallucination"
+                    resp_text = all_resps[idx]
+                    resp_len = len(tokenizer.encode(resp_text, add_special_tokens=False))
+                    print(f"\n  样本 #{idx} ({task}):")
+                    print(f"    Token长度: {resp_len}")
+                    print(f"    Prompt (前80字符): {all_prompts[idx][:80]}...")
+                    print(f"    Response (前200字符): {resp_text[:200]}...")
+                    if len(resp_text) > 200:
+                        print(f"    Response (后100字符): ...{resp_text[-100:]}")
+            print(f"  (共 {len(truncated_indices)} 个被截断)\n")
+
         # 记录指标
         step_metrics = {
             "loss": loss_total.item(),
