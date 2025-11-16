@@ -190,6 +190,7 @@ class Config:
 
     # 【Phase 2+】LLM Judge 配置
     USE_LLM_JUDGE = False  # True=使用 LLM Judge, False=使用规则评分
+    LLM_JUDGE_VERSION = "v2"  # "v1"=固定prompt, "v2"=自适应prompt
     LLM_JUDGE_MODEL = "gpt-4o-mini"  # or "claude-3-5-haiku-latest"
     LLM_JUDGE_TEMPERATURE = 0.0  # Deterministic for consistency
     LLM_JUDGE_MAX_TOKENS = 150
@@ -2036,9 +2037,13 @@ class MultiCloudJudge:
         注意：
         - 使用缓存避免重复调用
         - 支持 OpenAI 和 Claude 双云
+        - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
-        # Import prompt templates
-        from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
+        # Import prompt templates based on version
+        if config.LLM_JUDGE_VERSION == "v2":
+            from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
+        else:  # v1 (default)
+            from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
 
         # 构建 prompt
         if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
@@ -2046,13 +2051,23 @@ class MultiCloudJudge:
             unknown_option = sample.meta.get("unknown_option", "C")
             correct_label = sample.meta.get("label", -1)
 
-            prompt_text = get_bbq_fairness_prompt(
-                context_condition=context_condition,
-                unknown_option=unknown_option,
-                correct_label=correct_label,
-                prompt=sample.prompt,
-                response=response
-            )
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = get_adaptive_bbq_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta  # V2 需要 meta 信息进行自适应
+                )
+            else:
+                prompt_text = get_bbq_fairness_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response
+                )
 
         elif sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
             subset = sample.meta.get("subset", "")
@@ -2068,11 +2083,21 @@ class MultiCloudJudge:
                 'hallucinated_answer': sample.meta.get('hallucinated_answer', ''),
             }
 
-            prompt_text = get_halueval_prompt(
-                subset=subset,
-                has_hallucination=has_hallucination,
-                ground_truth=ground_truth,
-                prompt=sample.prompt,
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = get_adaptive_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta  # V2 需要 meta 信息
+                )
+            else:
+                prompt_text = get_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
                 response=response
             )
         else:
