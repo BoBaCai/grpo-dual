@@ -2173,7 +2173,7 @@ class MultiCloudJudge:
                     score = calibration["a"] * score + calibration["b"]
 
                     result_dict = {"final": np.clip(score, -1.0, 1.0), "provider": provider_name}
-                    self._cache_set(key, result_dict)
+                    self._cache_put(key, result_dict)
                     return result_dict
 
                 except Exception as e:
