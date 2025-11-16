@@ -2050,17 +2050,24 @@ class MultiCloudJudge:
             judges_dir = Path(__file__).parent.parent / "judges"
         except NameError:
             # 方法2: 使用当前工作目录 (适用于Jupyter notebook)
-            # 假设结构: workspace/src/grpo/trainer.py 和 workspace/src/judges/
             cwd = Path.cwd()
-            # 尝试 workspace/src/judges
-            if (cwd / "src" / "judges").exists():
-                judges_dir = cwd / "src" / "judges"
-            # 尝试 workspace/judges (用户可能直接上传judges文件夹)
-            elif (cwd / "judges").exists():
-                judges_dir = cwd / "judges"
-            else:
-                # 默认假设在workspace根目录
-                judges_dir = cwd / "src" / "judges"
+
+            # 按优先级尝试多个路径，直接检查文件是否存在
+            possible_paths = [
+                cwd,                      # workspace/ (文件直接在根目录)
+                cwd / "judges",           # workspace/judges/
+                cwd / "src" / "judges",   # workspace/src/judges/
+            ]
+
+            judges_dir = None
+            for path in possible_paths:
+                if (path / "llm_judge_prompts_v2.py").exists():
+                    judges_dir = path
+                    break
+
+            # 如果都找不到，默认使用当前目录
+            if judges_dir is None:
+                judges_dir = cwd
 
         if str(judges_dir) not in sys.path:
             sys.path.insert(0, str(judges_dir))
