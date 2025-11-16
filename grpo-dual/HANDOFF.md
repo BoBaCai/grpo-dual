@@ -3698,3 +3698,125 @@ for task in ['fairness', 'hallucination']:
 **Session 2 完成。所有问题已解决，配置已优化到稳定状态。**
 
 ---
+
+## 🔧 2025-11-16 修复记录 (Session 3)
+
+### ⚠️ 发现的问题
+
+#### 1. LLM Judge 未完全启用
+
+**症状：**
+```
+Step 1: HaluEval判分: 1.000 (provider: halueval_rule)  ← 规则评分
+Step 3: HaluEval判分: 0.100 (provider: halueval_rule)  ← 规则评分
+Step 5: [Judge@step5] time=2.4s providers={'openai': 8}  ← ✅ LLM Judge成功
+Step 6: BBQ判分: -1.000 (provider: bbq_rule)  ← 规则评分
+```
+
+**问题：** 大部分步骤 fallback 到规则评分，只有少数步骤成功使用 LLM Judge
+
+**影响：**
+- 规则judge无法区分回答质量细微差异
+- 导致零梯度组（Step 1示例：4个不同回答都得分0.350）
+
+---
+
+#### 2. 零梯度组根本原因
+
+**Step 1 零梯度组诊断：**
+```
+所有4个candidates:
+  Reward: 0.350 (完全相同！)
+  HaluEval判分: 1.000 (规则judge)
+
+但回答明显不同：
+  · "Casey Affleck and Morgan Freeman"
+  · "Casey Affleck Michelle Monaghan Morgan Freeman"
+  · "Casey Affleck Morgan Freeman"
+  · "Casey Affleck & Michelle Monaghan"
+```
+
+**根本原因：** 规则judge太粗糙 → 相同reward → std=0.000 → 零梯度
+
+---
+
+### ✅ 修复方案
+
+#### 修复：LLM Judge API调用可靠性
+
+**问题分析：**
+
+`trainer.py:2185-2188` 有静默fallback机制：
+```python
+# 所有 provider 都失败，使用规则评分兜底
+print(f"⚠️ [LLM Judge] 所有 LLM providers 失败，fallback 到规则评分")
+return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+       else self._evaluate_halueval(sample, response)
+```
+
+**根本原因：**
+- `JUDGE_MAX_WORKERS = 16` - 并发过高触发OpenAI限流
+- `JUDGE_TIMEOUT_SEC = 7` - 超时太短，API调用被中断
+- `JUDGE_MAX_RETRIES = 1` - 重试次数不足
+
+**解决方案：**
+
+| 参数 | 旧值 | 新值 | 目的 |
+|------|------|------|------|
+| `JUDGE_MAX_WORKERS` | 16 | **8** | 降低并发，避免触发OpenAI限流 |
+| `JUDGE_TIMEOUT_SEC` | 7 | **15** | 给API更多响应时间 |
+| `JUDGE_MAX_RETRIES` | 1 | **3** | 提高成功率，3次重试 |
+
+**预期效果：**
+- ✅ 所有步骤稳定使用 LLM Judge（无fallback）
+- ✅ 零梯度组大幅减少
+- ✅ 更细粒度的质量区分
+
+**Commit:**
+- `259f19f` - Fix LLM Judge API call reliability
+
+---
+
+### 📋 其他观察
+
+#### 1. 熵值仍然偏低但未崩溃
+```
+Step 2: 0.227
+Step 3: 0.036 😱 (严重塌陷)
+Step 6: 0.472
+```
+**状态：** 未崩溃（无乱码），但ENTROPY_COEF=1.0可能还是偏保守
+
+---
+
+#### 2. Hallucination任务截断率高
+```
+Step 5: H: 75%
+Step 6: H: 50%
+```
+
+**分析：**
+- Summarization子集需要更长回答
+- 96 tokens对summary任务偏短
+- **不是模型崩溃**（内容正常，只是verbose）
+
+**待优化：** 可考虑针对不同任务使用不同token限制
+
+---
+
+### 🎯 下一步建议
+
+**优先级1：** 测试LLM Judge修复效果
+- 重新运行训练
+- 确认所有步骤都使用 `providers={'openai': 8}`
+- 检查零梯度组是否减少
+
+**优先级2：** 根据新结果调整参数
+- 如果熵值仍低：考虑 ENTROPY_COEF: 1.0 → 1.5
+- 如果Hallucination截断率仍高：考虑分任务token限制
+
+---
+
+**Session 3 完成。LLM Judge可靠性已修复，等待测试结果。**
+
+---
