@@ -1517,6 +1517,7 @@ class MultiCloudJudge:
         self.debug_step = 0
         # 【新增】缓存 LLM Judge prompt 函数（避免重复导入）
         self._llm_judge_funcs_cached = False
+        self._llm_judge_import_lock = threading.Lock()  # 导入锁，防止多线程竞态
         self._get_adaptive_bbq_prompt = None
         self._get_adaptive_halueval_prompt = None
         self._get_bbq_fairness_prompt = None
@@ -2045,8 +2046,21 @@ class MultiCloudJudge:
         - 支持 OpenAI 和 Claude 双云
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
-        # 只在第一次调用时导入（避免重复导入）
+        # 只在第一次调用时导入（避免重复导入）- 使用双重检查锁定模式
         if not self._llm_judge_funcs_cached:
+            with self._llm_judge_import_lock:
+                # 再次检查（其他线程可能已经导入了）
+                if self._llm_judge_funcs_cached:
+                    # 另一个线程已经完成导入，直接返回使用
+                    pass
+                else:
+                    self._load_llm_judge_functions()
+
+    def _load_llm_judge_functions(self):
+        """
+        加载 LLM Judge prompt 函数（线程安全，由锁保护调用）
+        """
+        if True:  # 保持原有缩进结构
             import sys
             from pathlib import Path
             import urllib.request
@@ -2125,31 +2139,27 @@ class MultiCloudJudge:
             sys.path.insert(0, judges_dir_str)
             print(f"[LLM Judge] 已添加到 sys.path[0]: {judges_dir_str}")
 
-            # 清除模块缓存，确保导入最新版本
-            if 'llm_judge_prompts_v2' in sys.modules:
-                del sys.modules['llm_judge_prompts_v2']
-            if 'llm_judge_prompts' in sys.modules:
-                del sys.modules['llm_judge_prompts']
-
-            # 验证文件存在并导入
+            # 验证文件存在并导入（不清除缓存，避免 KeyError）
             if config.LLM_JUDGE_VERSION == "v2":
                 verify_file = Path(judges_dir_str) / "llm_judge_prompts_v2.py"
                 if not verify_file.exists():
                     raise RuntimeError(f"文件不存在: {verify_file}")
                 print(f"[LLM Judge] 验证文件: {verify_file} ({verify_file.stat().st_size} bytes)")
 
-                from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
-                self._get_adaptive_bbq_prompt = get_adaptive_bbq_prompt
-                self._get_adaptive_halueval_prompt = get_adaptive_halueval_prompt
+                # 直接导入，不清除缓存
+                import llm_judge_prompts_v2
+                self._get_adaptive_bbq_prompt = llm_judge_prompts_v2.get_adaptive_bbq_prompt
+                self._get_adaptive_halueval_prompt = llm_judge_prompts_v2.get_adaptive_halueval_prompt
                 print(f"[LLM Judge] ✅ 成功导入 V2 函数")
             else:  # v1 (default)
-                from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
-                self._get_bbq_fairness_prompt = get_bbq_fairness_prompt
-                self._get_halueval_prompt = get_halueval_prompt
+                import llm_judge_prompts
+                self._get_bbq_fairness_prompt = llm_judge_prompts.get_bbq_fairness_prompt
+                self._get_halueval_prompt = llm_judge_prompts.get_halueval_prompt
 
-            # 标记已缓存
+            # 标记已缓存（必须在最后设置，确保所有函数都已赋值）
             self._llm_judge_funcs_cached = True
 
+        # === 继续 _evaluate_with_llm_judge 方法 ===
         # 构建 prompt（使用缓存的函数）
         if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
             context_condition = sample.meta.get("context_condition", "")
