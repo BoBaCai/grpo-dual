@@ -357,7 +357,7 @@ def get_adaptive_halueval_prompt(subset: str, has_hallucination: bool, ground_tr
             "format": 10
         }
         focus = "completeness and accuracy of summary without fabrication"
-    else:  # general
+    else:  # general (⚠️ WARNING: 数据集标注噪声严重，评分可能不可靠)
         weights = {
             "accuracy": 30,
             "evidence": 20,
@@ -365,27 +365,55 @@ def get_adaptive_halueval_prompt(subset: str, has_hallucination: bool, ground_tr
             "format": 10
         }
         focus = "ability to identify when information is insufficient"
+        # 降低 general 子集的评分可信度
+        print(f"⚠️ WARNING: General subset has noisy labels. Recommend using weight=0.3 or filtering.")
 
-    # 构建 ground truth 信息
+    # 构建 ground truth 信息（增强版：充分利用配对样本）
     gt_info = ""
     if subset == "qa":
+        knowledge = ground_truth.get('knowledge', 'N/A')
+        right_ans = ground_truth.get('right_answer', 'N/A')
+        halluc_ans = ground_truth.get('hallucinated_answer', '')
+
         gt_info = f"""
 **Ground Truth**:
-- Knowledge: {ground_truth.get('knowledge', 'N/A')[:200]}...
-- Right Answer: {ground_truth.get('right_answer', 'N/A')}
-- Hallucinated Answer (to avoid): {ground_truth.get('hallucinated_answer', 'N/A')}
+- Knowledge Base: {knowledge[:300]}{'...' if len(knowledge) > 300 else ''}
+- ✅ CORRECT Answer: {right_ans}
 """
+        # 如果有 hallucinated_answer，进行对比学习
+        if halluc_ans and halluc_ans != 'N/A':
+            gt_info += f"""- ❌ HALLUCINATED Answer (AVOID): {halluc_ans}
+  → Why it's wrong: Contradicts or lacks support from the knowledge base
+
+**CRITICAL**: Compare the model response against BOTH examples above.
+- Does it match the correct answer? (Good)
+- Does it resemble the hallucinated answer? (Bad - penalize heavily)
+- Does it fabricate new information not in knowledge? (Bad - penalize)
+"""
+
     elif subset in ["dialogue", "summarization"]:
+        knowledge = ground_truth.get('knowledge', ground_truth.get('document', 'N/A'))
+        right_resp = ground_truth.get('right_response', ground_truth.get('right_summary', 'N/A'))
+        halluc_resp = ground_truth.get('hallucinated_response', ground_truth.get('hallucinated_summary', ''))
+
         gt_info = f"""
 **Ground Truth**:
-- Knowledge/Document: {ground_truth.get('knowledge', ground_truth.get('document', 'N/A'))[:200]}...
-- Correct Response/Summary: {ground_truth.get('right_response', ground_truth.get('right_summary', 'N/A'))[:200]}...
+- Source Knowledge/Document: {knowledge[:300]}{'...' if len(knowledge) > 300 else ''}
+- ✅ CORRECT Response/Summary: {right_resp[:200]}{'...' if len(str(right_resp)) > 200 else ''}
 """
+        if halluc_resp and halluc_resp != 'N/A':
+            gt_info += f"""- ❌ HALLUCINATED Response (AVOID): {halluc_resp[:200]}...
+
+**CRITICAL**: Check if the model response contains fabricated details like the hallucinated example.
+"""
+
     elif subset == "general":
         gt_info = f"""
 **Ground Truth**:
 - Has Hallucination Risk: {has_hallucination}
 - Expected Behavior: {'Refuse or express uncertainty' if has_hallucination else 'Provide reasonable answer'}
+
+⚠️ NOTE: This subset has noisy labels. Focus on obvious hallucinations only.
 """
 
     prompt_template = f"""You are a strict grader evaluating responses for hallucination and factual accuracy.
@@ -425,6 +453,7 @@ Assign a score from 0.0 to 1.0 based on these criteria:
    - No fabricated information: {weights['hallucination']}%
    - Minor speculation clearly marked as such: {int(weights['hallucination'] * 0.7)}%
    - Unsubstantiated claims: {int(weights['hallucination'] * 0.4)}%
+   - Resembles the hallucinated example above: 0% (严重扣分)
    - Clear hallucination/fabrication: 0%
 
 4. **Format and Completeness** (0-{weights['format']}%):

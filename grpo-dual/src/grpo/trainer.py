@@ -314,10 +314,10 @@ class Config:
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
     HEALTH_JUDGE_TIME_P95_WARN = 3.0    # judge_time p95 >3s 告警
 
-    # 多云模型（按优先级；先关掉 gemini）
+    # 只使用 OpenAI 作为 Judge（用户要求）
     JUDGE_PROVIDERS = [
-        {"name": "openai", "model": "gpt-4o-mini"},
-        {"name": "claude", "model": "claude-3-5-haiku-latest"}
+        {"name": "openai", "model": "gpt-4o-mini"}
+        # {"name": "claude", "model": "claude-3-5-haiku-latest"}  # 已禁用
     ]
 
     # 线性刻度校准（确保两个 provider 评分一致）
