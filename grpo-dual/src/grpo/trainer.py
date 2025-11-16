@@ -1523,7 +1523,23 @@ class MultiCloudJudge:
 
         # 【预加载】如果启用 LLM Judge，在初始化时就加载函数（避免多线程竞态）
         if config.USE_LLM_JUDGE:
-            self._load_llm_judge_functions()
+            print(f"\n{'='*80}")
+            print(f"🔍 [LLM Judge 初始化] USE_LLM_JUDGE=True，开始加载函数...")
+            print(f"   版本: {config.LLM_JUDGE_VERSION}")
+            print(f"   模型: {config.LLM_JUDGE_MODEL}")
+            print(f"{'='*80}")
+            try:
+                self._load_llm_judge_functions()
+                print(f"\n✅ [LLM Judge] 函数加载成功！")
+                print(f"   _get_adaptive_bbq_prompt: {self._get_adaptive_bbq_prompt is not None}")
+                print(f"   _get_adaptive_halueval_prompt: {self._get_adaptive_halueval_prompt is not None}")
+                print(f"{'='*80}\n")
+            except Exception as e:
+                print(f"\n❌ [LLM Judge] 函数加载失败: {e}")
+                import traceback
+                traceback.print_exc()
+                print(f"{'='*80}\n")
+                raise
 
     # --- 缓存表 ---
     def _setup_cache(self):
@@ -2161,13 +2177,16 @@ class MultiCloudJudge:
                     return result_dict
 
                 except Exception as e:
+                    print(f"⚠️ [LLM Judge] {provider_name} 调用失败 (attempt {attempt+1}/{config.JUDGE_MAX_RETRIES+1}): {type(e).__name__}: {e}")
                     if attempt < config.JUDGE_MAX_RETRIES:
                         continue
                     else:
                         # 失败后尝试下一个 provider
+                        print(f"❌ [LLM Judge] {provider_name} 所有重试失败，尝试下一个 provider...")
                         break
 
         # 所有 provider 都失败，使用规则评分兜底
+        print(f"⚠️ [LLM Judge] 所有 LLM providers 失败，fallback 到规则评分 (task={sample.task})")
         return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
                else self._evaluate_halueval(sample, response)
 
