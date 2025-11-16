@@ -188,6 +188,12 @@ class Config:
     DO_SFT_CONTINUE = True
     DO_GRPO = True
 
+    # 【Phase 2+】LLM Judge 配置
+    USE_LLM_JUDGE = False  # True=使用 LLM Judge, False=使用规则评分
+    LLM_JUDGE_MODEL = "gpt-4o-mini"  # or "claude-3-5-haiku-latest"
+    LLM_JUDGE_TEMPERATURE = 0.0  # Deterministic for consistency
+    LLM_JUDGE_MAX_TOKENS = 150
+
     # SFT
     SFT_STEPS = 200
     SFT_LR = 5e-5
@@ -2018,6 +2024,134 @@ class MultiCloudJudge:
 
         return np.clip(bonus, -0.5, 0.5)
 
+    def _evaluate_with_llm_judge(self, sample: Sample, response: str) -> Dict[str, float]:
+        """
+        使用 LLM Judge 进行评分
+
+        优势：
+        1. 更全面理解 reasoning 质量（不只是形式特征）
+        2. 可以检测微妙的逃避策略和 hallucination
+        3. 通过精心设计的 prompt 产生细粒度评分
+
+        注意：
+        - 使用缓存避免重复调用
+        - 支持 OpenAI 和 Claude 双云
+        """
+        # Import prompt templates
+        from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
+
+        # 构建 prompt
+        if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
+            context_condition = sample.meta.get("context_condition", "")
+            unknown_option = sample.meta.get("unknown_option", "C")
+            correct_label = sample.meta.get("label", -1)
+
+            prompt_text = get_bbq_fairness_prompt(
+                context_condition=context_condition,
+                unknown_option=unknown_option,
+                correct_label=correct_label,
+                prompt=sample.prompt,
+                response=response
+            )
+
+        elif sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
+            subset = sample.meta.get("subset", "")
+            has_hallucination = sample.meta.get("has_hallucination", False)
+
+            # 构建 ground truth dict
+            ground_truth = {
+                'knowledge': sample.meta.get('knowledge', ''),
+                'document': sample.meta.get('document', ''),
+                'right_answer': sample.meta.get('right_answer', ''),
+                'right_response': sample.meta.get('right_response', ''),
+                'right_summary': sample.meta.get('right_summary', ''),
+                'hallucinated_answer': sample.meta.get('hallucinated_answer', ''),
+            }
+
+            prompt_text = get_halueval_prompt(
+                subset=subset,
+                has_hallucination=has_hallucination,
+                ground_truth=ground_truth,
+                prompt=sample.prompt,
+                response=response
+            )
+        else:
+            # Fallback to rule-based for unknown tasks
+            return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+                   else self._evaluate_halueval(sample, response)
+
+        # 缓存 key
+        key = hashlib.sha256(f"llm_judge::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        # 调用 LLM Judge
+        GLOBAL_JUDGE_BUCKET.acquire()
+
+        for p in self.providers:
+            provider_name = p["name"]
+            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
+                try:
+                    if provider_name == "openai":
+                        from openai import OpenAI
+                        client = OpenAI()
+                        resp = client.chat.completions.create(
+                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("gpt") else "gpt-4o-mini",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            response_format={"type": "json_object"},
+                            messages=[{"role": "user", "content": prompt_text}],
+                            max_tokens=config.LLM_JUDGE_MAX_TOKENS,
+                            timeout=config.JUDGE_TIMEOUT_SEC
+                        )
+                        txt = resp.choices[0].message.content
+
+                    elif provider_name == "claude":
+                        import anthropic, inspect
+                        client = anthropic.Anthropic()
+                        sig = inspect.signature(client.messages.create)
+                        length_kw = "max_output_tokens" if "max_output_tokens" in sig.parameters else "max_tokens"
+                        resp = client.messages.create(
+                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("claude") else "claude-3-5-haiku-latest",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            messages=[{"role": "user", "content": prompt_text}],
+                            **{length_kw: config.LLM_JUDGE_MAX_TOKENS}
+                        )
+                        parts = []
+                        for blk in getattr(resp, "content", []) or []:
+                            if hasattr(blk, "text"):
+                                parts.append(blk.text)
+                            elif isinstance(blk, dict) and blk.get("type") == "text":
+                                parts.append(blk.get("text", ""))
+                        txt = "".join(parts) if parts else str(resp)
+                    else:
+                        raise ValueError(f"Unknown provider: {provider_name}")
+
+                    # 解析 JSON
+                    obj = extract_json_strict(txt)
+                    score = float(obj.get("final", 0.5))
+
+                    # 不需要校准（prompt 已经指定了 0.0-1.0 范围）
+                    out = {"final": score, "provider": f"llm_judge_{provider_name}"}
+                    self._cache_put(key, out)
+                    return out
+
+                except Exception as e:
+                    if attempt < config.JUDGE_MAX_RETRIES:
+                        wait = 2 ** attempt
+                        time.sleep(wait)
+                        continue
+                    else:
+                        # 所有重试失败，fallback to rule-based
+                        print(f"⚠️ LLM Judge failed after {config.JUDGE_MAX_RETRIES} retries: {e}")
+                        print(f"   Falling back to rule-based scoring...")
+                        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+                               else self._evaluate_halueval(sample, response)
+
+        # 如果所有 providers 都失败，fallback
+        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+               else self._evaluate_halueval(sample, response)
+
     def _evaluate_halueval(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         HaluEval专用评估器：基于规则检查是否包含hallucination
@@ -2164,11 +2298,15 @@ class MultiCloudJudge:
     def evaluate(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         统一评估接口：
-        - Fairness任务使用BBQ专用评估器（基于规则）
-        - Hallucination任务使用HaluEval规则评估器（基于规则）
+        - 根据 config.USE_LLM_JUDGE 选择评分方式
+        - LLM Judge: 使用高质量 prompt 调用 OpenAI/Claude
+        - 规则评分: 使用基于规则的评估器（原有逻辑）
 
         【紧急修复】模板检测：惩罚"安全废话模板"以解决模式坍塌
         """
+        # 【Phase 2+】如果启用 LLM Judge，使用 LLM 评分
+        if config.USE_LLM_JUDGE:
+            return self._evaluate_with_llm_judge(sample, response)
         # 【Plan C增强】模板检测器：识别并重罚逃避回答的模板化输出
         template_phrases = [
             "does not provide sufficient information",
