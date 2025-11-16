@@ -208,8 +208,9 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 2.0               # 【Plan C修复】从0.5→2.0，对抗严重熵塌陷
+    ENTROPY_COEF = 5.0               # 【强化修复】从2.0→5.0，更激进地对抗熵塌陷
                                      # 策略极度尖锐(top-1 prob 0.94~0.999999)，需要更强的熵正则化
+                                     # 现在使用 LLM Judge，可以承受更高的多样性
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -229,16 +230,14 @@ class Config:
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
     
     # 【修改】生成配置：平衡质量与性能
-    MAX_NEW_TOKENS_TRAIN = 128     # 【修复】从96提升到128，减少截断
-    MAX_NEW_TOKENS_EVAL = 128      # 评测同步提升
-    MIN_NEW_TOKENS_TRAIN = 5       # 【紧急修复】从30降到5，解决过度EOS抑制导致的模式坍塌
-                                   # 问题：MIN=30强制所有回答≥30 tokens → 强迫模板化输出 → 熵塌陷
-                                   # 修复：降到5允许短回答，让同一prompt的K个候选产生差异 → 恢复梯度信号
+    MAX_NEW_TOKENS_TRAIN = 192     # 【熵塌陷修复】从128→192，给模型更多空间，减少截断压力
+    MAX_NEW_TOKENS_EVAL = 192      # 评测同步提升
+    MIN_NEW_TOKENS_TRAIN = 10      # 【熵塌陷修复】从5→10，防止过短回答，鼓励推理
+                                   # 平衡点：不能太高（30会导致模板化），也不能太低（5缺乏推理）
 
-    TEMPERATURE_TRAIN = 1.0        # 【Option A配合修复】从1.15降到1.0：配合细粒度reasoning评分，不需要过高温度
-                                   # 理由：(1)细粒度评分可以区分reasoning质量差异，不依赖文本多样性
-                                   #      (2)降低temperature减少截断率(25-75%→10-30%)
-                                   #      (3)稳定熵值(0.38-3.0剧烈波动→0.8-2.0稳定)
+    TEMPERATURE_TRAIN = 1.15       # 【熵塌陷修复】从1.0→1.15，提高多样性
+                                   # 配合 LLM Judge V2，可以容忍更高的温度
+                                   # 目标：增加候选多样性，让 LLM Judge 有差异可评
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
@@ -249,10 +248,10 @@ class Config:
     
     # 【移除】LENGTH_PENALTY_TRAIN（只对beam search有效，采样模式下无效）
     
-    # 【修改】截断率监控（128硬约束下的期望）
-    TRUNC_FRAC_THRESHOLD = 0.05    # 目标：≤5%（因为上限已经是128）
-    TRUNC_FRAC_WARNING = 0.20      # 警告阈值：>20%说明配置有问题
-    MAX_NEW_TOKENS_INCREMENT = 0   # 【禁用】不再自动增大（已到硬约束上限）
+    # 【修改】截断率监控（192上限下的期望）
+    TRUNC_FRAC_THRESHOLD = 0.10    # 目标：≤10%（192 tokens 应该足够大多数回答）
+    TRUNC_FRAC_WARNING = 0.30      # 警告阈值：>30%说明配置有问题
+    MAX_NEW_TOKENS_INCREMENT = 0   # 【禁用】不再自动增大（192已经很大）
 
     # PPO / KL（统一控制）
     PPO_CLIP_EPS = 0.1
@@ -260,7 +259,7 @@ class Config:
     ADV_CLIP = 5.0
     
     # 【修改】统一KL控制（老师Q13建议）
-    KL_BETA_INIT = 0.025            # 初始统一beta
+    KL_BETA_INIT = 0.01             # 【熵塌陷修复】从0.025→0.01，降低KL惩罚，允许更多探索
     KL_ADAPTIVE_CONTROL = True      # 是否启用KL自适应控制
     KL_ADAPTIVE_WINDOW = 20         # 自适应控制窗口大小
     KL_TARGET_MIN = 0.05            # KL目标下界
