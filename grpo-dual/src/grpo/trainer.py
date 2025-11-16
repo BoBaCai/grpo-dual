@@ -2040,10 +2040,28 @@ class MultiCloudJudge:
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
         # Import prompt templates based on version
-        # 动态添加judges目录到路径
+        # 动态添加judges目录到路径（支持Jupyter notebook环境）
         import sys
         from pathlib import Path
-        judges_dir = Path(__file__).parent.parent / "judges"
+
+        # 尝试多种路径以支持不同运行环境
+        try:
+            # 方法1: 使用 __file__ (适用于直接运行脚本)
+            judges_dir = Path(__file__).parent.parent / "judges"
+        except NameError:
+            # 方法2: 使用当前工作目录 (适用于Jupyter notebook)
+            # 假设结构: workspace/src/grpo/trainer.py 和 workspace/src/judges/
+            cwd = Path.cwd()
+            # 尝试 workspace/src/judges
+            if (cwd / "src" / "judges").exists():
+                judges_dir = cwd / "src" / "judges"
+            # 尝试 workspace/judges (用户可能直接上传judges文件夹)
+            elif (cwd / "judges").exists():
+                judges_dir = cwd / "judges"
+            else:
+                # 默认假设在workspace根目录
+                judges_dir = cwd / "src" / "judges"
+
         if str(judges_dir) not in sys.path:
             sys.path.insert(0, str(judges_dir))
 
