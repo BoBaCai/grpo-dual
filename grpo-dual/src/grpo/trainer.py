@@ -2040,38 +2040,79 @@ class MultiCloudJudge:
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
         # Import prompt templates based on version
-        # 动态添加judges目录到路径（支持Jupyter notebook环境）
+        # 支持从 GitHub 自动下载（Jupyter notebook 友好）
         import sys
         from pathlib import Path
+        import urllib.request
+        import tempfile
 
-        # 尝试多种路径以支持不同运行环境
+        # GitHub 配置
+        GITHUB_RAW_URL = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ/grpo-dual/src/judges/llm_judge_prompts_v2.py"
+
+        def download_from_github(url, cache_dir):
+            """从 GitHub 下载模块文件"""
+            cache_path = Path(cache_dir)
+            cache_path.mkdir(parents=True, exist_ok=True)
+            local_file = cache_path / "llm_judge_prompts_v2.py"
+
+            # 如果缓存存在且不为空，直接使用
+            if local_file.exists() and local_file.stat().st_size > 0:
+                print(f"[LLM Judge] 使用缓存文件: {local_file}")
+                return cache_path
+
+            # 下载文件
+            try:
+                print(f"[LLM Judge] 从 GitHub 下载: {url}")
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    content = response.read()
+                    with open(local_file, 'wb') as f:
+                        f.write(content)
+                print(f"[LLM Judge] 下载成功: {local_file} ({len(content)} bytes)")
+                return cache_path
+            except Exception as e:
+                print(f"[LLM Judge] GitHub 下载失败: {e}")
+                return None
+
+        # 尝试多种方式导入
+        judges_dir = None
+
         try:
             # 方法1: 使用 __file__ (适用于直接运行脚本)
             judges_dir = Path(__file__).parent.parent / "judges"
+            if not (judges_dir / "llm_judge_prompts_v2.py").exists():
+                judges_dir = None
         except NameError:
-            # 方法2: 使用当前工作目录 (适用于Jupyter notebook)
-            cwd = Path.cwd()
+            pass
 
-            # 按优先级尝试多个路径，直接检查文件是否存在
+        if judges_dir is None:
+            # 方法2: 本地文件系统搜索 (适用于 Jupyter notebook)
+            cwd = Path.cwd()
             possible_paths = [
-                cwd,                      # workspace/ (文件直接在根目录)
+                cwd,                      # workspace/
                 cwd / "judges",           # workspace/judges/
                 cwd / "src" / "judges",   # workspace/src/judges/
             ]
 
-            judges_dir = None
             for path in possible_paths:
                 if (path / "llm_judge_prompts_v2.py").exists():
                     judges_dir = path
-                    print(f"[LLM Judge] 找到 llm_judge_prompts_v2.py 在: {path}")
+                    print(f"[LLM Judge] 找到本地文件: {path}/llm_judge_prompts_v2.py")
                     break
 
-            # 如果都找不到，默认使用当前目录
-            if judges_dir is None:
-                judges_dir = cwd
-                print(f"[LLM Judge] 未找到 llm_judge_prompts_v2.py，使用默认路径: {cwd}")
+        if judges_dir is None:
+            # 方法3: 从 GitHub 下载
+            print("[LLM Judge] 本地未找到，尝试从 GitHub 下载...")
+            cache_dir = Path(tempfile.gettempdir()) / "grpo_llm_judge_cache"
+            judges_dir = download_from_github(GITHUB_RAW_URL, cache_dir)
 
-        # 确保路径在 sys.path 最前面（优先级最高）
+            if judges_dir is None:
+                raise RuntimeError(
+                    "无法加载 llm_judge_prompts_v2.py！\n"
+                    "请手动上传文件到 workspace/ 或检查网络连接。\n"
+                    f"GitHub URL: {GITHUB_RAW_URL}"
+                )
+
+        # 确保路径在 sys.path 最前面
         judges_dir_str = str(judges_dir)
         if judges_dir_str in sys.path:
             sys.path.remove(judges_dir_str)
