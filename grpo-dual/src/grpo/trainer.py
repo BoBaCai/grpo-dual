@@ -3963,11 +3963,11 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         t_tok0 = _t.time()
         full_tok, comp_mask = _tokenize_concat(tokenizer, all_prompts, all_resps, all_lengths, device)
         
-        # 【修改】检查gen_len越界（硬约束128）
+        # 【修改】检查gen_len越界（使用配置的硬约束）
         gen_lengths = comp_mask.sum(dim=1).cpu().numpy()
         max_gen_len = gen_lengths.max()
-        if max_gen_len > 128:  # 硬约束
-            print(f"\n⚠️ [步骤{step+1}] 检测到gen_len超过硬约束: max={max_gen_len} > 128")
+        if max_gen_len > config.MAX_NEW_TOKENS_TRAIN:  # 使用配置值
+            print(f"\n⚠️ [步骤{step+1}] 检测到gen_len超过配置上限: max={max_gen_len} > {config.MAX_NEW_TOKENS_TRAIN}")
             print("  这表明comp_mask统计口径错误（包含了prompt或padding），需修正代码！")
             print(f"  all_lengths (response实际长度)范围: [{min(all_lengths)}, {max(all_lengths)}]")
             print(f"  gen_lengths (comp_mask统计)范围: [{gen_lengths.min()}, {gen_lengths.max()}]")
@@ -4377,13 +4377,37 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         # §7: KL自适应调整（每N步触发一次）
         if (step + 1) % config.KL_ADAPTIVE_WINDOW == 0:
             kl_controller.auto_adjust(step + 1)
-        
-        # 【修改】截断率监控与告警（不再自动调整，因为已到硬约束上限）
+
+        # 【诊断】每个 step 打印前 3 个样本，看模型输出什么
+        if step < 5:  # 只在前5个steps打印，避免刷屏
+            print(f"\n{'='*80}")
+            print(f"📝 [样本诊断 Step {step+1}] 前3个生成样本内容：")
+            print(f"{'='*80}")
+            for idx in range(min(3, len(all_resps))):
+                task = "Fairness" if task_mask_f[idx] else "Hallucination"
+                resp_text = all_resps[idx]
+                resp_len = all_lengths[idx]
+                is_trunc = all_truncated[idx]
+                trunc_mark = " 🔴截断" if is_trunc else " ✅完整"
+
+                print(f"\n样本 #{idx} ({task}){trunc_mark}:")
+                print(f"  Token长度: {resp_len}")
+                print(f"  Prompt (前100字符):")
+                print(f"    {all_prompts[idx][:100]}...")
+                print(f"  Response 完整内容:")
+                # 按行打印，每行缩进
+                for line in resp_text.split('\n'):
+                    print(f"    {line}")
+                if len(resp_text) > 500:
+                    print(f"    ... (共 {len(resp_text)} 字符)")
+            print(f"{'='*80}\n")
+
+        # 【修改】截断率监控与告警
         if trunc_f > config.TRUNC_FRAC_WARNING or trunc_h > config.TRUNC_FRAC_WARNING:
             print(f"\n⚠️ [步骤{step+1}] 截断率过高(F:{trunc_f:.1%}, H:{trunc_h:.1%})")
-            print(f"  当前max_new_tokens={current_max_new_tokens_train}（已达硬约束上限128）")
+            print(f"  当前max_new_tokens={current_max_new_tokens_train}（配置上限={config.MAX_NEW_TOKENS_TRAIN}）")
             print(f"  建议：(1)降低temperature={config.TEMPERATURE_TRAIN} (2)增大rep_penalty={config.REP_PENALTY_TRAIN}")
-            print(f"       (3)增大presence_penalty={config.PRESENCE_PENALTY} (4)或接受10-20%的截断率")
+            print(f"       (3)增大presence_penalty={config.PRESENCE_PENALTY} (4)优化prompt要求简洁")
 
             # 【诊断】打印被截断样本示例
             print(f"\n📋 [截断样本诊断] 查看被截断的回答内容：")
