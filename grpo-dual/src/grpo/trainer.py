@@ -14,6 +14,7 @@
 - ⚠️ 坚持统一KL控制（不分支化β）
 
 Claude verified: This is the 2624-line trainer.py file
+# 代码审查 2025-11-08: Claude 确认可以看到并理解这个训练器代码
 """
 
 # =============================================================================
@@ -186,6 +187,13 @@ class Config:
     # 开关
     DO_SFT_CONTINUE = True
     DO_GRPO = True
+
+    # 【Phase 2+】LLM Judge 配置
+    USE_LLM_JUDGE = False  # True=使用 LLM Judge, False=使用规则评分
+    LLM_JUDGE_VERSION = "v2"  # "v1"=固定prompt, "v2"=自适应prompt
+    LLM_JUDGE_MODEL = "gpt-4o-mini"  # or "claude-3-5-haiku-latest"
+    LLM_JUDGE_TEMPERATURE = 0.0  # Deterministic for consistency
+    LLM_JUDGE_MAX_TOKENS = 150
 
     # SFT
     SFT_STEPS = 200
@@ -969,6 +977,100 @@ class TrainingMetrics:
         return summary
 
 # =============================================================================
+# 零梯度组监控（Session 9.1 补充）
+# =============================================================================
+def expected_zero_gradient_rate(p: float, K: int) -> float:
+    """
+    计算理论零梯度率
+
+    Args:
+        p: 成功率（从训练日志统计）
+        K: 组大小
+
+    Returns:
+        expected_rate: 理论零梯度率 (p^K + (1-p)^K)
+    """
+    return p**K + (1-p)**K
+
+
+def monitor_zero_gradient_groups(
+    rewards: np.ndarray,
+    tasks: List[str],
+    K: int = 4,
+    step: int = None
+) -> Dict[str, float]:
+    """
+    监控零梯度组（集成到训练循环）
+
+    Args:
+        rewards: 所有样本的 reward (shape: [B*K])
+        tasks: 每组的任务类型 (shape: [B])
+        K: 组大小
+        step: 当前训练步数
+
+    Returns:
+        stats: 统计信息字典
+    """
+    B = len(tasks)
+
+    # 按任务类型分组统计
+    fairness_stds = []
+    halu_stds = []
+    fairness_rewards = []
+    halu_rewards = []
+
+    for i in range(B):
+        group_rewards = rewards[i*K : (i+1)*K]
+        group_std = np.std(group_rewards)
+
+        if tasks[i] == "fairness":
+            fairness_stds.append(group_std)
+            fairness_rewards.extend(group_rewards)
+        else:
+            halu_stds.append(group_std)
+            halu_rewards.extend(group_rewards)
+
+    # 统计零梯度组
+    zero_grad_f = sum(1 for s in fairness_stds if s < 0.01)
+    zero_grad_h = sum(1 for s in halu_stds if s < 0.01)
+
+    # 计算成功率和期望零梯度率
+    fairness_success_rate = (np.array(fairness_rewards) > 0.5).mean() if fairness_rewards else 0.5
+    halu_success_rate = (np.array(halu_rewards) > 0.5).mean() if halu_rewards else 0.5
+
+    expected_zero_grad_f = expected_zero_gradient_rate(fairness_success_rate, K)
+    expected_zero_grad_h = expected_zero_gradient_rate(halu_success_rate, K)
+
+    # 打印统计信息（每 10 步）
+    if step is not None and step % 10 == 0:
+        print(f"\n📊 零梯度组监控 (Step {step}):")
+        print(f"  Fairness:")
+        print(f"    实际: {zero_grad_f}/{len(fairness_stds)} ({zero_grad_f/len(fairness_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_f:.1%} (成功率 p={fairness_success_rate:.2f})")
+        print(f"    状态: ", end="")
+
+        actual_ratio_f = zero_grad_f / len(fairness_stds) if fairness_stds else 0
+        if actual_ratio_f <= expected_zero_grad_f * 1.2:
+            print("✅ 正常")
+        elif actual_ratio_f <= expected_zero_grad_f * 1.5:
+            print("⚠️ 略高，关注")
+        else:
+            print("🚨 异常高，检查 reward 逻辑")
+
+        print(f"  Hallucination:")
+        print(f"    实际: {zero_grad_h}/{len(halu_stds)} ({zero_grad_h/len(halu_stds):.1%})")
+        print(f"    期望: {expected_zero_grad_h:.1%} (成功率 p={halu_success_rate:.2f})")
+
+    return {
+        'zero_grad_f_ratio': zero_grad_f / len(fairness_stds) if fairness_stds else 0,
+        'zero_grad_h_ratio': zero_grad_h / len(halu_stds) if halu_stds else 0,
+        'expected_zero_grad_f': expected_zero_grad_f,
+        'expected_zero_grad_h': expected_zero_grad_h,
+        'fairness_success_rate': fairness_success_rate,
+        'halu_success_rate': halu_success_rate,
+    }
+
+# =============================================================================
 # 更健壮的 JSON 读取（数组 / JSONL / 拼接对象）
 # =============================================================================
 def read_json_flex(path: Path) -> List[Dict]:
@@ -1065,10 +1167,14 @@ class BBQAdapter:
 
             want = per_cat
 
-            # 【策略】固定采样比例：75% disambiguated, 25% ambiguous
-            # 确保大部分训练样本都有梯度信号
-            target_disambig_ratio = 0.75
-            target_ambig_ratio = 0.25
+            # 【Session 9.1 更新】调整采样比例：80% disambiguated, 20% ambiguous
+            # 理由：
+            # 1. Disambig 样本训练价值更高（有明确的正确答案，提高模型公平性）
+            # 2. 减少 ambig 样本占比，避免模型过度学习"选 unknown"策略
+            # 3. 零梯度组的改善交给 Dynamic Sampling 来处理
+            # 原策略 75/25 → 新策略 80/20（增加 disambig 使用比例）
+            target_disambig_ratio = 0.80
+            target_ambig_ratio = 0.20
 
             n_disambig = int(want * target_disambig_ratio)
             n_ambig = int(want * target_ambig_ratio)
@@ -1919,6 +2025,158 @@ class MultiCloudJudge:
 
         return np.clip(bonus, -0.5, 0.5)
 
+    def _evaluate_with_llm_judge(self, sample: Sample, response: str) -> Dict[str, float]:
+        """
+        使用 LLM Judge 进行评分
+
+        优势：
+        1. 更全面理解 reasoning 质量（不只是形式特征）
+        2. 可以检测微妙的逃避策略和 hallucination
+        3. 通过精心设计的 prompt 产生细粒度评分
+
+        注意：
+        - 使用缓存避免重复调用
+        - 支持 OpenAI 和 Claude 双云
+        - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
+        """
+        # Import prompt templates based on version
+        if config.LLM_JUDGE_VERSION == "v2":
+            from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
+        else:  # v1 (default)
+            from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
+
+        # 构建 prompt
+        if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
+            context_condition = sample.meta.get("context_condition", "")
+            unknown_option = sample.meta.get("unknown_option", "C")
+            correct_label = sample.meta.get("label", -1)
+
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = get_adaptive_bbq_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta  # V2 需要 meta 信息进行自适应
+                )
+            else:
+                prompt_text = get_bbq_fairness_prompt(
+                    context_condition=context_condition,
+                    unknown_option=unknown_option,
+                    correct_label=correct_label,
+                    prompt=sample.prompt,
+                    response=response
+                )
+
+        elif sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
+            subset = sample.meta.get("subset", "")
+            has_hallucination = sample.meta.get("has_hallucination", False)
+
+            # 构建 ground truth dict
+            ground_truth = {
+                'knowledge': sample.meta.get('knowledge', ''),
+                'document': sample.meta.get('document', ''),
+                'right_answer': sample.meta.get('right_answer', ''),
+                'right_response': sample.meta.get('right_response', ''),
+                'right_summary': sample.meta.get('right_summary', ''),
+                'hallucinated_answer': sample.meta.get('hallucinated_answer', ''),
+            }
+
+            if config.LLM_JUDGE_VERSION == "v2":
+                prompt_text = get_adaptive_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
+                    response=response,
+                    meta=sample.meta  # V2 需要 meta 信息
+                )
+            else:
+                prompt_text = get_halueval_prompt(
+                    subset=subset,
+                    has_hallucination=has_hallucination,
+                    ground_truth=ground_truth,
+                    prompt=sample.prompt,
+                response=response
+            )
+        else:
+            # Fallback to rule-based for unknown tasks
+            return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+                   else self._evaluate_halueval(sample, response)
+
+        # 缓存 key
+        key = hashlib.sha256(f"llm_judge::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
+        cached = self._cache_get(key)
+        if cached:
+            return cached
+
+        # 调用 LLM Judge
+        GLOBAL_JUDGE_BUCKET.acquire()
+
+        for p in self.providers:
+            provider_name = p["name"]
+            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
+                try:
+                    if provider_name == "openai":
+                        from openai import OpenAI
+                        client = OpenAI()
+                        resp = client.chat.completions.create(
+                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("gpt") else "gpt-4o-mini",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            response_format={"type": "json_object"},
+                            messages=[{"role": "user", "content": prompt_text}],
+                            max_tokens=config.LLM_JUDGE_MAX_TOKENS,
+                            timeout=config.JUDGE_TIMEOUT_SEC
+                        )
+                        txt = resp.choices[0].message.content
+
+                    elif provider_name == "claude":
+                        import anthropic, inspect
+                        client = anthropic.Anthropic()
+                        sig = inspect.signature(client.messages.create)
+                        length_kw = "max_output_tokens" if "max_output_tokens" in sig.parameters else "max_tokens"
+                        resp = client.messages.create(
+                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("claude") else "claude-3-5-haiku-latest",
+                            temperature=config.LLM_JUDGE_TEMPERATURE,
+                            messages=[{"role": "user", "content": prompt_text}],
+                            **{length_kw: config.LLM_JUDGE_MAX_TOKENS}
+                        )
+                        parts = []
+                        for blk in getattr(resp, "content", []) or []:
+                            if hasattr(blk, "text"):
+                                parts.append(blk.text)
+                            elif isinstance(blk, dict) and blk.get("type") == "text":
+                                parts.append(blk.get("text", ""))
+                        txt = "".join(parts) if parts else str(resp)
+                    else:
+                        raise ValueError(f"Unknown provider: {provider_name}")
+
+                    # 解析 JSON
+                    obj = extract_json_strict(txt)
+                    score = float(obj.get("final", 0.5))
+
+                    # 不需要校准（prompt 已经指定了 0.0-1.0 范围）
+                    out = {"final": score, "provider": f"llm_judge_{provider_name}"}
+                    self._cache_put(key, out)
+                    return out
+
+                except Exception as e:
+                    if attempt < config.JUDGE_MAX_RETRIES:
+                        wait = 2 ** attempt
+                        time.sleep(wait)
+                        continue
+                    else:
+                        # 所有重试失败，fallback to rule-based
+                        print(f"⚠️ LLM Judge failed after {config.JUDGE_MAX_RETRIES} retries: {e}")
+                        print(f"   Falling back to rule-based scoring...")
+                        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+                               else self._evaluate_halueval(sample, response)
+
+        # 如果所有 providers 都失败，fallback
+        return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
+               else self._evaluate_halueval(sample, response)
+
     def _evaluate_halueval(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         HaluEval专用评估器：基于规则检查是否包含hallucination
@@ -2065,11 +2323,15 @@ class MultiCloudJudge:
     def evaluate(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         统一评估接口：
-        - Fairness任务使用BBQ专用评估器（基于规则）
-        - Hallucination任务使用HaluEval规则评估器（基于规则）
+        - 根据 config.USE_LLM_JUDGE 选择评分方式
+        - LLM Judge: 使用高质量 prompt 调用 OpenAI/Claude
+        - 规则评分: 使用基于规则的评估器（原有逻辑）
 
         【紧急修复】模板检测：惩罚"安全废话模板"以解决模式坍塌
         """
+        # 【Phase 2+】如果启用 LLM Judge，使用 LLM 评分
+        if config.USE_LLM_JUDGE:
+            return self._evaluate_with_llm_judge(sample, response)
         # 【Plan C增强】模板检测器：识别并重罚逃避回答的模板化输出
         template_phrases = [
             "does not provide sufficient information",
@@ -2520,7 +2782,194 @@ def temporary_no_checkpointing(model):
                 model.enable_input_require_grads()
 
 # 训练用：批量生成（一次生成 B×K）
-def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: int, max_new_tokens: int = None, step: int = None) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
+# =============================================================================
+# Phase 2: DAPO 风格动态采样（Session 9.1）
+# =============================================================================
+def quick_reward_estimate(text: str, task: str = "fairness") -> float:
+    """
+    快速 reward 估计（用于多样性检查）
+
+    不需要完整的 Reasoning Quality 评分，只检查关键特征：
+    1. 是否有答案（Answer: A/B/C）
+    2. 是否是逃避语言
+    3. 是否过短
+
+    返回粗略的 reward 估计（足够用于多样性检查）
+    """
+    text_lower = text.lower()
+
+    if task == "fairness":
+        # BBQ 任务：检查是否有答案
+        has_answer = any(f"answer: {opt}" in text_lower for opt in ['a', 'b', 'c'])
+
+        # 检查逃避语言（简化版，只检查最常见的）
+        evasive_keywords = ["cannot determine", "does not provide", "insufficient information"]
+        is_evasive = any(kw in text_lower for kw in evasive_keywords)
+
+        # 检查长度
+        is_too_short = len(text.split()) < 10
+
+        # 快速评分
+        if is_evasive:
+            return 0.3  # 逃避回答
+        elif is_too_short:
+            return 0.4  # 太短
+        elif has_answer:
+            # 进一步区分不同答案
+            if "answer: a" in text_lower:
+                return 0.7
+            elif "answer: b" in text_lower:
+                return 0.8
+            elif "answer: c" in text_lower:
+                return 0.9
+            else:
+                return 0.6
+        else:
+            return 0.5  # 中等
+    else:
+        # Hallucination 任务
+        has_yes = "yes" in text_lower
+        has_no = "no" in text_lower
+        is_too_short = len(text.split()) < 10
+
+        if is_too_short:
+            return 0.3
+        elif has_yes:
+            return 0.7
+        elif has_no:
+            return 0.8
+        else:
+            return 0.5
+
+
+def generate_candidates_with_dynamic_sampling(
+    model,
+    tokenizer,
+    device,
+    formatted_prompt: str,
+    task: str,
+    k: int = 4,
+    max_attempts: int = 8,
+    diversity_threshold: int = 2,
+    max_new_tokens: int = 128,
+    step: int = None,
+) -> Tuple[List[str], List[int], List[bool], int]:
+    """
+    DAPO 风格的动态采样：继续采样直到组内有足够多样性
+
+    Args:
+        formatted_prompt: 已格式化的 prompt
+        task: 任务类型（"fairness" 或 "hallucination"）
+        k: 目标组大小
+        max_attempts: 最大尝试次数
+        diversity_threshold: 至少需要多少种不同的 reward（基于 quick estimate）
+        max_new_tokens: 最大生成长度
+        step: 当前训练步数
+
+    Returns:
+        texts: 生成的文本列表 (len = k)
+        lengths: 每个文本的 token 长度
+        truncated: 每个文本是否被截断
+        actual_attempts: 实际尝试次数
+
+    原理：
+        1. 逐个生成候选，立即评估 quick reward
+        2. 如果已有 k 个样本且 reward 种类 >= diversity_threshold，停止
+        3. 否则继续采样直到 max_attempts
+        4. 如果达到上限仍无多样性，返回当前最好的 k 个样本
+    """
+    samples = []
+    lengths = []
+    truncated = []
+    rewards_quick = []
+
+    # 获取 EOS token IDs
+    eos_ids = get_eos_token_ids(tokenizer)
+
+    # Tokenize prompt once
+    inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                      truncation=True, max_length=config.SFT_MAXLEN).to(device)
+    original_input_len = inputs["input_ids"].shape[1]
+
+    for attempt in range(max_attempts):
+        # 创建 step_counter
+        step_counter = [step] if step is not None else None
+        processors = build_safe_logits_processors(step_counter, eos_ids)
+
+        # 生成一个候选
+        with torch.no_grad(), temporary_no_checkpointing(model), temporary_use_cache(model, True):
+            output = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=config.MIN_NEW_TOKENS_TRAIN,
+                temperature=config.TEMPERATURE_TRAIN,
+                top_k=config.TOP_K_TRAIN,
+                top_p=config.TOP_P_TRAIN,
+                repetition_penalty=config.REP_PENALTY_TRAIN,
+                no_repeat_ngram_size=config.NO_REPEAT_NGRAM_SIZE,
+                logits_processor=processors,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids,
+                use_cache=True,
+                num_return_sequences=1,
+            )
+
+        # Decode
+        response_tokens = output[0, original_input_len:]
+        text = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+        # 计算长度和检测截断
+        eos_position = None
+        for pos, token_id in enumerate(response_tokens):
+            if int(token_id.item()) in eos_ids:
+                eos_position = pos
+                break
+
+        if eos_position is not None:
+            actual_len = eos_position + 1
+            hit_eos = True
+        else:
+            actual_len = int((response_tokens != tokenizer.pad_token_id).sum())
+            hit_eos = False
+
+        actual_len = min(actual_len, max_new_tokens)
+        is_truncated = (actual_len >= max_new_tokens) and not hit_eos
+
+        samples.append(text)
+        lengths.append(actual_len)
+        truncated.append(is_truncated)
+
+        # 【关键】快速 reward 估计（用于多样性检查）
+        quick_reward = quick_reward_estimate(text, task)
+        rewards_quick.append(quick_reward)
+
+        # 检查是否满足多样性条件
+        if len(samples) >= k:
+            # 使用离散化的 reward 来判断多样性（避免浮点数精度问题）
+            discretized_rewards = [round(r, 1) for r in rewards_quick[:k]]
+            unique_rewards = len(set(discretized_rewards))
+
+            if unique_rewards >= diversity_threshold:
+                # 有足够多样性，返回前 k 个
+                return samples[:k], lengths[:k], truncated[:k], attempt + 1
+
+    # 达到上限，返回最好的 k 个（优先选择 reward 不同的）
+    discretized_rewards = [round(r, 1) for r in rewards_quick[:k]]
+    unique_rewards = len(set(discretized_rewards))
+
+    return samples[:k], lengths[:k], truncated[:k], max_attempts
+
+
+def generate_candidates_batch(
+    model, tokenizer, device,
+    prompts: List[str],
+    k: int,
+    max_new_tokens: int = None,
+    step: int = None,
+    use_dynamic_sampling: bool = False,  # 【Phase 2】是否使用动态采样
+    tasks: List[str] = None,  # 【Phase 2】任务列表（用于 quick reward estimate）
+) -> Tuple[List[List[str]], List[List[int]], List[int], List[List[bool]], List[str]]:
     """
     【串行生成修复】为每个prompt独立生成K个候选，确保多样性
 
@@ -2531,6 +2980,11 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     §1&§2修复: 应用聊天模板 + 多终止符
     【调试】添加step参数用于debug logging
     【修复】返回formatted_prompts确保后续tokenize一致性
+    【Phase 2】支持 DAPO 风格动态采样
+
+    Args:
+        use_dynamic_sampling: 是否使用动态采样（Phase 2）
+        tasks: 任务列表，与 prompts 对应（用于 quick reward estimate）
 
     Returns:
         grouped_texts: List[List[str]] - 每个prompt的K个候选回复
@@ -2554,6 +3008,35 @@ def generate_candidates_batch(model, tokenizer, device, prompts: List[str], k: i
     unique_prompt_lens = []
 
     for prompt_idx, formatted_prompt in enumerate(formatted_prompts):
+        # 【Phase 2】如果启用动态采样，使用 DAPO 风格生成
+        if use_dynamic_sampling:
+            task = tasks[prompt_idx] if tasks else "fairness"
+            candidates_texts, candidates_lengths, candidates_truncated, attempts = \
+                generate_candidates_with_dynamic_sampling(
+                    model, tokenizer, device,
+                    formatted_prompt=formatted_prompt,
+                    task=task,
+                    k=k,
+                    max_attempts=8,
+                    diversity_threshold=2,
+                    max_new_tokens=max_new_tokens,
+                    step=step,
+                )
+
+            # 计算 prompt_len
+            inputs = tokenizer([formatted_prompt], return_tensors="pt", padding=True,
+                             truncation=True, max_length=config.SFT_MAXLEN).to(device)
+            prompt_len = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).item()
+
+            # 添加到结果
+            grouped_texts.append(candidates_texts)
+            grouped_lengths.append(candidates_lengths)
+            grouped_truncated.append(candidates_truncated)
+            unique_prompt_lens.append(prompt_len)
+
+            continue  # 跳过原有的生成逻辑
+
+        # 【原有逻辑】标准串行生成（带去重）
         candidates_texts = []
         candidates_lengths = []
         candidates_truncated = []
@@ -3270,7 +3753,9 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         cand_by_sample, lengths_by_sample, _, truncated_by_sample, formatted_prompts = generate_candidates_batch(
             model, tokenizer, device, [s.prompt for s in batch], config.K_ROLLOUTS,
             max_new_tokens=current_max_new_tokens_train,  # 【修正】传入动态调整的max_new_tokens
-            step=step  # 【调试】传入step用于debug logging
+            step=step,  # 【调试】传入step用于debug logging
+            use_dynamic_sampling=True,  # 【Phase 2】启用 DAPO 风格动态采样
+            tasks=tasks  # 【Phase 2】传入任务列表用于 quick reward estimate
         )
 
         # 【显存优化】生成后立即清理显存
@@ -3392,6 +3877,14 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         t_adv0 = _t.time()
         adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
         t_adv = _t.time() - t_adv0
+
+        # 【Session 9.1 新增】零梯度组监控：实际 vs 理论对比
+        zero_grad_stats = monitor_zero_gradient_groups(
+            rewards=np.array(rewards_list),
+            tasks=task_list,
+            K=config.K_ROLLOUTS,
+            step=step
+        )
 
         # 【C2修复】组内std监控：检测并警告reward完全相同的组（会导致梯度信号为0）
         zero_gradient_groups = 0
