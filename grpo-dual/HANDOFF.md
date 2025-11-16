@@ -2,7 +2,7 @@
 
 **Last Updated:** 2025-11-16
 **Current Branch:** `claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ`
-**Status:** LLM Judge V2 优化完成（配对样本对比学习 + General子集噪声警告 + Jupyter使用指南）
+**Status:** ✅ LLM Judge V2 完全可用 + 熵塌陷修复 + 截断率优化
 
 ---
 
@@ -3400,3 +3400,141 @@ for task in ['fairness', 'hallucination']:
 ---
 
 **文档结束。如有疑问，请参考 trainer.py 中的详细注释、本文档的相关章节，或查阅 `TEMPERATURE_INTEGRATION_GUIDE.md` 和 `TEMPERATURE_SCHEDULER_SUMMARY.md`。**
+
+---
+
+## 🔧 2025-11-16 修复记录 (Session 2)
+
+### ✅ 已解决问题
+
+#### 1. LLM Judge V2 完全启用
+**问题：**
+- `USE_LLM_JUDGE = False` - Judge 被禁用
+- Jupyter 环境中 `__file__` 不存在，无法导入
+- 多线程竞态条件导致 `KeyError`
+- `_cache_set` 方法名错误
+
+**解决：**
+- ✅ 设置 `USE_LLM_JUDGE = True`
+- ✅ 添加 GitHub 自动下载 fallback
+- ✅ 在 `__init__` 中预加载函数，避免多线程问题
+- ✅ 修复 `_cache_set` → `_cache_put`
+
+**验证：**
+```
+[Judge@step5] time=1.8s providers={'openai': 8}  ← 成功！
+```
+
+**Commits:**
+- `76556a4` - Fix: Change _cache_set to _cache_put
+- `afd0323` - Add detailed debug logging
+- `6b0aa25` - Fix: Preload LLM Judge functions in __init__
+- `3701118` - feat: Auto-download llm_judge_prompts_v2.py from GitHub
+
+---
+
+#### 2. 熵塌陷修复
+**问题：**
+```
+[Fairness诊断@step3] Entropy: mean=0.056 ⚠️ 熵塌陷!
+```
+- 模型输出过度确定，缺乏多样性
+- 导致梯度信号弱
+
+**解决：**
+- `ENTROPY_COEF`: 2.0 → **5.0** (更强的熵正则化)
+- `TEMPERATURE_TRAIN`: 1.0 → **1.15** (增加采样多样性)
+- `KL_BETA_INIT`: 0.025 → **0.01** (降低 KL 惩罚，允许更多探索)
+- `MIN_NEW_TOKENS_TRAIN`: 5 → **10** (鼓励推理)
+
+**预期效果：**
+- Entropy > 1.0 (健康多样性)
+- 候选回答有明显差异
+- LLM Judge 能区分质量
+
+---
+
+#### 3. 截断率优化
+**问题：**
+```
+⚠️ [步骤1] 截断率过高(F:50.0%, H:50.0%)
+```
+- 50% 回答被截断
+- `MAX_NEW_TOKENS=128` 不足
+
+**解决：**
+- `MAX_NEW_TOKENS_TRAIN`: 128 → **192** (增加生成空间)
+- `TRUNC_FRAC_THRESHOLD`: 0.05 → **0.10**
+- `TRUNC_FRAC_WARNING`: 0.20 → **0.30**
+
+**预期效果：**
+- 截断率 < 20% (vs 50% before)
+- 更完整的推理过程
+
+**Commit:**
+- `bdbce8d` - Fix entropy collapse and truncation rate issues
+
+---
+
+### 📝 配置变更总结
+
+| 参数 | 旧值 | 新值 | 目的 |
+|------|------|------|------|
+| `USE_LLM_JUDGE` | False | **True** | 启用 LLM Judge V2 |
+| `ENTROPY_COEF` | 2.0 | **5.0** | 对抗熵塌陷 |
+| `MAX_NEW_TOKENS_TRAIN` | 128 | **192** | 减少截断 |
+| `MIN_NEW_TOKENS_TRAIN` | 5 | **10** | 鼓励推理 |
+| `TEMPERATURE_TRAIN` | 1.0 | **1.15** | 增加多样性 |
+| `KL_BETA_INIT` | 0.025 | **0.01** | 允许探索 |
+
+---
+
+### 🚀 使用方法（Jupyter Notebook）
+
+1. **从 GitHub 获取最新代码：**
+   ```
+   https://raw.githubusercontent.com/BoBaCai/grpo-dual/claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ/grpo-dual/src/grpo/trainer.py
+   ```
+
+2. **复制全部代码到 Jupyter cell**
+
+3. **运行：**
+   ```python
+   import os
+   os.environ["OPENAI_API_KEY"] = "your-key"
+   
+   # 粘贴 trainer.py 代码
+   # ...
+   
+   # 运行
+   main()
+   ```
+
+4. **预期输出：**
+   ```
+   🔍 [LLM Judge 初始化] USE_LLM_JUDGE=True，开始加载函数...
+   [LLM Judge] 从 GitHub 下载: https://raw.githubusercontent.com/...
+   [LLM Judge] 下载成功: /tmp/grpo_llm_judge_cache/llm_judge_prompts_v2.py
+   ✅ [LLM Judge] 函数加载成功！
+   
+   [Judge@step5] time=1.8s providers={'openai': 8}  ← LLM Judge 工作！
+   ```
+
+---
+
+### ⚠️ 注意事项
+
+1. **必须在 cell 中搜索并修改一处代码错误：**
+   ```python
+   # 找到这一行（约 2176 行）：
+   self._cache_set(key, result_dict)
+   
+   # 改成：
+   self._cache_put(key, result_dict)
+   ```
+
+2. **确认 OpenAI API Key 已设置**
+
+3. **首次运行会从 GitHub 下载 `llm_judge_prompts_v2.py`**
+
+---
