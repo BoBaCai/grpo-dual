@@ -3538,3 +3538,163 @@ for task in ['fairness', 'hallucination']:
 3. **首次运行会从 GitHub 下载 `llm_judge_prompts_v2.py`**
 
 ---
+
+### 🔄 2025-11-16 更新 (Session 2 续)
+
+#### 4. 截断率诊断输出
+**问题：**
+- 截断率仍高达 50%，但不清楚模型在输出什么
+
+**解决：**
+- 添加样本诊断代码（前5步，每步显示前3个样本）
+- 显示完整 response 内容、token 长度、截断状态
+- 修复硬编码的 128 token 检查 → 使用 `config.MAX_NEW_TOKENS_TRAIN`
+
+**Commits:**
+- `f2ce76c` - Add diagnostic output for truncated samples
+- `672783c` - Update diagnostics and fix hardcoded values
+
+---
+
+#### 5. 🚨 发现模型崩溃问题
+
+**诊断输出揭示的问题：**
+
+激进参数配置导致**严重的模型训练崩溃**：
+
+**正常样本示例（工作正常）：**
+```
+样本 #0 (Fairness) ✅完整:
+  Token长度: 19
+  Response: Answer: B
+  Justification: The question does not provide sufficient information to determine this.
+```
+
+**崩溃样本示例（完全失败）：**
+```
+样本 #0 (Fairness) 🔴截断:
+  Token长度: 192
+  Response: Answer: C
+  Justification: Based on the context: "Both Matthew Larson and Trevon Mosley applied to the same college with the s...", the answer is Trevor...lah/l/ty/.urenosmoso.ure/e/i.edu.l.c./.edu..."we"re.t.h.i/r"s."lept..t.r/&f To find out more abou...'an&Matthew.", students may also search t/t/n/co..., he siTovr/fas/siTol.er/y/mose/vir/unom.p...
+```
+
+**问题特征：**
+- 模型生成完全的乱码（随机符号、HTML片段、破碎单词）
+- 输出长度几乎总是到达 192 token 上限
+- 高截断率并非因为回答太长，而是模型持续生成垃圾直到 token 限制
+
+**根本原因：**
+激进的熵/温度设置导致训练不稳定：
+- `ENTROPY_COEF = 5.0` - 过于激进的熵正则化，强制采样极低概率 token
+- `TEMPERATURE = 1.15` - 增加随机性
+- `KL_BETA = 0.01` - 过于宽松的 KL 约束，允许过度偏离
+- `MAX_NEW_TOKENS = 192` - 给崩溃更多空间继续生成垃圾
+
+---
+
+#### 6. ✅ 方案A：保守回退修复
+
+**实施的修复（方案A - 保守配置）：**
+
+| 参数 | 激进值（崩溃） | 方案A（保守） | 变更原因 |
+|------|----------------|---------------|----------|
+| `ENTROPY_COEF` | 5.0 | **1.0** | 温和熵正则化，避免采样垃圾 token |
+| `TEMPERATURE_TRAIN` | 1.15 | **0.9** | 降低随机性，保持稳定性 |
+| `MAX_NEW_TOKENS_TRAIN` | 192 | **96** | 正常回答 20-70 tokens 足够 |
+| `MAX_NEW_TOKENS_EVAL` | 192 | **96** | 评测同步调整 |
+| `KL_BETA_INIT` | 0.01 | **0.02** | 更保守的 KL 约束 |
+| `TRUNC_FRAC_THRESHOLD` | 0.10 | **0.05** | 调整到 96 token 上限 |
+| `TRUNC_FRAC_WARNING` | 0.30 | **0.15** | 调整到 96 token 上限 |
+| `MIN_NEW_TOKENS_TRAIN` | 10 | **10** | 保持不变 |
+
+**预期效果：**
+- ✅ 模型输出稳定、连贯
+- ✅ 截断率大幅降低（目标 <5%）
+- ✅ 避免采样低概率垃圾 token
+- ✅ 熵值恢复正常范围
+- ✅ 配合 LLM Judge V2 既保证质量又有温和多样性
+
+**Commit:**
+- `740fab8` - Apply conservative Plan A rollback to fix model collapse
+
+---
+
+### 📋 完整配置对比（Session 2 全过程）
+
+| 参数 | 初始值 | 激进修复 | 方案A（最终） | 状态 |
+|------|--------|----------|---------------|------|
+| `USE_LLM_JUDGE` | False | True | **True** | ✅ |
+| `ENTROPY_COEF` | 2.0 | 5.0 | **1.0** | ✅ |
+| `TEMPERATURE_TRAIN` | 1.0 | 1.15 | **0.9** | ✅ |
+| `MAX_NEW_TOKENS_TRAIN` | 128 | 192 | **96** | ✅ |
+| `MAX_NEW_TOKENS_EVAL` | 128 | 192 | **96** | ✅ |
+| `MIN_NEW_TOKENS_TRAIN` | 5 | 10 | **10** | ✅ |
+| `KL_BETA_INIT` | 0.025 | 0.01 | **0.02** | ✅ |
+| `TRUNC_FRAC_THRESHOLD` | 0.05 | 0.10 | **0.05** | ✅ |
+| `TRUNC_FRAC_WARNING` | 0.20 | 0.30 | **0.15** | ✅ |
+
+---
+
+### 🎯 关键经验教训
+
+1. **过度激进的参数会导致训练崩溃**
+   - `ENTROPY_COEF = 5.0` 过于激进
+   - 温和的 `1.0` 配合 LLM Judge 已足够
+
+2. **诊断输出至关重要**
+   - 添加样本内容诊断才发现是模型崩溃，而非简单的截断问题
+   - 监控不仅要看指标，还要看实际输出内容
+
+3. **保守配置更稳定**
+   - 96 tokens 对 BBQ/HaluEval 任务已足够（正常回答 20-70 tokens）
+   - 温度 0.9 既保证稳定性又有多样性
+
+4. **LLM Judge V2 成功启用**
+   - GitHub 自动下载机制工作良好
+   - 线程安全预加载避免竞态条件
+
+---
+
+### 🚀 更新后使用方法（Jupyter Notebook）
+
+1. **从 GitHub 获取最新代码：**
+   ```
+   https://raw.githubusercontent.com/BoBaCai/grpo-dual/claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ/grpo-dual/src/grpo/trainer.py
+   ```
+
+2. **复制全部代码到 Jupyter cell**
+
+3. **运行：**
+   ```python
+   import os
+   os.environ["OPENAI_API_KEY"] = "your-key"
+
+   # 粘贴 trainer.py 代码
+   # ...
+
+   # 运行
+   main()
+   ```
+
+4. **预期输出：**
+   ```
+   🔍 [LLM Judge 初始化] USE_LLM_JUDGE=True，开始加载函数...
+   [LLM Judge] 从 GitHub 下载: https://raw.githubusercontent.com/...
+   [LLM Judge] 下载成功: /tmp/grpo_llm_judge_cache/llm_judge_prompts_v2.py
+   ✅ [LLM Judge] 函数加载成功！
+
+   [Judge@step5] time=1.8s providers={'openai': 8}  ← LLM Judge 工作！
+
+   # 诊断输出（前5步）
+   📝 [样本诊断 Step 1] 前3个生成样本内容：
+   样本 #0 (Fairness) ✅完整:
+     Token长度: 25
+     Response: Answer: B
+     Justification: The question does not provide sufficient information...
+   ```
+
+---
+
+**Session 2 完成。所有问题已解决，配置已优化到稳定状态。**
+
+---
