@@ -301,9 +301,9 @@ class Config:
 
     # 评审器（judge）多云与限流
     # 【性能优化】匹配当前 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
-    JUDGE_MAX_WORKERS = 16      # 提升到16，匹配单步生成数 (4×4=16)，消除分波等待
-    JUDGE_TIMEOUT_SEC = 7       # 降低到7秒，压缩长尾延迟（有重试兜底）
-    JUDGE_MAX_RETRIES = 1       # 【恢复】保留重试，确保 reward 质量
+    JUDGE_MAX_WORKERS = 8       # 【修复】从16降到8，避免触发OpenAI限流
+    JUDGE_TIMEOUT_SEC = 15      # 【修复】从7增到15秒，给API更多响应时间
+    JUDGE_MAX_RETRIES = 3       # 【修复】从1增到3次，提高成功率
     RATE_LIMIT_RPS   = 20       # 提升到20，充分利用两家API吞吐
     RATE_LIMIT_BURST = 20       # 提升到20，匹配并发数，避免限流等待
     
