@@ -1,45 +1,37 @@
 # LLM Judge V2 快速使用指南
 
-## 📝 在 Jupyter Notebook 中使用
+## 📝 在 Jupyter Notebook 中使用（最简单方式）
 
-### 1. 环境准备（在第一个 cell 运行）
+### 1. 上传文件到 workspace
+
+把 `llm_judge_prompts_v2.py` 上传到你的 Jupyter workspace 文件夹
+
+### 2. 环境准备（在第一个 cell 运行）
 
 ```python
 import os
 import sys
 from pathlib import Path
 
-# 添加路径
-project_root = Path.cwd().parent  # 假设在 grpo-dual/notebooks/ 目录
-sys.path.insert(0, str(project_root / "src" / "judges"))
-sys.path.insert(0, str(project_root / "src" / "grpo"))
+# ✅ 直接从当前目录导入
+sys.path.insert(0, str(Path.cwd()))
 
-# ⚠️ 必须设置 OpenAI API Key
-os.environ["OPENAI_API_KEY"] = "sk-your-api-key-here"
+# 设置 OpenAI API Key
+os.environ["OPENAI_API_KEY"] = "sk-your-key"
 ```
 
 ---
 
-### 2. 导入模块（第二个 cell）
+### 3. 导入并定义评分函数（第二个 cell）
 
 ```python
-from llm_judge_prompts_v2 import (
-    get_adaptive_bbq_prompt,
-    get_adaptive_halueval_prompt
-)
+from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
 from openai import OpenAI
 import json
 
 client = OpenAI()
-```
 
----
-
-### 3. 定义评分函数（第三个 cell）
-
-```python
 def judge_score(judge_prompt):
-    """调用 OpenAI 评分"""
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.0,
