@@ -1515,6 +1515,12 @@ class MultiCloudJudge:
                 raise ValueError("Gemini provider is not supported in this version")
         # 【调试】用于打印template_detector触发样本
         self.debug_step = 0
+        # 【新增】缓存 LLM Judge prompt 函数（避免重复导入）
+        self._llm_judge_funcs_cached = False
+        self._get_adaptive_bbq_prompt = None
+        self._get_adaptive_halueval_prompt = None
+        self._get_bbq_fairness_prompt = None
+        self._get_halueval_prompt = None
 
     # --- 缓存表 ---
     def _setup_cache(self):
@@ -2039,99 +2045,119 @@ class MultiCloudJudge:
         - 支持 OpenAI 和 Claude 双云
         - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
         """
-        # Import prompt templates based on version
-        # 支持从 GitHub 自动下载（Jupyter notebook 友好）
-        import sys
-        from pathlib import Path
-        import urllib.request
-        import tempfile
+        # 只在第一次调用时导入（避免重复导入）
+        if not self._llm_judge_funcs_cached:
+            import sys
+            from pathlib import Path
+            import urllib.request
+            import tempfile
 
-        # GitHub 配置
-        GITHUB_RAW_URL = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ/grpo-dual/src/judges/llm_judge_prompts_v2.py"
+            # GitHub 配置
+            GITHUB_RAW_URL = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ/grpo-dual/src/judges/llm_judge_prompts_v2.py"
 
-        def download_from_github(url, cache_dir):
-            """从 GitHub 下载模块文件"""
-            cache_path = Path(cache_dir)
-            cache_path.mkdir(parents=True, exist_ok=True)
-            local_file = cache_path / "llm_judge_prompts_v2.py"
+            def download_from_github(url, cache_dir):
+                """从 GitHub 下载模块文件"""
+                cache_path = Path(cache_dir)
+                cache_path.mkdir(parents=True, exist_ok=True)
+                local_file = cache_path / "llm_judge_prompts_v2.py"
 
-            # 如果缓存存在且不为空，直接使用
-            if local_file.exists() and local_file.stat().st_size > 0:
-                print(f"[LLM Judge] 使用缓存文件: {local_file}")
-                return cache_path
+                # 如果缓存存在且不为空，直接使用
+                if local_file.exists() and local_file.stat().st_size > 0:
+                    print(f"[LLM Judge] 使用缓存文件: {local_file}")
+                    return cache_path
 
-            # 下载文件
+                # 下载文件
+                try:
+                    print(f"[LLM Judge] 从 GitHub 下载: {url}")
+                    with urllib.request.urlopen(url, timeout=10) as response:
+                        content = response.read()
+                        with open(local_file, 'wb') as f:
+                            f.write(content)
+                    print(f"[LLM Judge] 下载成功: {local_file} ({len(content)} bytes)")
+                    return cache_path
+                except Exception as e:
+                    print(f"[LLM Judge] GitHub 下载失败: {e}")
+                    return None
+
+            # 尝试多种方式导入
+            judges_dir = None
+
             try:
-                print(f"[LLM Judge] 从 GitHub 下载: {url}")
-                with urllib.request.urlopen(url, timeout=10) as response:
-                    content = response.read()
-                    with open(local_file, 'wb') as f:
-                        f.write(content)
-                print(f"[LLM Judge] 下载成功: {local_file} ({len(content)} bytes)")
-                return cache_path
-            except Exception as e:
-                print(f"[LLM Judge] GitHub 下载失败: {e}")
-                return None
-
-        # 尝试多种方式导入
-        judges_dir = None
-
-        try:
-            # 方法1: 使用 __file__ (适用于直接运行脚本)
-            judges_dir = Path(__file__).parent.parent / "judges"
-            if not (judges_dir / "llm_judge_prompts_v2.py").exists():
-                judges_dir = None
-        except NameError:
-            pass
-
-        if judges_dir is None:
-            # 方法2: 本地文件系统搜索 (适用于 Jupyter notebook)
-            cwd = Path.cwd()
-            possible_paths = [
-                cwd,                      # workspace/
-                cwd / "judges",           # workspace/judges/
-                cwd / "src" / "judges",   # workspace/src/judges/
-            ]
-
-            for path in possible_paths:
-                if (path / "llm_judge_prompts_v2.py").exists():
-                    judges_dir = path
-                    print(f"[LLM Judge] 找到本地文件: {path}/llm_judge_prompts_v2.py")
-                    break
-
-        if judges_dir is None:
-            # 方法3: 从 GitHub 下载
-            print("[LLM Judge] 本地未找到，尝试从 GitHub 下载...")
-            cache_dir = Path(tempfile.gettempdir()) / "grpo_llm_judge_cache"
-            judges_dir = download_from_github(GITHUB_RAW_URL, cache_dir)
+                # 方法1: 使用 __file__ (适用于直接运行脚本)
+                judges_dir = Path(__file__).parent.parent / "judges"
+                if not (judges_dir / "llm_judge_prompts_v2.py").exists():
+                    judges_dir = None
+            except NameError:
+                pass
 
             if judges_dir is None:
-                raise RuntimeError(
-                    "无法加载 llm_judge_prompts_v2.py！\n"
-                    "请手动上传文件到 workspace/ 或检查网络连接。\n"
-                    f"GitHub URL: {GITHUB_RAW_URL}"
-                )
+                # 方法2: 本地文件系统搜索 (适用于 Jupyter notebook)
+                cwd = Path.cwd()
+                possible_paths = [
+                    cwd,                      # workspace/
+                    cwd / "judges",           # workspace/judges/
+                    cwd / "src" / "judges",   # workspace/src/judges/
+                ]
 
-        # 确保路径在 sys.path 最前面
-        judges_dir_str = str(judges_dir)
-        if judges_dir_str in sys.path:
-            sys.path.remove(judges_dir_str)
-        sys.path.insert(0, judges_dir_str)
-        print(f"[LLM Judge] 已添加到 sys.path[0]: {judges_dir_str}")
+                for path in possible_paths:
+                    if (path / "llm_judge_prompts_v2.py").exists():
+                        judges_dir = path
+                        print(f"[LLM Judge] 找到本地文件: {path}/llm_judge_prompts_v2.py")
+                        break
 
-        if config.LLM_JUDGE_VERSION == "v2":
-            from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
-        else:  # v1 (default)
-            from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
+            if judges_dir is None:
+                # 方法3: 从 GitHub 下载
+                print("[LLM Judge] 本地未找到，尝试从 GitHub 下载...")
+                cache_dir = Path(tempfile.gettempdir()) / "grpo_llm_judge_cache"
+                judges_dir = download_from_github(GITHUB_RAW_URL, cache_dir)
 
-        # 构建 prompt
+                if judges_dir is None:
+                    raise RuntimeError(
+                        "无法加载 llm_judge_prompts_v2.py！\n"
+                        "请手动上传文件到 workspace/ 或检查网络连接。\n"
+                        f"GitHub URL: {GITHUB_RAW_URL}"
+                    )
+
+            # 确保路径在 sys.path 最前面
+            judges_dir_str = str(judges_dir)
+            if judges_dir_str in sys.path:
+                sys.path.remove(judges_dir_str)
+            sys.path.insert(0, judges_dir_str)
+            print(f"[LLM Judge] 已添加到 sys.path[0]: {judges_dir_str}")
+
+            # 清除模块缓存，确保导入最新版本
+            if 'llm_judge_prompts_v2' in sys.modules:
+                del sys.modules['llm_judge_prompts_v2']
+            if 'llm_judge_prompts' in sys.modules:
+                del sys.modules['llm_judge_prompts']
+
+            # 验证文件存在并导入
+            if config.LLM_JUDGE_VERSION == "v2":
+                verify_file = Path(judges_dir_str) / "llm_judge_prompts_v2.py"
+                if not verify_file.exists():
+                    raise RuntimeError(f"文件不存在: {verify_file}")
+                print(f"[LLM Judge] 验证文件: {verify_file} ({verify_file.stat().st_size} bytes)")
+
+                from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
+                self._get_adaptive_bbq_prompt = get_adaptive_bbq_prompt
+                self._get_adaptive_halueval_prompt = get_adaptive_halueval_prompt
+                print(f"[LLM Judge] ✅ 成功导入 V2 函数")
+            else:  # v1 (default)
+                from llm_judge_prompts import get_bbq_fairness_prompt, get_halueval_prompt
+                self._get_bbq_fairness_prompt = get_bbq_fairness_prompt
+                self._get_halueval_prompt = get_halueval_prompt
+
+            # 标记已缓存
+            self._llm_judge_funcs_cached = True
+
+        # 构建 prompt（使用缓存的函数）
         if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
             context_condition = sample.meta.get("context_condition", "")
             unknown_option = sample.meta.get("unknown_option", "C")
             correct_label = sample.meta.get("label", -1)
 
             if config.LLM_JUDGE_VERSION == "v2":
-                prompt_text = get_adaptive_bbq_prompt(
+                prompt_text = self._get_adaptive_bbq_prompt(
                     context_condition=context_condition,
                     unknown_option=unknown_option,
                     correct_label=correct_label,
@@ -2140,7 +2166,7 @@ class MultiCloudJudge:
                     meta=sample.meta  # V2 需要 meta 信息进行自适应
                 )
             else:
-                prompt_text = get_bbq_fairness_prompt(
+                prompt_text = self._get_bbq_fairness_prompt(
                     context_condition=context_condition,
                     unknown_option=unknown_option,
                     correct_label=correct_label,
@@ -2163,7 +2189,7 @@ class MultiCloudJudge:
             }
 
             if config.LLM_JUDGE_VERSION == "v2":
-                prompt_text = get_adaptive_halueval_prompt(
+                prompt_text = self._get_adaptive_halueval_prompt(
                     subset=subset,
                     has_hallucination=has_hallucination,
                     ground_truth=ground_truth,
@@ -2172,7 +2198,7 @@ class MultiCloudJudge:
                     meta=sample.meta  # V2 需要 meta 信息
                 )
             else:
-                prompt_text = get_halueval_prompt(
+                prompt_text = self._get_halueval_prompt(
                     subset=subset,
                     has_hallucination=has_hallucination,
                     ground_truth=ground_truth,
