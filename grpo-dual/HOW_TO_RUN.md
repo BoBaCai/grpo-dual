@@ -132,43 +132,35 @@ from llm_judge_prompts_v2 import get_adaptive_bbq_prompt
 
 ---
 
-## 📊 方式 3：在 Jupyter Notebook 中使用
+## 📊 方式 3：在 Jupyter Notebook 中使用（最简单）
 
-### **3.1 准备环境（Cell 1）**
+### **3.1 上传文件到 workspace**
+
+把 `llm_judge_prompts_v2.py` 上传到你的 Jupyter workspace 文件夹
+
+### **3.2 准备环境（Cell 1）**
 
 ```python
 import os
 import sys
 from pathlib import Path
 
-# 方式 A：本地项目
-project_root = Path.cwd().parent  # 假设在 grpo-dual/notebooks/
-sys.path.insert(0, str(project_root / "src" / "judges"))
-sys.path.insert(0, str(project_root / "src" / "grpo"))
-
-# 方式 B：从 GitHub 下载
-# import urllib.request
-# url = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/main/src/judges/llm_judge_prompts_v2.py"
-# urllib.request.urlretrieve(url, "llm_judge_prompts_v2.py")
-# sys.path.insert(0, str(Path.cwd()))
+# ✅ 直接从当前目录导入
+sys.path.insert(0, str(Path.cwd()))
 
 # 设置 API Key
 os.environ["OPENAI_API_KEY"] = "sk-your-key"
 ```
 
-### **3.2 导入并使用（Cell 2）**
+### **3.3 导入并使用（Cell 2）**
 
 ```python
-from llm_judge_prompts_v2 import (
-    get_adaptive_bbq_prompt,
-    get_adaptive_halueval_prompt
-)
+from llm_judge_prompts_v2 import get_adaptive_bbq_prompt, get_adaptive_halueval_prompt
 from openai import OpenAI
 import json
 
 client = OpenAI()
 
-# 测试评分
 def judge_score(judge_prompt):
     response = client.chat.completions.create(
         model="gpt-4o-mini",
