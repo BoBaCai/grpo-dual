@@ -1,8 +1,8 @@
 # GRPO Multi-Objective Training - Handoff Document
 
-**Last Updated:** 2025-11-08
-**Current Branch:** `claude/open-trainer-py-011CUp9RqkPbRBQPMVzBRuJ3`
-**Status:** 关键工程问题修复完成（串行生成 + Advantage计算 + 熵奖励 + KL约束 + 模板检测增强）
+**Last Updated:** 2025-11-16
+**Current Branch:** `claude/check-code-visibility-01SkC6KeLSK4GxQha56AihwJ`
+**Status:** LLM Judge V2 优化完成（配对样本对比学习 + General子集噪声警告 + Jupyter使用指南）
 
 ---
 
@@ -66,25 +66,30 @@ if val[1]=="unknown":
 
 #### HaluEval数据集（部分问题 ⚠️）
 
-**问题2.1: General子集噪声严重**
+**问题2.1: General子集噪声严重** ⚠️ 部分缓解 (2025-11-16)
 - "幻觉"概念混用：事实错误、不完整回答、能力声明、格式问题全混在一起
 - 815个yes标注中，约13个hallucination_spans为空
 - 约200+个涉及"As an AI language model..."被标为幻觉
-- **影响：** reward信号互相矛盾，模型倾向保守模板
+- ~~**影响：** reward信号互相矛盾，模型倾向保守模板~~
 
-**问题2.2: 配对样本未充分利用**
+**缓解措施：**
+- ✅ 使用 general 子集时会打印警告（见 Commit d7c5e60 修改2）
+- ✅ Judge Prompt 中提示标注可能不可靠
+- ⚠️ 建议：降低权重（weight=0.3）或完全过滤该子集
+
+**问题2.2: 配对样本未充分利用** ✅ 已解决 (2025-11-16)
 - qa/dialogue子集有 `right_answer` 和 `hallucinated_answer`
-- 当前只用了 `right_answer` 做SFT/target
-- 未做对比学习（positive vs negative）
-- **影响：** 模型只知道"正确"，不知道"幻觉"长什么样
+- ~~当前只用了 `right_answer` 做SFT/target~~ → ✅ 现已在 Judge Prompt 中使用
+- ~~未做对比学习（positive vs negative）~~ → ✅ 现已实现对比学习
+- ~~**影响：** 模型只知道"正确"，不知道"幻觉"长什么样~~ → ✅ 已修复
+
+**修复方案：** 见 Commit d7c5e60 的修改1
 
 **代码位置：**
 ```
-grpo-dual/src/grpo/trainer.py
-  - Line 1163-1276: HaluEvalAdapter.load_samples()
-  - Line 1220: 只用right_answer（待改进）
-  - Line 1234: 只用right_response（待改进）
-  - Line 1255-1274: general子集处理（可能需要过滤）
+grpo-dual/src/judges/llm_judge_prompts_v2.py
+  - Line 371-417: 增强的 Ground Truth 构建（含配对样本对比）
+  - Line 428: 幻觉惩罚强化（Resembles hallucinated example: 0%）
 ```
 
 ---
@@ -241,6 +246,117 @@ test_improved_judge.py（验证脚本）
 ---
 
 ## ✅ 已完成的修复
+
+### Commit: d7c5e60 "Optimize LLM Judge V2 and add Jupyter notebook usage guide" (2025-11-16) ⭐ 最新
+
+**解决问题2.2：配对样本未充分利用**
+
+**修改1: 充分利用 HaluEval 的 hallucinated_answer 进行对比学习**
+
+```python
+# src/judges/llm_judge_prompts_v2.py:371-417
+# 增强 Ground Truth 信息构建
+
+# QA 子集：现在包含正确答案和幻觉答案对比
+if subset == "qa":
+    gt_info = f"""
+**Ground Truth**:
+- Knowledge Base: {knowledge[:300]}...
+- ✅ CORRECT Answer: {right_ans}
+- ❌ HALLUCINATED Answer (AVOID): {halluc_ans}
+  → Why it's wrong: Contradicts or lacks support from the knowledge base
+
+**CRITICAL**: Compare the model response against BOTH examples above.
+- Does it match the correct answer? (Good)
+- Does it resemble the hallucinated answer? (Bad - penalize heavily)
+"""
+
+# 评分标准中增加严格惩罚
+3. **Hallucination Detection**:
+   - Resembles the hallucinated example above: 0% (严重扣分)
+```
+
+**效果：**
+- ✅ Judge 现在能识别模型响应是否接近幻觉样本
+- ✅ 提供对比学习信号：正确 vs 幻觉的具体差异
+- ✅ 更精细的评分：不只是"对/错"，还包括"接近幻觉"的程度
+
+---
+
+**修改2: General 子集噪声警告**
+
+```python
+# src/judges/llm_judge_prompts_v2.py:360-369
+else:  # general (⚠️ WARNING: 数据集标注噪声严重，评分可能不可靠)
+    focus = "ability to identify when information is insufficient"
+    # 降低 general 子集的评分可信度
+    print(f"⚠️ WARNING: General subset has noisy labels. Recommend using weight=0.3 or filtering.")
+
+# Judge Prompt 中也添加提示
+⚠️ NOTE: This subset has noisy labels. Focus on obvious hallucinations only.
+```
+
+**效果：**
+- ✅ 开发者使用 general 子集时会收到明确警告
+- ✅ Judge 被告知标注可能不可靠，只关注明显幻觉
+- ✅ 防止因 general 子集噪声导致训练不稳定（问题2.1的缓解）
+
+---
+
+**修改3: 配置只使用 OpenAI 作为 Judge**
+
+```python
+# src/grpo/trainer.py:317-321
+# 只使用 OpenAI 作为 Judge（用户要求）
+JUDGE_PROVIDERS = [
+    {"name": "openai", "model": "gpt-4o-mini"}
+    # {"name": "claude", "model": "claude-3-5-haiku-latest"}  # 已禁用
+]
+```
+
+**效果：**
+- ✅ 简化 Judge 配置，只依赖 OpenAI API
+- ✅ 降低成本（gpt-4o-mini 便宜且快速）
+- ✅ 减少多 provider 之间的一致性问题
+
+---
+
+**修改4: 创建 Jupyter Notebook 使用指南**
+
+新增文件：
+- `notebooks/llm_judge_usage_example.ipynb` - 完整的交互式示例
+- `notebooks/QUICK_START.md` - 快速入门指南
+
+**内容包括：**
+1. 环境准备（3 行代码快速开始）
+2. BBQ 公平性评分示例
+3. HaluEval 幻觉检测示例（含 hallucinated_answer 对比验证）
+4. 批量评分代码
+5. FAQ 和故障排除
+
+**效果：**
+- ✅ 用户可在 Jupyter 中一个 cell 一个 cell 运行测试 Judge
+- ✅ 完整的使用文档，降低学习曲线
+- ✅ 可验证 hallucinated_answer 对比功能是否生效
+
+---
+
+**代码位置：**
+```
+grpo-dual/src/judges/llm_judge_prompts_v2.py
+  - Line 360-369: General 子集噪声警告
+  - Line 371-417: 增强的 Ground Truth 构建（含配对样本对比）
+  - Line 428: 幻觉惩罚强化
+
+grpo-dual/src/grpo/trainer.py
+  - Line 317-321: 只使用 OpenAI Judge 配置
+
+grpo-dual/notebooks/
+  - llm_judge_usage_example.ipynb: 完整示例
+  - QUICK_START.md: 快速入门
+```
+
+---
 
 ### Commit: f140a1c "Fix entropy collapse: reduce MIN_NEW_TOKENS and penalize template responses"
 
