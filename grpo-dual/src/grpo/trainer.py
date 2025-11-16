@@ -189,7 +189,7 @@ class Config:
     DO_GRPO = True
 
     # 【Phase 2+】LLM Judge 配置
-    USE_LLM_JUDGE = False  # True=使用 LLM Judge, False=使用规则评分
+    USE_LLM_JUDGE = True  # True=使用 LLM Judge, False=使用规则评分
     LLM_JUDGE_VERSION = "v2"  # "v1"=固定prompt, "v2"=自适应prompt
     LLM_JUDGE_MODEL = "gpt-4o-mini"  # or "claude-3-5-haiku-latest"
     LLM_JUDGE_TEMPERATURE = 0.0  # Deterministic for consistency
