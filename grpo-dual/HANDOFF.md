@@ -4652,3 +4652,213 @@ Step 6: F std=0.000, H std=0.225 | Signal: F=0.0000, H=4.3316
 **下次运行训练，参考本清单逐项检查！** 🎯
 
 ---
+
+## 🆕 Session 3 (续) - 模板崩溃持续诊断与激进干预
+
+**时间**: 2025-11-17（续）
+**背景**: ENTROPY_COEF=1.5修复后，LLM Judge已100%启用，但模板崩溃仍未解决
+
+---
+
+### 📊 **Step 1-5 训练日志诊断**
+
+#### ✅ **成功：LLM Judge 100%启用**
+```
+[Judge@step1] providers={'openai': 8}
+[Judge@step2] providers={'openai': 8}
+[Judge@step3] providers={'openai': 8}
+[Judge@step4] providers={'openai': 8}
+[Judge@step5] providers={'openai': 8}
+```
+
+**结论**：诊断消息混淆问题已解决，所有评分都使用gpt-4o-mini！
+
+---
+
+#### ❌ **失败1：熵值仍然极低**
+
+| Step | Entropy | 期望值 | 状态 |
+|------|---------|--------|------|
+| 1 | 0.293 | >0.3 | ⚠️ 勉强达标 |
+| 2 | 0.012 | >0.3 | 🚨 严重偏低 |
+| 3 | 0.054 | >0.3 | 🚨 严重偏低 |
+| 4 | 0.147 | >0.3 | 🚨 严重偏低 |
+| 5 | 0.021 | >0.3 | 🚨 严重偏低 |
+| **平均** | **0.105** | **>0.3** | **🚨 失败** |
+
+**当前配置**: ENTROPY_COEF = 1.5
+
+**结论**: 1.5仍然**不足以对抗模板收敛**！
+
+---
+
+#### ❌ **失败2：模板化输出持续**
+
+**Step 5, 样本 #0, #1, #2 - 完全相同**:
+```
+Answer: B
+Justification: The context does not provide sufficient information to determine this.
+```
+- **Token长度**: 19（仍然满足MIN_NEW_TOKENS=15的要求）
+- **所有ambig样本**: 完全相同的模板回答
+
+**当前配置**: MIN_NEW_TOKENS_TRAIN = 15
+
+**结论**: 15太低，无法阻止19-token"万能模板"！
+
+---
+
+#### ❌ **失败3：Fairness信号完全死亡**
+
+```
+Step 5:
+  F mean=0.664, std=0.000, rel=0.000
+```
+
+**零标准差 → 零梯度 → 公平性任务无法学习！**
+
+**根本原因**: 所有ambig样本产生相同模板 → LLM Judge给相同分数 → std=0
+
+---
+
+#### ❌ **失败4：零梯度组比例过高**
+
+```
+Step 5: 零梯度组: 50.0% (4/8 group)
+```
+
+**期望**: <30%
+**实际**: 50%
+
+**结论**: 一半的训练样本没有提供学习信号！
+
+---
+
+### 🔍 **根本原因分析**
+
+#### **模型为什么收敛到模板？**
+
+1. **局部最优解**:
+   - 模型发现：ambig样本（上下文不明确）→ "insufficient information" 模板 → **LLM Judge给高分**
+   - 这是一个**正确且安全的策略**（对ambig样本确实应该说"信息不足"）
+   - 但导致：所有ambig样本完全相同 → 零梯度 → 无法学习
+
+2. **熵惩罚不足**:
+   - ENTROPY_COEF=1.5时，熵损失 = 1.5 * mean_entropy
+   - 但奖励信号太强（mean_F=0.664），足以抵消熵惩罚
+   - 模型选择：**确定性模板（高奖励） > 探索（高熵）**
+
+3. **最小长度约束太弱**:
+   - MIN_NEW_TOKENS=15
+   - 19-token模板轻松满足（19>15）
+   - 无法强制模型提供更多reasoning
+
+4. **温度参数保守**:
+   - TEMPERATURE=0.9相对保守
+   - 配合已收敛的模板策略，采样多样性不足
+
+---
+
+### 💊 **修复方案B：激进熵干预**
+
+**核心思路**：既然模型已收敛到局部最优（模板策略），必须用**强熵正则化 + 严格长度约束**打破平衡。
+
+#### **参数调整**
+
+| 参数 | 当前值 | 新值 | 理由 |
+|------|--------|------|------|
+| `ENTROPY_COEF` | 1.5 | **2.5** | 大幅提升熵惩罚，强制探索 |
+| `MIN_NEW_TOKENS_TRAIN` | 15 | **30** | 杜绝19-token模板，强制详细reasoning |
+| `TEMPERATURE_TRAIN` | 0.9 | **1.0** | 轻微提升采样随机性 |
+
+#### **理论依据**
+
+1. **ENTROPY_COEF=2.5**:
+   - 熵损失权重 = 2.5 * 奖励损失权重
+   - 当mean_entropy<0.3时，熵惩罚足够大，迫使模型探索
+   - 参考：DeepMind AlphaGo使用entropy_coef ∈ [1.5, 3.0]
+
+2. **MIN_NEW_TOKENS=30**:
+   - 当前模板19 tokens，新约束30 tokens
+   - 模型必须输出更长的justification（至少多11 tokens）
+   - 打破"短模板→高分"的捷径
+
+3. **TEMPERATURE=1.0**:
+   - 从0.9提升到1.0
+   - 配合更强熵惩罚，增加采样多样性
+   - 不会像1.15那样导致崩溃（已在Session 2验证）
+
+---
+
+### 📝 **预期效果**
+
+应用修复后，预期在接下来的训练步骤中看到：
+
+1. **熵值回升**: 从~0.1提升到>0.3
+2. **候选多样性**: 不再是4个完全相同的回答
+3. **Fairness信号恢复**: F std从0.000提升到>0.05
+4. **零梯度组下降**: 从50%降到<30%
+5. **更长回答**: 平均token数从19提升到30-50
+
+---
+
+### ⚠️ **风险评估**
+
+**低风险**：
+- ENTROPY_COEF=2.5仍在安全范围（之前5.0才崩溃）
+- TEMPERATURE=1.0已验证不会导致gibberish（Session 2中1.15才有问题）
+- MIN_NEW_TOKENS=30不会导致过长（MAX=96，30-70 tokens是正常范围）
+
+**需监控**：
+- 如果ENTROPY_COEF=2.5导致奖励下降过快 → 回退到2.0
+- 如果MIN_NEW_TOKENS=30导致截断率>15% → 回退到25
+
+---
+
+### ✅ **修复已应用**
+
+**文件**: `grpo-dual/src/grpo/trainer.py`
+
+**更改内容**:
+
+```python
+# Lines 211-214
+ENTROPY_COEF = 2.5               # 从1.5提升到2.5
+
+# Lines 236-238
+MIN_NEW_TOKENS_TRAIN = 30        # 从15提升到30
+
+# Lines 240-242
+TEMPERATURE_TRAIN = 1.0          # 从0.9提升到1.0
+```
+
+**配置对比表**:
+
+| 参数 | Session 3 初始 | Session 3 中期 | Session 3 激进干预 |
+|------|---------------|---------------|-------------------|
+| `ENTROPY_COEF` | 1.0 | 1.5 | **2.5** |
+| `MIN_NEW_TOKENS_TRAIN` | 10 | 15 | **30** |
+| `TEMPERATURE_TRAIN` | 0.9 | 0.9 | **1.0** |
+| `MAX_NEW_TOKENS_TRAIN` | 96 | 96 | 96 |
+| `KL_BETA_INIT` | 0.02 | 0.02 | 0.02 |
+
+**预期在下次训练中看到**:
+- ✅ 熵值从~0.1回升到>0.3
+- ✅ 候选不再完全相同
+- ✅ Fairness信号恢复（F std>0.05）
+- ✅ 零梯度组从50%降到<30%
+- ✅ 平均token数从19提升到30-50
+
+---
+
+### 📋 **完整变更记录（Session 3续）**
+
+#### **Commits**
+
+```bash
+# 待提交
+- Apply aggressive entropy intervention (Plan B): ENTROPY_COEF 1.5→2.5, MIN_NEW_TOKENS 15→30, TEMPERATURE 0.9→1.0
+- Update HANDOFF.md: document template collapse diagnosis and Plan B fixes
+```
+
+---
