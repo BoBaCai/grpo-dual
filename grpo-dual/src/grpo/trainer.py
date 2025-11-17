@@ -204,10 +204,13 @@ class Config:
     # GRPO（显存优化配置）
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 2     # 【显存优化】降到2，Reward-only CAGrad需要4次反传（显存×2）
+    GRPO_BATCH_SIZE = 6     # 【BBQ数据分析修复】从2增到6，确保每步至少2-3个disambig fairness样本
+                            # 原因：BATCH_SIZE=2时每步只有1个fairness，如果是ambig→100%零梯度
+                            # 增到6后：3个fairness样本，即使1个ambig，还有2个disambig提供梯度
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
+    GRADIENT_ACCUMULATION_STEPS = 1  # 【BBQ数据分析修复】从2降到1，因为BATCH_SIZE已从2增到6
+                                     # 有效batch保持=6（vs之前2×2=4），略有增加但可接受
     ENTROPY_COEF = 2.5               # 【激进干预】从1.5提升到2.5，强力对抗模板收敛
                                      # Step 1-5诊断：熵值0.012-0.293（avg=0.105），1.5不足以打破模板局部最优
                                      # 模型收敛到："insufficient information"模板 → LLM Judge高分 → 零梯度
@@ -1168,14 +1171,21 @@ class BBQAdapter:
 
             want = per_cat
 
-            # 【Session 9.1 更新】调整采样比例：80% disambiguated, 20% ambiguous
-            # 理由：
-            # 1. Disambig 样本训练价值更高（有明确的正确答案，提高模型公平性）
-            # 2. 减少 ambig 样本占比，避免模型过度学习"选 unknown"策略
-            # 3. 零梯度组的改善交给 Dynamic Sampling 来处理
-            # 原策略 75/25 → 新策略 80/20（增加 disambig 使用比例）
-            target_disambig_ratio = 0.80
-            target_ambig_ratio = 0.20
+            # 【BBQ数据分析修复】调整采样比例：95% disambiguated, 5% ambiguous
+            #
+            # 【关键发现】通过检查data/bbq/*.jsonl发现：
+            # 1. 所有ambig样本的正确答案都是unknown（只是选项位置随机）
+            # 2. SFT用固定模板训练："Answer: {unk}\nJustification: insufficient information"
+            # 3. GRPO时模型正确地输出相同模板 → 4个候选完全相同 → std=0 → 零梯度
+            # 4. 这是ambig样本的**固有特性**，不是bug
+            #
+            # 【解决方案】大幅减少ambig占比：
+            # - 原策略 80/20 → 新策略 95/5
+            # - Disambig样本有梯度信号（答案多样化）
+            # - 5% ambig保留用于测试模型识别信息不足的能力
+            # - 配合BATCH_SIZE=6，即使有ambig也不会完全零梯度
+            target_disambig_ratio = 0.95
+            target_ambig_ratio = 0.05
 
             n_disambig = int(want * target_disambig_ratio)
             n_ambig = int(want * target_ambig_ratio)
