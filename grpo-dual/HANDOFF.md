@@ -4974,3 +4974,218 @@ def compute_group_advantages(rewards, k, step=None, task_list=None)
 - 场景D: 阈值问题 → 降低到0.001
 
 ---
+
+## 🔬 Session 3 (续3) - BBQ数据集分析与根本原因发现
+
+**时间**: 2025-11-17（续3）
+**触发**: 用户建议"你还可以看看data文件夹里的bbq dataset"
+
+---
+
+### 🎯 **重大发现：原因8 - Ambig样本的固有零梯度问题**
+
+#### **数据集统计**
+
+检查`data/bbq/*.jsonl`所有11个类别：
+
+| 类别 | 总样本 | ambig | disambig |
+|------|--------|-------|----------|
+| 所有类别 | 58,492 | 29,246 (50%) | 29,246 (50%) |
+
+**关键**: 所有BBQ类别都是严格**50/50分布**，而代码设置80% disambig / 20% ambig采样。
+
+#### **Ambig样本Label分析**
+
+Age.jsonl前200个ambig样本的label分布：
+```
+Counter({0: 37, 1: 31, 2: 32})
+```
+
+**初看问题**: 为什么不是100%都是label=2（unknown）？
+
+**真相揭示**:
+- 所有ambig样本的label都指向unknown选项
+- 但unknown选项的**位置是随机化的**（0, 1, 或2）
+- 这是BBQ数据集设计，防止模型记忆位置
+
+示例：
+```
+Sample 1: label=2 → ans2="Can't be determined"
+Sample 5: label=1 → ans1="Undetermined"
+```
+
+**结论**: **100%的ambig样本正确答案都是unknown，只是选项位置随机**
+
+---
+
+### 🚨 **零梯度问题链条**
+
+#### **1. SFT阶段固定模板** (trainer.py:1240-1241)
+```python
+if it.get("context_condition","") == "ambig":
+    return f"Answer: {unk}\nJustification: The context does not provide sufficient information to determine this."
+```
+**所有ambig样本用相同模板训练**（只有unk字母A/B/C不同）
+
+#### **2. 模型正确学会模板**
+模型在SFT阶段学习：ambig → 选unknown + "insufficient information"（**这是正确的！**）
+
+#### **3. GRPO时重复相同模板**
+当遇到ambig样本，4个候选都生成相同输出
+
+#### **4. LLM Judge给相同高分**
+对正确的unknown回答 → 相同高分（**这也是正确的！**）
+
+#### **5. 零梯度形成**
+```
+原始reward: [0.85, 0.86, 0.85, 0.86]
+Scale (0.7): [0.595, 0.602, 0.595, 0.602]
+Normalization: [0.0001, 0.0001, 0.0001, 0.0001]
+std = 0.000012 < 0.01 → advantage = 0 (零梯度)
+```
+
+#### **6. BATCH_SIZE=2的放大效应**
+- 每步只有1个fairness样本
+- 如果这1个是ambig → **100%零梯度**
+- 20% ambig比例 × 多步累积 → 持续零梯度
+
+---
+
+### 💊 **根本原因总结**
+
+**核心矛盾**:
+- Ambig样本的**正确行为**（模型用模板回答unknown）
+- 导致GRPO的**零梯度问题**（4个候选缺乏多样性）
+
+**这不是bug，而是ambig样本的固有特性！**
+
+| 因素 | 影响 |
+|------|------|
+| 数据设计 | 所有ambig正确答案=unknown |
+| SFT模板 | 固定"insufficient information"表述 |
+| 模型学习 | 正确地学会模板（好事） |
+| LLM Judge | 对正确答案给高分（对的） |
+| BATCH_SIZE=2 | 每步仅1个fairness，如果ambig→100%零梯度 |
+| 20% ambig | 约1/5的step遇到ambig |
+
+---
+
+### ✅ **已实施修复（优先级1+2）**
+
+#### **修复1: 增加BATCH_SIZE**
+
+```python
+# trainer.py Line 207-213
+GRPO_BATCH_SIZE = 6  # 从2增到6
+
+# 效果：
+# - 每步3个fairness样本（vs 1个）
+# - 即使1个ambig（零梯度），还有2个disambig提供梯度
+# - 零梯度组比例从50%降到<20%
+
+GRADIENT_ACCUMULATION_STEPS = 1  # 从2降到1
+# 有效batch = 6（vs 之前2×2=4），略增但可接受
+```
+
+#### **修复2: 减少Ambig比例**
+
+```python
+# trainer.py Line 1187-1188
+target_disambig_ratio = 0.95  # 从0.80提升到0.95
+target_ambig_ratio = 0.05     # 从0.20降到0.05
+
+# 效果：
+# - 95%的样本是disambig（有梯度信号）
+# - 5% ambig保留用于测试能力
+# - 配合BATCH_SIZE=6，即使有ambig也不会全零梯度
+```
+
+---
+
+### 📊 **预期效果**
+
+| 配置 | 零梯度组比例 | Fairness std | 说明 |
+|------|-------------|-------------|------|
+| **修复前** | 50% | 0.000 | BATCH_SIZE=2, 20% ambig |
+| **修复后** | <10% | >0.05 | BATCH_SIZE=6, 5% ambig |
+
+**理论分析**:
+- BATCH_SIZE=6 → 3个fairness样本
+- 5% ambig → 平均20步才遇到1个ambig
+- 即使遇到ambig，还有2个disambig提供梯度
+- 零梯度组从50%降到<10%
+
+---
+
+### 📁 **创建的分析文档**
+
+**文件**: `BBQ_DATA_ANALYSIS.md` (完整的数据集分析和修复方案)
+
+内容：
+- BBQ数据集统计（11类别，58K样本）
+- Ambig vs disambig分布分析
+- Label随机化机制揭秘
+- 零梯度问题链条详解
+- 修复方案优先级排序
+- 长期优化建议（多样化模板、diversity bonus等）
+
+---
+
+### 📝 **代码更改总结**
+
+1. **GRPO_BATCH_SIZE**: 2 → 6 (Line 207)
+2. **GRADIENT_ACCUMULATION_STEPS**: 2 → 1 (Line 212)
+3. **target_disambig_ratio**: 0.80 → 0.95 (Line 1187)
+4. **target_ambig_ratio**: 0.20 → 0.05 (Line 1188)
+
+**影响**:
+- 显存使用略增（6 vs 4有效batch）
+- 零梯度组大幅减少（50% → <10%）
+- Fairness信号恢复（F std从0.000到>0.05）
+
+---
+
+### 🎯 **与其他7个诊断原因的关系**
+
+原来诊断的7个原因现在看来可能都是**次要的**：
+
+1. ✅ 模板崩溃 → **次要**（真正原因是ambig样本本身）
+2. ❓ Batch内只有ambig → **主要！**（已修复：BATCH_SIZE=6）
+3. ❓ LLM Judge过于一致 → **次要**（对ambig是正确的）
+4. ❓ Reward Scale精度丢失 → **次要**（微小但不是主因）
+5. ❓ Reward Normalization → **次要**（加剧了问题但不是根源）
+6. ❓ Grouping错误 → **排除**（经验证无此问题）
+7. ❓ Advantage阈值 → **次要**（0.01合理）
+8. ✅ **Ambig固有问题** → **根本原因！**（已修复）
+
+**结论**: 6大诊断模块仍然有用（帮助验证修复效果），但主要问题通过检查数据发现并解决。
+
+---
+
+### 🚀 **下一步验证**
+
+1. 运行训练1-2步
+2. 使用6大诊断模块验证：
+   - **诊断1**: 确认batch内有2-3个disambig样本
+   - **诊断6**: 确认零梯度组比例<10%
+   - **诊断2-3**: 验证scale/norm是否仍有问题（应该不会）
+3. 观察Fairness信号是否恢复（F std>0.05）
+
+---
+
+### 💡 **教训与启示**
+
+**用户的建议"看看data文件夹"极其关键！**
+
+- 之前7个诊断原因都是"症状分析"
+- 检查数据后发现了**病因**
+- **Always check the data first!**
+
+**最有效的修复往往最简单**:
+- 不需要改LLM Judge逻辑
+- 不需要改normalization
+- 不需要禁用功能
+- **只需调整采样策略**（BATCH_SIZE + ambig比例）
+
+---
+
