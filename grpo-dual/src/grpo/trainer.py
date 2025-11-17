@@ -4100,7 +4100,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 print(f"\n[诊断3: Reward Normalization@step{step+1}]")
                 print(f"  Before norm: mean={f_before_norm.mean():.4f}, std={f_before_norm.std():.6f}")
                 print(f"  After norm:  mean={f_after_norm.mean():.4f}, std={f_after_norm.std():.6f}")
-                print(f"  EMA stats: mean={fairness_stats.get('mean', 'N/A'):.4f if isinstance(fairness_stats.get('mean'), (int, float)) else 'N/A'}, "
+                # 修复：正确处理EMA stats的格式化
+                mean_val = fairness_stats.get('mean', None)
+                mean_str = f"{mean_val:.4f}" if isinstance(mean_val, (int, float)) else 'N/A'
+                print(f"  EMA stats: mean={mean_str}, "
                       f"std={np.sqrt(fairness_stats.get('var', 0)):.4f}")
                 print(f"  Values before norm: {f_before_norm.cpu().numpy()}")
                 print(f"  Values after norm:  {f_after_norm.cpu().numpy()}")
