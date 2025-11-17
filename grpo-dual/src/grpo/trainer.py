@@ -4012,7 +4012,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         t_judge = _t.time() - t_judge0
 
         # 打印评审耗时与 provider 分布（定位用）
-        if (step + 1) % 5 == 0:
+        # 【诊断增强】前10步每步打印，之后每5步打印
+        if step < 10 or (step + 1) % 5 == 0:
             print(f"\n[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
 
         # 【优先级2：长度惩罚】对Fairness极短回答进行惩罚，防止熵塌陷导致的1-token生成
