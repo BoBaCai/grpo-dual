@@ -208,9 +208,10 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 1.5               # 【模板崩溃修复】从1.0提升到1.5，对抗模板化输出
-                                     # 发现问题：Step 5所有回答完全相同，熵值0.017（极端确定）
-                                     # 需要更强的熵正则化鼓励探索，避免万能模板策略
+    ENTROPY_COEF = 2.5               # 【激进干预】从1.5提升到2.5，强力对抗模板收敛
+                                     # Step 1-5诊断：熵值0.012-0.293（avg=0.105），1.5不足以打破模板局部最优
+                                     # 模型收敛到："insufficient information"模板 → LLM Judge高分 → 零梯度
+                                     # 需要更强的熵正则化（2.5x奖励权重）迫使模型探索
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -232,12 +233,13 @@ class Config:
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
-    MIN_NEW_TOKENS_TRAIN = 15      # 【模板崩溃修复】从10提升到15，强制更长reasoning
-                                   # Step 5发现19-token模板："insufficient information"
-                                   # 提高最小长度要求，迫使模型提供更多justification
+    MIN_NEW_TOKENS_TRAIN = 30      # 【激进干预】从15提升到30，杜绝19-token模板
+                                   # Step 1-5诊断：所有候选完全相同的19-token模板
+                                   # 30-token约束迫使模型必须提供更详细justification，无法走捷径
 
-    TEMPERATURE_TRAIN = 0.9        # 【保守方案A】从1.15回退到0.9，降低随机性避免崩溃
-                                   # 温和的温度配合LLM Judge既保证质量又有一定多样性
+    TEMPERATURE_TRAIN = 1.0        # 【激进干预】从0.9提升到1.0，增加采样多样性
+                                   # 配合ENTROPY_COEF=2.5和MIN_NEW_TOKENS=30，打破模板收敛
+                                   # 1.0不会像1.15那样导致崩溃（Session 2已验证）
     TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
     TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
