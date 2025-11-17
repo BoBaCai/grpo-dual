@@ -4862,3 +4862,115 @@ TEMPERATURE_TRAIN = 1.0          # 从0.9提升到1.0
 ```
 
 ---
+
+## 🔬 Session 3 (续2) - Fairness信号为0的全面诊断
+
+**时间**: 2025-11-17（续2）
+**触发**: 用户指出："会不会是别的原因导致的fairness信号为0？多方面原因都思考一下然后各个方面一起解决"
+
+---
+
+### 🎯 **核心洞察**
+
+之前仅聚焦于"模板崩溃"单一原因，但Fairness信号为0可能是**多因素共同作用**：
+
+1. ✅ 模板崩溃（已修复ENTROPY_COEF=2.5）
+2. ❓ Batch内只有ambig样本
+3. ❓ LLM Judge对ambig模板打分过于一致
+4. ❓ Reward Scale导致精度丢失
+5. ❓ Reward Normalization抹平差异
+6. ❓ Grouping逻辑错误
+7. ❓ Advantage计算阈值问题
+
+**策略**: 分阶段 - 先**全面诊断**找出真正root cause，再**针对性修复**
+
+---
+
+### 📋 **已添加的6大诊断模块**
+
+#### **诊断1: Batch Composition** (trainer.py:3972-3980)
+检查每个batch中fairness样本的context_condition分布
+
+#### **诊断2: Reward Scale** (trainer.py:4047-4063)
+检查FAIRNESS_REWARD_SCALE=0.7是否导致精度丢失
+
+#### **诊断3: Reward Normalization** (trainer.py:4069-4082)
+检查EMA z-score normalization是否抹平reward差异
+
+#### **诊断4: LLM Judge详细评分** (trainer.py:4185-4197)
+检查LLM Judge对ambig样本的4个候选是否给出相同分数
+
+#### **诊断5: Grouping验证** (trainer.py:4174-4180)
+验证4个候选确实来自同一个sample
+
+#### **诊断6: Advantage计算** (trainer.py:3739-3770)
+检查零梯度阈值（0.01）是否合理
+
+---
+
+### 📁 **创建的诊断文档**
+
+**文件**: `FAIRNESS_ZERO_DIAGNOSIS.md` (134 lines)
+
+**关键发现**:
+- **GRPO_BATCH_SIZE=2** → 每步只有1个fairness样本
+  - 如果是ambig → 4个候选用模板 → std=0
+  - **建议**: 增加到4-6
+
+- **BBQ采样比例** 全局80% disambig / 20% ambig
+  - 单个batch可能全是ambig（随机性）
+  - **建议**: 前50步强制100% disambig
+
+- **Reward normalization最小方差** 当前0.01
+  - **建议**: 提升到0.1或暂时禁用
+
+---
+
+### 📝 **代码更改总结**
+
+**文件**: `grpo-dual/src/grpo/trainer.py`
+
+**新增诊断代码**:
+1. Batch composition (Lines 3972-3980)
+2. Reward scale (Lines 4047-4063)
+3. Reward normalization (Lines 4069-4082)
+4. Grouping + LLM Judge (Lines 4174-4221)
+5. Advantage计算 (Lines 3739-3770)
+6. 函数调用更新 (Line 4151)
+
+**新增文件**: `FAIRNESS_ZERO_DIAGNOSIS.md`
+
+**修改函数签名**:
+```python
+def compute_group_advantages(rewards, k, step=None, task_list=None)
+```
+
+---
+
+### ⚙️ **配置保持不变（等待诊断）**
+
+- `GRPO_BATCH_SIZE = 2`
+- `FAIRNESS_REWARD_SCALE = 0.7`
+- `REWARD_NORMALIZE = True`
+- `最小方差 = 0.01`
+- `零梯度阈值 = 0.01`
+
+**理由**: Evidence-based fixing
+
+---
+
+### 🚀 **下一步行动**
+
+1. ✅ 添加诊断代码（已完成）
+2. ⏳ 运行1-2步训练收集日志
+3. ⏳ 分析6个诊断输出
+4. ⏳ 确定root cause
+5. ⏳ 应用targeted fix（参考FAIRNESS_ZERO_DIAGNOSIS.md）
+
+**预期诊断场景**:
+- 场景A: batch内只有ambig → 修复采样
+- 场景B: scale/norm精度丢失 → 调整参数
+- 场景C: LLM Judge过于一致 → 修改评分逻辑
+- 场景D: 阈值问题 → 降低到0.001
+
+---
