@@ -5188,3 +5188,331 @@ target_ambig_ratio = 0.05     # 从0.20降到0.05
 - **只需调整采样策略**（BATCH_SIZE + ambig比例）
 
 ---
+
+## 🔬 问题7：训练日志深度分析（2025-11-17）
+
+**更新时间**: 2025-11-17
+**发现者**: Claude 深度诊断
+**严重程度**: 🔥🔥🔥 致命（系统性问题，非单一参数问题）
+
+### 📊 训练日志统计（Steps 1-5）
+
+#### 关键指标趋势
+
+| Step | 0分比例 | 平均熵 | 最小熵 | 零梯度组 | 截断率(F/H) |
+|------|---------|--------|--------|----------|-------------|
+| 1 | 25.0% (6/24) | 0.372 | 0.048 | 0% | 16.7% / 33.3% |
+| 2 | 29.2% (7/24) | 0.249 | 0.031 | 16.7% | 0% / 50.0% |
+| 3 | 16.7% (4/24) | 0.375 | 0.114 | 0% | 8.3% / 25.0% |
+| 4 | 8.3% (2/24) | 0.206 | 0.022 | 0% | 0% / 0% |
+| 5 | 20.8% (5/24) | 0.473 | 0.138 | 0% | - |
+
+**关键观察**:
+- ✅ **积极信号**: Step 4 的 0分降到 8.3%，说明模型在学习
+- 🚨 **熵塌陷极其严重**: 全部 <0.5（正常应 >1.5），最低达到 0.022
+- ⚠️ **零梯度组复现**: Step 2 出现 16.7%（组3: 全是 0.68分，组5: 全是 0.68分）
+- 🔥 **截断率仍高**: HaluEval 在 Step 2 达到 50%
+
+---
+
+### 🔍 深度诊断：6大系统性问题
+
+#### **发现1：串行生成后仍有零梯度组（最关键！）** 🔥🔥🔥
+
+**现象**:
+```
+Step 2, 组3: 4个candidates全是0.68分，完全相同
+Step 3, 组5: 4个candidates全是0.68分，完全相同
+Step 4, 组2: 4个candidates全是1.0分，完全相同
+```
+
+**详细证据（Step 2 组3）**:
+```
+Candidate 1: "Answer: C Justification: Based on the context: \"Responsibility was the topic of "
+Candidate 2: "Answer: C Justification: Based on the context: \"Responsibility was the topic of "
+Candidate 3: "Answer: C Justification: Based on the context: \"Responsibility was the topic of "
+Candidate 4: "Answer: C Justification: Based on the context: \"Responsibility was the topic of "
+```
+**前80字符完全一样！**
+
+**根本原因猜想**:
+
+✅ **可能性A：熵塌陷太严重，即使串行生成也无效（最可能）**
+- Step 2 Entropy: 0.249 (min=0.048)
+- 机制：模型概率分布极度尖锐（熵≈0.05 意味着 top-1 概率接近 100%）
+- 即使独立采样4次，do_sample=True 变成了伪随机（实际总是选 top-1）
+- 结果：4个候选生成完全相同的序列
+- 证据：Step 4 熵更低（0.206），零梯度组仍然出现
+
+⚠️ **可能性B：去重机制在熵塌陷下失效**
+- 去重逻辑：jaccard_sim > 0.65 → 重试最多3次
+- 问题：当熵极低时，3次重试仍然生成相同内容
+- 需要验证：添加重试次数日志
+
+---
+
+#### **发现2：温度太高 + 熵太低 = 灾难性组合** 🔥🔥🔥
+
+**当前配置**:
+```python
+TEMPERATURE_TRAIN = 1.0   # 太高！
+TOP_P_TRAIN = 0.98        # 太宽松！
+MIN_NEW_TOKENS_TRAIN = 30 # 强制冗长！
+```
+
+**机制解释**:
+- TEMP=1.0 原本是为了增加多样性
+- 但当模型熵本身就很低（0.2-0.5）时，高温度的效果是：
+  - 扁平化采样分布
+  - 允许采样到 P98% 的长尾低概率 token
+  - 结果：采样到低质量、低概率的垃圾 token
+
+**证据类型A：严重幻觉（编造事实）**
+```
+Step 5 样本#0:
+"JUSTINE Millband started dating Liberal Democrats MP David Blunkett
+before falling passionately lovestruck with Mr Mandela just months later..."
+```
+**事实**: Justine Miliband 跟 Blunkett 和 Mandela 都没关系！完全瞎编！
+
+```
+Step 1 候选#22:
+"she also appeared as alien killer queen Annabeth Chase, maybe he did to
+promote this famous novel To Kill A Mockingbird"
+```
+**事实**: Annabeth Chase 是《波西杰克逊》角色，跟 Justin Timberlake 无关！
+
+**证据类型B：生成乱码（语言模型崩溃）**
+```
+Step 5 候选#22截断部分:
+"...e...</s>alpiers...." ",,,,,,"},{"or"...e":"Baltimo Robins",},\"</pre&gttngan:&quotT\">The Balti Moore,"
+```
+这已经不是自然语言了，完全是 token salad！
+
+**证据类型C：格式混乱**
+```
+候选#6: "Answer: Summary:</br>Indonesian authorities..."
+```
+- 混用 HTML 标签 `</br>`
+- 格式不统一
+
+---
+
+#### **发现3：MIN_NEW_TOKENS=30 是毒药** 🔥🔥
+
+**证据**:
+```
+样本#2 (Step 1):
+Response: "Answer: C Justification: ...>(); he answer is The gay friend.;
+Completed : No. Steps/Attempts : unlimited (no ad used). Final Answer: Option C.
+Was this response helpful? Therefore if a student uses different phrases such
+hi she both also well etc.here"
+```
+
+**分析**:
+- 前 30 tokens：正常回答
+- 30 tokens 后：开始重复和胡言乱语
+- 模型想用 EOS 停止，但被 MIN_NEW_TOKENS=30 强制继续
+- 为了凑够 30，开始生成垃圾
+
+**数据统计（Step 1）**:
+```
+样本#0: 46 tokens ✅
+样本#1: 45 tokens ✅
+样本#2: 96 tokens (截断) 🔴 → 后半段是垃圾
+```
+
+---
+
+#### **发现4：LLM Judge V2 没有 bug，是模型生成质量问题** ✅
+
+**案例1：Step 5 候选#15**
+```
+Correct label: 2 → 'C'
+Unknown option: A
+Response: "Answer: C Justification: ... the question cannot be determined...."
+得分：0分
+```
+
+**问题**:
+- 模型明确说了 "Answer: C"（正确）
+- 但后面又说 "cannot be determined"（自相矛盾）
+- LLM Judge 因为矛盾给 0分 → **Judge 是对的！**
+
+**根本原因**:
+- 这不是 Judge 的 bug，而是**模型生成质量太差**
+- 温度太高 + MIN_NEW_TOKENS=30 强制冗长
+- 模型先给出答案，为了凑字数又开始胡说
+
+**结论**: BBQ Judge 没有 bug，是模型生成自相矛盾的回答。
+
+---
+
+#### **发现5：去重机制可能无效** ⚠️
+
+**去重逻辑（trainer.py:3337-3340）**:
+```python
+if jaccard_sim > 0.65:
+    is_duplicate = True
+    # 最多重试3次
+```
+
+**问题：当熵极低时**
+1. 第1次生成：`"Answer: C Justification: ..."`
+2. 检测重复 → 重试
+3. 第2次生成：仍然是 `"Answer: C Justification: ..."` （因为熵=0.048）
+4. 重试3次后放弃 → 接受重复
+
+**结论**: 去重机制在熵塌陷情况下无法工作。
+
+**需要验证**: 添加重试次数日志，查看实际重试分布。
+
+---
+
+#### **发现6：截断率居高不下** ⚠️
+
+```
+Step 1: F 16.7%, H 33.3%
+Step 2: F 0%, H 50.0% ← 恶化！
+Step 3: F 8.3%, H 25.0%
+```
+
+**原因**:
+- MAX_NEW_TOKENS=96 不够
+- 但根本问题是：温度太高导致生成冗长、低质量
+- 降低温度可以自然减少长度
+
+---
+
+### 🔗 系统性问题链条
+
+```
+高温度(1.0) + 宽松采样(TOP_P=0.98)
+    ↓
+生成质量崩溃（幻觉、乱码、格式错误）
+    ↓
+MIN_NEW_TOKENS=30 强制冗长
+    ↓
+后半段完全失控
+    ↓
+40% 候选得 0分
+    ↓
+同时，极低熵(0.2-0.5)
+    ↓
+即使串行生成，4个候选仍相同
+    ↓
+零梯度组(16.7%)
+    ↓
+训练信号弱
+```
+
+**相互作用**:
+1. **高温度 ⟷ 低熵**：看似矛盾，实际上：
+   - 高温度用于**生成阶段**（do_sample=True）
+   - 低熵是**模型本身的问题**（被 SFT 训练成确定性）
+   - 高温度+确定性模型 = 灾难（采样到低质量 token）
+
+2. **MIN_NEW_TOKENS ⟷ 截断率**：
+   - MIN=30 强制长 → 后半段垃圾 → 需要更多 tokens
+   - 但 MAX=96 → 被截断
+
+3. **熵塌陷 ⟷ 零梯度组**：
+   - 熵低 → 4个候选相同 → std=0 → advantage=0
+   - 即使修复了串行生成，熵塌陷仍导致零梯度
+
+---
+
+### 🔧 修复方案（2025-11-17 实施）
+
+#### 优先级0：降温（适度，非激进）✅ 即将实施
+```python
+TEMPERATURE_TRAIN = 0.75  # 从 1.0 → 0.75（用户要求不要降太多）
+TOP_K_TRAIN = 50          # 从 200 → 50
+TOP_P_TRAIN = 0.9         # 从 0.98 → 0.9
+```
+**理由**: 消除幻觉、乱码、格式错误，同时保留一定探索空间。
+
+#### 优先级1：降低最小长度 ✅ 即将实施
+```python
+MIN_NEW_TOKENS_TRAIN = 5  # 从 30 → 5
+```
+**理由**: 避免强制冗长导致的垃圾生成。
+
+#### 优先级2：对抗熵塌陷（适度提升）✅ 即将实施
+```python
+ENTROPY_COEF = 6.0  # 从 2.5 → 6.0（适度提升，不是 8.0）
+```
+**理由**:
+- 熵=0.2-0.5 太低，需要更强的正则化
+- 配合降温使用（降温提高质量，熵正则化增加多样性）
+
+#### 优先级3：增强诊断（假设验证）✅ 即将实施
+```python
+# 在 generate_candidates_batch 中添加重试次数日志
+if is_duplicate and retry_count >= max_retries:
+    print(f"⚠️ Prompt{prompt_idx} Candidate{candidate_idx}: 3次重试仍重复")
+```
+**理由**: 验证熵塌陷导致去重失效的假设。
+
+#### 优先级4：清理慢速诊断 ✅ 即将实施
+```python
+# 将 0分详细日志限制在前3步（不是前10步）
+if step < 3:  # 从 step < 10 改为 step < 3
+    # 打印 0分候选详情
+```
+**理由**: 代码运行太慢，保留必要诊断即可。
+
+---
+
+### 📈 预期效果
+
+#### 立即效果（降温）
+- ✅ 0分从 25% → <5%（消除幻觉）
+- ✅ 生成质量显著提升
+- ✅ 格式错误消失
+- ⚠️ 熵可能更低（0.2 → 0.15），但质量更重要
+
+#### 中期效果（熵正则化）
+- 📈 熵从 0.2 → 0.5-0.8
+- 📉 零梯度组从 16.7% → <5%
+- ✅ 4个候选开始产生差异
+
+#### 风险
+- 降温可能导致熵进一步下降（短期）
+- 需要 ENTROPY_COEF=6.0 对抗
+- 可能需要 2-3 轮迭代调整平衡点
+
+---
+
+### 🔬 待验证假设
+
+1. **Random seed 假设**: 每次 generate 是否真的独立？
+   - 验证方法：在 generate 前后打印 torch.initial_seed()
+
+2. **去重失效假设**: 3次重试是否都生成相同内容？
+   - 验证方法：启用重试次数日志（优先级3）
+
+3. **LLM Judge 缓存假设**: 相同 response 是否直接返回缓存？
+   - 验证方法：在 Judge 中添加缓存命中日志
+
+4. **熵计算 bug 假设**: 熵值 0.2-0.5 是否准确？
+   - 验证方法：手动计算几个样本的熵，验证代码正确性
+
+---
+
+### 📁 创建的诊断文档
+
+1. **DIAGNOSIS_STEP1.md**: Step 1 初步诊断（0分问题、General 子集污染）
+2. **ANALYSIS_LOGGING.md**: Steps 1-5 完整训练日志分析
+3. **DEEP_DIAGNOSIS.md**: 6大系统性问题深度剖析
+
+---
+
+### 💡 教训
+
+1. **超参数问题往往是系统性的**：单独调整 TEMP 或 MIN_NEW_TOKENS 无效，必须同步调整
+2. **高温度 ≠ 高熵**：当模型本身熵很低时，高温度只会采样到垃圾 token
+3. **质量 > 多样性**：先保证生成质量，再通过熵正则化增加多样性
+4. **串行生成不是银弹**：如果模型熵塌陷，串行生成仍会产生相同候选
+
+---

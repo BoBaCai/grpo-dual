@@ -211,10 +211,10 @@ class Config:
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 1  # 【BBQ数据分析修复】从2降到1，因为BATCH_SIZE已从2增到6
                                      # 有效batch保持=6（vs之前2×2=4），略有增加但可接受
-    ENTROPY_COEF = 2.5               # 【激进干预】从1.5提升到2.5，强力对抗模板收敛
-                                     # Step 1-5诊断：熵值0.012-0.293（avg=0.105），1.5不足以打破模板局部最优
-                                     # 模型收敛到："insufficient information"模板 → LLM Judge高分 → 零梯度
-                                     # 需要更强的熵正则化（2.5x奖励权重）迫使模型探索
+    ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
+                                     # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
+                                     # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
+                                     # 需要更强的熵正则化（6.0x奖励权重）配合降温一起对抗塌陷
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -236,15 +236,22 @@ class Config:
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
-    MIN_NEW_TOKENS_TRAIN = 30      # 【激进干预】从15提升到30，杜绝19-token模板
-                                   # Step 1-5诊断：所有候选完全相同的19-token模板
-                                   # 30-token约束迫使模型必须提供更详细justification，无法走捷径
+    MIN_NEW_TOKENS_TRAIN = 5       # 【2025-11-17深度诊断修复】从30大幅降到5，避免强制冗长
+                                   # Steps 1-5证据：MIN=30强制冗长→后半段垃圾生成→40%得0分
+                                   # 案例："Answer: C... >(); he answer is The gay friend.; Was this helpful?"
+                                   # 机制：模型前30 tokens正常，被迫继续→开始胡言乱语凑字数
+                                   # 5 tokens足够"Answer: X"，让模型自然决定何时停止
 
-    TEMPERATURE_TRAIN = 1.0        # 【激进干预】从0.9提升到1.0，增加采样多样性
-                                   # 配合ENTROPY_COEF=2.5和MIN_NEW_TOKENS=30，打破模板收敛
-                                   # 1.0不会像1.15那样导致崩溃（Session 2已验证）
-    TOP_K_TRAIN = 200              # 【核选项】从150提升到200，进一步扩大候选空间
-    TOP_P_TRAIN = 0.98             # 【核选项】从0.95放宽到0.98，允许更多长尾token
+    TEMPERATURE_TRAIN = 0.75       # 【2025-11-17深度诊断修复】从1.0适度降到0.75，消除幻觉
+                                   # Steps 1-5证据：TEMP=1.0+熵=0.2=灾难（采样到长尾垃圾token）
+                                   # 幻觉案例："Justine Millband dating Blunkett...Mandela"（完全编造）
+                                   # 乱码案例："...e...</s>alpiers...."},{"or"...（token salad）
+                                   # 机制：高温扁平化分布→允许P98%低概率token→低质量输出
+                                   # 0.75适度收紧，消除幻觉同时保留探索空间（配合ENTROPY_COEF=6.0）
+    TOP_K_TRAIN = 50               # 【2025-11-17深度诊断修复】从200收紧到50，限制候选空间
+                                   # 200太宽松，允许采样到低质量token→幻觉、格式错误
+    TOP_P_TRAIN = 0.9              # 【2025-11-17深度诊断修复】从0.98收紧到0.9，避免长尾token
+                                   # P98允许采样到极低概率token→生成质量崩溃
     REP_PENALTY_TRAIN = 1.3        # 【核选项】从1.25提升到1.3，最大力度去重
 
     PRESENCE_PENALTY = 0.7         # 【修复】从0.3提升到0.7，惩罚模板化输出
@@ -3341,15 +3348,16 @@ def generate_candidates_batch(
 
                 # 如果不重复，或已经重试max_retries次，接受这个candidate
                 if not is_duplicate or retry_count >= max_retries:
-                    # if is_duplicate and retry_count >= max_retries and step is not None and step < 3:
-                    #     print(f"⚠️ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: {max_retries}次重试后仍重复，保留")
-                    # elif is_duplicate == False and retry_count > 0 and step is not None and step < 3:
-                    #     print(f"✓ [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count+1}次生成成功（去重）")
+                    # 【2025-11-17假设验证】启用重试日志，验证熵塌陷导致去重失效
+                    if is_duplicate and retry_count >= max_retries and step is not None and step < 5:
+                        print(f"⚠️ [去重失效] Prompt{prompt_idx} Candidate{candidate_idx}: {max_retries}次重试后仍重复(Jaccard>0.65)，强制保留")
+                    elif is_duplicate == False and retry_count > 0 and step is not None and step < 5:
+                        print(f"✓ [去重成功] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count+1}次生成成功去重")
                     break
                 else:
                     retry_count += 1
-                    # if step is not None and step < 3:
-                    #     print(f"🔄 [去重] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count}次重试（Jaccard>{0.75}）")
+                    if step is not None and step < 5:
+                        print(f"🔄 [去重重试] Prompt{prompt_idx} Candidate{candidate_idx}: 第{retry_count}次重试(Jaccard>0.65)")
 
             # 【已禁用】调试日志
             # if step is not None and step < 2 and prompt_idx < 2 and candidate_idx < 2:
@@ -4052,8 +4060,8 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         if step < 10 or (step + 1) % 5 == 0:
             print(f"\n[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
 
-        # 【诊断0分候选】前10步打印所有0分候选的详细信息，找出根本原因
-        if step < 10:
+        # 【诊断0分候选】前3步打印所有0分候选的详细信息，找出根本原因（2025-11-17优化：从10→3，代码太慢）
+        if step < 3:
             zero_score_count = sum(1 for r in rewards_list if abs(r) < 0.01)
             if zero_score_count > 0:
                 print(f"\n{'='*80}")
@@ -4090,10 +4098,10 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 original_reward = rewards[i].item()
                 rewards[i] = rewards[i] * 0.3 - 0.3  # 双重惩罚：缩放到30%并减0.3
                 length_penalty_count += 1
-                if step < 20:  # 前20步打印详细信息
+                if step < 3:  # 前3步打印详细信息（2025-11-17优化：从20→3，代码太慢）
                     print(f"  [长度惩罚] 样本#{i} (Fairness, {all_lengths[i]}tokens): reward {original_reward:.3f} → {rewards[i].item():.3f}")
 
-        if length_penalty_count > 0 and step < 20:
+        if length_penalty_count > 0 and step < 3:
             print(f"  本步共对 {length_penalty_count} 个极短Fairness回答施加了长度惩罚\n")
 
         # 【优先级A：Reward Scale】调整不同任务的reward权重，解决信号失衡
@@ -4608,7 +4616,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             kl_controller.auto_adjust(step + 1)
 
         # 【诊断】每个 step 打印前 3 个样本，看模型输出什么
-        if step < 5:  # 只在前5个steps打印，避免刷屏
+        if step < 3:  # 只在前3个steps打印，避免刷屏（2025-11-17优化：从5→3，代码太慢）
             print(f"\n{'='*80}")
             print(f"📝 [样本诊断 Step {step+1}] 前3个生成样本内容：")
             print(f"{'='*80}")
