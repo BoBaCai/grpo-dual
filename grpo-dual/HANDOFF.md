@@ -4061,3 +4061,280 @@ general_samples = load_general_dialogue()  # Alpaca等
 **Session 3 完成。已添加遗忘监控系统，等待训练测试结果。**
 
 ---
+
+## 🚨 2025-11-16 紧急修复 (Session 3 续)
+
+### ⚠️ 发现的严重问题：模板崩溃
+
+#### 训练日志诊断
+
+**Step 5零梯度组 - 灾难性发现：**
+
+```
+所有4个candidates完全相同：
+  Answer: B
+  Justification: The context does not provide sufficient information to determine this.
+
+所有Reward: 0.780（完全相同）
+Reward std: 0.000  → 零梯度！
+Entropy: 0.017     → 几乎确定性输出
+```
+
+**样本诊断确认：**
+```
+样本 #0 (Fairness) ✅完整: Token长度: 19
+  Response: Answer: B
+  Justification: The context does not provide sufficient information to determine this.
+
+样本 #1 (Fairness) ✅完整: Token长度: 19
+  Response: Answer: B
+  Justification: The context does not provide sufficient information to determine this.
+
+样本 #2 (Fairness) ✅完整: Token长度: 19
+  Response: Answer: B
+  Justification: The context does not provide sufficient information to determine this.
+```
+
+**所有ambig样本输出完全一字不差！**
+
+---
+
+#### 问题特征
+
+1. **极端熵塌陷**
+   ```
+   Step 2: 0.291  ⚠️
+   Step 3: 0.072  ⚠️
+   Step 5: 0.017  🚨 几乎确定性
+   Step 6: 0.128  ⚠️
+   ```
+
+2. **零梯度组持续50%**
+   ```
+   Step 1: 50%
+   Step 3: 50%
+   Step 5: 50%
+   Step 6: 50%
+   ```
+
+3. **Fairness信号完全消失**
+   ```
+   Step 5: F std=0.000, H std=0.058 | Signal: F=0.0000, H=5.3484
+   Step 6: F std=0.000, H std=0.225 | Signal: F=0.0000, H=4.3316
+   ```
+   Fairness任务完全没有梯度信号。
+
+4. **严重Reward失衡**
+   ```
+   Step 2: F/H = 0.05  ⚠️
+   Step 4: F/H = 0.18  ⚠️
+   Step 5: F/H = 0.00  🚨
+   ```
+
+---
+
+#### 根本原因分析
+
+**为什么会模板崩溃？**
+
+1. **ENTROPY_COEF=1.0过于保守**
+   - 鼓励确定性输出
+   - 模型快速收敛到"安全策略"
+   - 缺乏探索性，无法发现更好的reasoning
+
+2. **MIN_NEW_TOKENS=10太低**
+   - 19-token模板轻松满足最小要求
+   - 没有压力提供详细justification
+   - 模板成为"最省力"的策略
+
+3. **规则Judge + 低熵的恶性循环**
+   - Ambig样本：选Unknown = 1.0分（满分）
+   - 模型发现"insufficient information"是万能答案
+   - 低熵设置强化了这种确定性策略
+   - 规则judge不看reasoning质量，只看选项
+
+4. **梯度信号消失的正反馈**
+   - 模板 → 所有candidates相同 → std=0 → 零梯度
+   - 无法学习 → 更依赖模板 → 更确定性
+
+---
+
+### ✅ 紧急修复方案
+
+#### 修复1：增加熵系数
+
+**修改：**
+```python
+ENTROPY_COEF: 1.0 → 1.5
+```
+
+**目的：**
+- 更强的熵正则化，对抗模板化
+- 鼓励探索不同的回答方式
+- 平衡点：不像5.0那样激进（会导致崩溃），但比1.0更能鼓励多样性
+
+**预期效果：**
+- 熵值提升（目标 >0.5）
+- 候选回答有差异
+- 减少完全相同的输出
+
+---
+
+#### 修复2：增加最小Token要求
+
+**修改：**
+```python
+MIN_NEW_TOKENS_TRAIN: 10 → 15
+```
+
+**目的：**
+- 19-token模板不再满足要求
+- 强制模型提供更详细的justification
+- 提高模板策略的"成本"
+
+**预期效果：**
+- 迫使模型思考更多
+- 减少短模板的吸引力
+- 鼓励实际reasoning而非套话
+
+---
+
+### 📊 修复对比
+
+| 参数 | 旧值 | 新值 | 目的 |
+|------|------|------|------|
+| `ENTROPY_COEF` | 1.0 | **1.5** | 对抗模板化，鼓励多样性 |
+| `MIN_NEW_TOKENS_TRAIN` | 10 | **15** | 强制更长reasoning |
+
+---
+
+### 🎯 其他观察
+
+#### 1. LLM Judge仍然不稳定
+
+```
+Step 1, 3, 6: provider: halueval_rule / bbq_rule  ← 规则评分
+Step 5:       providers={'openai': 8}             ← 唯一成功
+```
+
+**分析：**
+- 尽管修改了配置，仍然频繁fallback
+- 可能是缓存污染或并发限流
+
+**建议：**
+- 清空缓存（如果存在）
+- 观察新训练run的judge使用情况
+
+---
+
+#### 2. Hallucination任务截断率仍高
+
+```
+Step 4: H: 25%
+Step 5: H: 100%  ← 极端
+Step 6: H: 25%
+```
+
+**分析：**
+- Summarization子集需要更长输出
+- 96 tokens对某些任务偏短
+- **但不是崩溃**（内容正常）
+
+**暂不处理：**
+- 先解决模板崩溃问题
+- 后续考虑分任务token限制
+
+---
+
+### 💡 行动建议
+
+#### 优先级1：测试修复效果
+
+**重新运行训练，检查：**
+
+1. **熵值是否恢复：**
+   ```
+   期望: Step 1-6 mean >0.3
+   理想: Step 1-6 mean >0.5
+   ```
+
+2. **零梯度组比例下降：**
+   ```
+   当前: 50%
+   目标: <30%
+   理想: <20%
+   ```
+
+3. **Fairness信号恢复：**
+   ```
+   当前: std=0.000（完全无信号）
+   目标: std>0.05
+   ```
+
+4. **模板使用减少：**
+   - 样本诊断不应再看到完全相同的输出
+   - 候选回答应有差异
+
+---
+
+#### 优先级2：确认LLM Judge稳定性
+
+**检查日志中是否所有步骤显示：**
+```
+[Judge@stepX] providers={'openai': 8}
+```
+
+**如果仍有fallback：**
+- 检查是否有 `"⚠️ [LLM Judge] 所有 LLM providers 失败"` 消息
+- 确认OPENAI_API_KEY有效
+- 可能需要清空缓存或降低并发
+
+---
+
+#### 优先级3：等待遗忘监控
+
+**Step 50时会看到：**
+```
+🧠 [遗忘监控@step50] 基础能力评估
+  ✅ Common Sense: ?
+  ✅ Reasoning: ?
+  ✅ Safety: ?
+  ✅ Generation: ?
+```
+
+**关注是否有能力退化。**
+
+---
+
+### ⚠️ 风险评估
+
+#### 如果ENTROPY_COEF=1.5仍然模板化：
+
+**后续选项：**
+
+1. **进一步增加到2.0**
+   - 更激进的多样性鼓励
+   - 风险：可能导致输出质量下降
+
+2. **改进规则Judge**
+   - 让ambig样本也能根据reasoning质量差异化评分
+   - 即使选Unknown，reasoning好坏应该有区别
+
+3. **增加MIN_NEW_TOKENS到20-25**
+   - 进一步提高模板成本
+   - 风险：可能导致废话填充
+
+4. **重新训练**
+   - 从SFT后的checkpoint重新开始GRPO
+   - 确保LLM Judge从一开始就稳定工作
+
+---
+
+**Commit:**
+- `64c4aa7` - Fix template collapse: increase entropy and min tokens
+
+---
+
+**Session 3 完成。已修复模板崩溃参数，等待测试结果。**
+
+---
