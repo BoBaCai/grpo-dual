@@ -3710,7 +3710,7 @@ def _tokenize_concat(tokenizer, prompts: List[str], responses: List[str], respon
     
     return full, comp_mask
 
-def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
+def compute_group_advantages(rewards: torch.Tensor, k: int, step: int = None, task_list: List[str] = None) -> torch.Tensor:
     """
     【业界标准修复】正确处理零方差组
 
@@ -3736,9 +3736,24 @@ def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
     r = rewards.view(B, k)
 
     advantages = []
+    # 【诊断6】Advantage计算详细日志（前20步）
+    if step is not None and step < 20:
+        print(f"\n[诊断6: Advantage计算@step{step+1}]")
+
     for i in range(B):
         group_rewards = r[i]
-        group_std = group_rewards.std()
+        group_std = group_rewards.std().item()
+        group_mean = group_rewards.mean().item()
+
+        # 【诊断6】打印每组的详细信息
+        if step is not None and step < 20:
+            task = task_list[i] if task_list else "unknown"
+            if group_std < 0.01:
+                print(f"  组{i} ({task}): std={group_std:.6f} < 0.01 → adv=0 (零梯度)")
+                print(f"    Rewards: {group_rewards.cpu().numpy()}")
+            elif group_std < 0.05:
+                print(f"  组{i} ({task}): std={group_std:.6f} (接近阈值)")
+                print(f"    Rewards: {group_rewards.cpu().numpy()}")
 
         if group_std < 0.01:
             # 【业界标准】零方差组无学习信号，跳过
@@ -3747,8 +3762,7 @@ def compute_group_advantages(rewards: torch.Tensor, k: int) -> torch.Tensor:
         else:
             # 【标准GRPO】组内归一化
             # adv = (r - mean) / std，确保组内advantage期望为0，std为1
-            group_mean = group_rewards.mean()
-            group_adv = (group_rewards - group_mean) / group_std.clamp_min(1e-6)
+            group_adv = (group_rewards - group_mean) / max(group_std, 1e-6)
 
         advantages.append(group_adv)
 
@@ -3969,6 +3983,16 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         batch = dataset.get_balanced_batch(config.GRPO_BATCH_SIZE)
         tasks = [s.task for s in batch]
 
+        # 【诊断1】Batch composition - 检查fairness样本的context_condition分布
+        if step < 20:
+            fairness_samples = [s for s in batch if s.task == "fairness"]
+            if fairness_samples:
+                print(f"\n[诊断1: Batch Composition@step{step+1}] {len(fairness_samples)} Fairness样本:")
+                for i, s in enumerate(fairness_samples):
+                    ctx_cond = s.meta.get("context_condition", "unknown")
+                    category = s.meta.get("category", "unknown")
+                    print(f"  Sample #{i}: context={ctx_cond}, category={category}")
+
         # ——生成（批量）——
         t_gen0 = _t.time()
         cand_by_sample, lengths_by_sample, _, truncated_by_sample, formatted_prompts = generate_candidates_batch(
@@ -4034,15 +4058,42 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             print(f"  本步共对 {length_penalty_count} 个极短Fairness回答施加了长度惩罚\n")
 
         # 【优先级A：Reward Scale】调整不同任务的reward权重，解决信号失衡
+        rewards_before_scale = rewards.clone()  # 【诊断2】保存scale前的值
         for i in range(len(rewards)):
             if task_list[i] == "fairness":
                 rewards[i] *= config.FAIRNESS_REWARD_SCALE
             elif task_list[i] == "hallucination":
                 rewards[i] *= config.HALLUCINATION_REWARD_SCALE
 
+        # 【诊断2】Reward Scale - 检查scale是否导致精度丢失
+        if step < 20:
+            fairness_indices = [i for i, t in enumerate(task_list) if t == "fairness"]
+            if fairness_indices:
+                f_before = rewards_before_scale[fairness_indices]
+                f_after = rewards[fairness_indices]
+                print(f"\n[诊断2: Reward Scale@step{step+1}] FAIRNESS_REWARD_SCALE={config.FAIRNESS_REWARD_SCALE}")
+                print(f"  Before scale: {f_before.cpu().numpy()}")
+                print(f"  After scale:  {f_after.cpu().numpy()}")
+                print(f"  Std before: {f_before.std():.6f}, after: {f_after.std():.6f}")
+
         # 【新增】奖励分支内标准化（含winsorize去除离群值）
         rewards_before_norm = rewards.clone()  # 保存normalize前的值用于debug
         rewards = reward_normalizer.update_and_normalize(rewards, task_list)
+
+        # 【诊断3】Reward Normalization - 检查normalization是否抹平差异
+        if step < 20:
+            fairness_indices = [i for i, t in enumerate(task_list) if t == "fairness"]
+            if fairness_indices:
+                f_before_norm = rewards_before_norm[fairness_indices]
+                f_after_norm = rewards[fairness_indices]
+                fairness_stats = reward_normalizer.stats.get('fairness', {})
+                print(f"\n[诊断3: Reward Normalization@step{step+1}]")
+                print(f"  Before norm: mean={f_before_norm.mean():.4f}, std={f_before_norm.std():.6f}")
+                print(f"  After norm:  mean={f_after_norm.mean():.4f}, std={f_after_norm.std():.6f}")
+                print(f"  EMA stats: mean={fairness_stats.get('mean', 'N/A'):.4f if isinstance(fairness_stats.get('mean'), (int, float)) else 'N/A'}, "
+                      f"std={np.sqrt(fairness_stats.get('var', 0)):.4f}")
+                print(f"  Values before norm: {f_before_norm.cpu().numpy()}")
+                print(f"  Values after norm:  {f_after_norm.cpu().numpy()}")
 
         # 【诊断模块】前20步打印Fairness样本详情，排查奖励函数bug
         if step < 20:
@@ -4097,7 +4148,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
 
         # ——组内优势——
         t_adv0 = _t.time()
-        adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS)
+        adv = compute_group_advantages(rewards, k=config.K_ROLLOUTS, step=step, task_list=tasks)
         t_adv = _t.time() - t_adv0
 
         # 【Session 9.1 新增】零梯度组监控：实际 vs 理论对比
@@ -4133,28 +4184,55 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
                 print(f"\n{'='*70}")
                 print(f"[零梯度组诊断@step{step+1}] 组{i}的4个candidates:")
                 print(f"{'='*70}")
+
+                # 【诊断5】Grouping验证 - 确认4个候选确实来自同一样本
+                print(f"\n[诊断5: Grouping验证] idx_map检查:")
+                for j in range(K):
+                    idx = i * K + j
+                    mapped_idx = idx_map[idx]
+                    status = "✓" if mapped_idx == i else "❌ ERROR"
+                    print(f"  Candidate {j+1}: idx_map[{idx}] = {mapped_idx} (expected {i}) {status}")
+
+                sample = batch[i]
+                print(f"\nSample info: task={sample.task}, context_condition={sample.meta.get('context_condition', 'N/A')}")
+
+                # 【诊断4】LLM Judge原始分数 - 检查是否过于一致
+                if sample.task == "fairness":
+                    print(f"\n[诊断4: LLM Judge详细评分] Fairness样本 (context={sample.meta.get('context_condition')})")
+                    for j in range(K):
+                        idx = i * K + j
+                        response = all_resps[idx]
+                        # 重新评估获取详细分数（使用实际的judge.evaluate）
+                        result = judge.evaluate(sample, response)
+                        print(f"  Candidate {j+1}:")
+                        print(f"    Final score: {result.get('final', 'N/A'):.4f}")
+                        print(f"    Provider: {result.get('provider', 'N/A')}")
+                        print(f"    Raw reward: {rewards_list[idx]:.4f}")
+                        print(f"    Response (前80字符): {response[:80].replace(chr(10), ' ')}")
+
+                # 原有的简化诊断
                 for j in range(K):
                     idx = i * K + j
                     sample = batch[i]
                     response = all_resps[idx]
                     reward = rewards_list[idx]
 
-                    print(f"\nCandidate {j+1}:")
+                    print(f"\nCandidate {j+1} 完整信息:")
                     print(f"  Task: {sample.task}")
                     print(f"  Subset: {sample.meta.get('subset', 'N/A')}")
                     print(f"  Context condition: {sample.meta.get('context_condition', 'N/A')}")
                     print(f"  Reward: {reward:.3f}")
                     print(f"  Response (前150字符): {response[:150].replace(chr(10), ' ')}...")
 
-                    # 【增强诊断】重新评估以查看详细评分
+                    # 【增强诊断】重新评估以查看详细评分（仅disambig用规则评估作为参考）
                     if sample.task == "fairness" and sample.meta.get("context_condition") == "disambig":
                         result = judge._evaluate_bbq_fairness(sample, response)
-                        print(f"  BBQ判分: {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
+                        print(f"  BBQ规则判分(参考): {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
 
                     elif sample.task == "hallucination":
                         # 【新增】Hallucination任务诊断
                         result = judge._evaluate_halueval(sample, response)
-                        print(f"  HaluEval判分: {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
+                        print(f"  HaluEval规则判分(参考): {result.get('final', 'N/A'):.3f} (provider: {result.get('provider', 'N/A')})")
 
                         # 打印ground truth信息（如果有）
                         subset = sample.meta.get("subset", "")
