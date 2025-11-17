@@ -4461,3 +4461,194 @@ if step < 10 or (step + 1) % 5 == 0:
 **Session 3 完成。已澄清LLM Judge状态，增强诊断可见性。**
 
 ---
+
+## 📋 2025-11-16 快速参考：下次运行训练时观察要点
+
+### 🎯 关键指标检查清单
+
+#### 1. LLM Judge使用确认
+
+**期望看到（前10步每步打印）：**
+```
+[Judge@step1] time=1.5s providers={'openai': 8}  ✅
+[Judge@step2] time=1.4s providers={'openai': 8}  ✅
+[Judge@step3] time=1.6s providers={'openai': 8}  ✅
+```
+
+**⚠️ 忽略这些诊断消息：**
+```
+[零梯度组诊断@step1] ...
+  HaluEval判分: 1.000 (provider: halueval_rule)  ← 仅供调试，非实际评估
+```
+
+**🚨 如果看到这些才需要担心：**
+```
+⚠️ [LLM Judge] openai 调用失败 (attempt 1/4): ...
+❌ [LLM Judge] openai 所有重试失败，尝试下一个 provider...
+⚠️ [LLM Judge] 所有 LLM providers 失败，fallback 到规则评分
+```
+
+---
+
+#### 2. 熵值恢复检查
+
+**当前问题：**
+```
+Step 2: 0.291  ⚠️
+Step 3: 0.072  ⚠️
+Step 5: 0.017  🚨 极端塌陷
+```
+
+**期望改善（ENTROPY_COEF: 1.0 → 1.5）：**
+```
+目标: Step 1-10 mean >0.3
+理想: Step 1-10 mean >0.5
+```
+
+---
+
+#### 3. 零梯度组比例
+
+**当前问题：**
+```
+Step 1, 3, 5, 6: 都是50%
+```
+
+**期望改善：**
+```
+目标: <30%
+理想: <20%
+```
+
+---
+
+#### 4. Fairness信号恢复
+
+**当前问题：**
+```
+Step 5: F std=0.000, H std=0.058 | Signal: F=0.0000, H=5.3484
+Step 6: F std=0.000, H std=0.225 | Signal: F=0.0000, H=4.3316
+```
+
+**期望改善：**
+```
+目标: F std >0.05
+理想: F std >0.10
+```
+
+---
+
+#### 5. 模板化输出减少
+
+**当前问题（Step 5样本诊断）：**
+```
+样本 #0, #1, #2: 完全相同
+  Answer: B
+  Justification: The context does not provide sufficient information to determine this.
+```
+
+**期望改善（MIN_NEW_TOKENS: 10 → 15）：**
+- 候选回答应有差异
+- Token长度 >19
+- 不应完全一字不差
+
+---
+
+#### 6. 遗忘监控（Step 50）
+
+**首次监控输出：**
+```
+🧠 [遗忘监控@step50] 基础能力评估
+  ✅ Common Sense: ?
+  ✅ Reasoning: ?
+  ✅ Safety: ?
+  ✅ Generation: ?
+```
+
+**健康标准：**
+- 所有维度 ≥ 0.8: ✅ 正常
+- 任何维度 < 0.5: 🚨 需要干预
+
+---
+
+### 📊 参数变更总结
+
+| 参数 | Session 2<br>(方案A) | Session 3<br>(模板崩溃修复) | 目的 |
+|------|---------------------|---------------------------|------|
+| `ENTROPY_COEF` | 1.0 | **1.5** | 对抗模板化 |
+| `MIN_NEW_TOKENS_TRAIN` | 10 | **15** | 强制更长reasoning |
+| `JUDGE_MAX_WORKERS` | 16 | **8** | 避免OpenAI限流 |
+| `JUDGE_TIMEOUT_SEC` | 7 | **15** | 更多API响应时间 |
+| `JUDGE_MAX_RETRIES` | 1 | **3** | 提高成功率 |
+
+**保持不变：**
+- `MAX_NEW_TOKENS_TRAIN = 96`
+- `TEMPERATURE_TRAIN = 0.9`
+- `KL_BETA_INIT = 0.02`
+
+---
+
+### 🔧 诊断增强功能
+
+1. **Judge provider统计（commit 1d2b4f3）**
+   - 前10步每步打印
+   - 之后每5步打印
+
+2. **遗忘监控（commit 5063f57）**
+   - 每50步自动运行
+   - 测试4个维度基础能力
+
+3. **零梯度组诊断**
+   - 前20步显示详细候选内容
+   - 便于发现模板化问题
+
+---
+
+### ⚡ 如果仍有问题
+
+#### 场景A：熵值仍低 (<0.3)
+**后续选项：**
+1. ENTROPY_COEF: 1.5 → 2.0
+2. 检查是否仍然模板化
+3. 考虑调整温度: 0.9 → 1.0
+
+#### 场景B：零梯度组仍高 (>40%)
+**后续选项：**
+1. 检查LLM Judge是否真的在用
+2. 增加MIN_NEW_TOKENS: 15 → 20
+3. 考虑改进规则judge的reasoning评分
+
+#### 场景C：Fairness信号仍为0
+**后续选项：**
+1. 检查ambig样本是否都输出相同模板
+2. 增加FAIRNESS_REWARD_SCALE: 0.7 → 1.0
+3. 检查LLM Judge对reasoning质量的区分度
+
+#### 场景D：遗忘严重 (<0.5)
+**立即行动：**
+1. 停止训练
+2. 检查哪些维度退化
+3. 考虑添加KL正则化或数据混合
+
+---
+
+### 📝 Commits总览（Session 3）
+
+```bash
+5063f57 - Add forgetting monitor to track base capabilities
+49809e1 - Update HANDOFF.md with forgetting monitor documentation
+259f19f - Fix LLM Judge API call reliability (judge配置优化)
+1b602f8 - Update HANDOFF.md with Session 3 LLM Judge fix
+740fab8 - Apply conservative Plan A rollback to fix model collapse (熵/温度回退)
+050fbe4 - Update HANDOFF.md with model collapse diagnosis and Plan A rollback
+64c4aa7 - Fix template collapse: increase entropy and min tokens (模板崩溃修复)
+6f756b5 - Update HANDOFF.md with template collapse diagnosis and fix
+1d2b4f3 - Enhance judge provider diagnostics: print every step (诊断增强)
+453d037 - Update HANDOFF.md: clarify LLM Judge diagnostic confusion (澄清误解)
+```
+
+---
+
+**下次运行训练，参考本清单逐项检查！** 🎯
+
+---
