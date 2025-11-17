@@ -4338,3 +4338,126 @@ Step 6: H: 25%
 **Session 3 完成。已修复模板崩溃参数，等待测试结果。**
 
 ---
+
+## 🔍 2025-11-16 LLM Judge诊断澄清 (Session 3 续)
+
+### 重要发现：LLM Judge可能一直在正常工作
+
+#### 问题重新分析
+
+**用户困惑：** 训练日志显示大量 `provider: halueval_rule / bbq_rule`，只有Step 5显示 `providers={'openai': 8}`，似乎LLM Judge频繁失败。
+
+**真相揭示：**
+
+经过代码复查发现了**关键误解**：
+
+1. **零梯度组诊断不是实际评估**
+   ```python
+   # trainer.py:4148, 4153 - 零梯度组诊断代码
+   result = judge._evaluate_bbq_fairness(sample, response)  # 故意调用规则函数
+   print(f"  BBQ判分: {result.get('final'):.3f} (provider: {result.get('provider')})")
+
+   result = judge._evaluate_halueval(sample, response)  # 故意调用规则函数
+   print(f"  HaluEval判分: {result.get('final'):.3f} (provider: {result.get('provider')})")
+   ```
+
+   **这些 `provider: halueval_rule` 消息只是诊断目的的重新评估，不代表训练时实际使用的judge！**
+
+2. **实际训练评估（trainer.py:4000）**
+   ```python
+   r_obj = judge.evaluate(s, all_resps[i])  # 实际评估调用
+   prov = r_obj.get("provider", "?")
+   provider_count[prov] = provider_count.get(prov, 0) + 1
+   ```
+
+   如果 `USE_LLM_JUDGE=True`，这会调用 `_evaluate_with_llm_judge`，使用OpenAI LLM Judge。
+
+3. **Provider统计仅每5步打印（trainer.py:4015）**
+   ```python
+   if (step + 1) % 5 == 0:  # 只在step 5, 10, 15... 打印
+       print(f"[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
+   ```
+
+   **这就是为什么只看到Step 5的provider统计！**
+   - Step 1,2,3,4,6,7,8,9: **没有打印**，但很可能也在用OpenAI
+   - Step 5,10,15...: 打印了provider统计
+
+---
+
+### ✅ 修复：增强诊断可见性
+
+**修改（commit 1d2b4f3）：**
+```python
+# 前10步每步打印，之后每5步打印
+if step < 10 or (step + 1) % 5 == 0:
+    print(f"[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
+```
+
+**目的：**
+- 前10步每步都显示实际使用的judge
+- 确认LLM Judge是否稳定工作
+- 消除零梯度诊断的误导
+
+---
+
+### 🎯 预期观察
+
+**重新运行训练后应该看到：**
+
+```
+[Judge@step1] time=1.5s providers={'openai': 8}
+[Judge@step2] time=1.4s providers={'openai': 8}
+[Judge@step3] time=1.6s providers={'openai': 8}
+...
+[Judge@step10] time=1.5s providers={'openai': 8}
+```
+
+**如果看到这样，说明LLM Judge一直在正常工作！**
+
+---
+
+### ⚠️ 如果仍然频繁fallback
+
+**只有在看到这些消息时才说明真的有问题：**
+```
+⚠️ [LLM Judge] openai 调用失败 (attempt 1/4): TimeoutError: ...
+❌ [LLM Judge] openai 所有重试失败，尝试下一个 provider...
+⚠️ [LLM Judge] 所有 LLM providers 失败，fallback 到规则评分 (task=...)
+```
+
+**那时再考虑：**
+- 检查OPENAI_API_KEY
+- 检查网络连接
+- 降低并发（JUDGE_MAX_WORKERS）
+- 增加超时（JUDGE_TIMEOUT_SEC）
+
+---
+
+### 📊 结论
+
+**之前的分析可能过度反应了：**
+
+1. ✅ LLM Judge配置正确（USE_LLM_JUDGE=True）
+2. ✅ 函数预加载成功（初始化时会打印）
+3. ✅ Step 5确实使用了OpenAI（providers={'openai': 8}）
+4. ❓ 其他步骤很可能也在用OpenAI，只是没打印
+
+**真正的问题可能只是：**
+- 诊断消息的误导性
+- Provider统计打印频率太低
+
+**模板崩溃的根本原因更可能是：**
+- ENTROPY_COEF=1.0过低（已修复→1.5）
+- MIN_NEW_TOKENS=10过低（已修复→15）
+- 规则judge在ambig样本上的粗糙评分（无法区分reasoning质量）
+
+---
+
+**Commit:**
+- `1d2b4f3` - Enhance judge provider diagnostics: print every step (first 10 steps)
+
+---
+
+**Session 3 完成。已澄清LLM Judge状态，增强诊断可见性。**
+
+---
