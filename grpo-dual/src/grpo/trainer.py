@@ -176,7 +176,7 @@ class Config:
     HALUEVAL_FILES = {
         "dialogue": "dialogue_data.json",
         "qa": "qa_data.json",
-        "general": "general_data.json",
+        # "general": "general_data.json",  # ⚠️ 禁用：27%的标注将能力声明("as an AI...")误标为hallucination
         "summarization": "summarization_data.json",
     }
 
@@ -4051,6 +4051,35 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         # 【诊断增强】前10步每步打印，之后每5步打印
         if step < 10 or (step + 1) % 5 == 0:
             print(f"\n[Judge@step{step+1}] time={t_judge:.1f}s providers={provider_count}")
+
+        # 【诊断0分候选】前10步打印所有0分候选的详细信息，找出根本原因
+        if step < 10:
+            zero_score_count = sum(1 for r in rewards_list if abs(r) < 0.01)
+            if zero_score_count > 0:
+                print(f"\n{'='*80}")
+                print(f"[诊断: 0分候选详情@step{step+1}] 发现 {zero_score_count}/{len(rewards_list)} 个0分候选")
+                print(f"{'='*80}")
+                for i, r in enumerate(rewards_list):
+                    if abs(r) < 0.01:
+                        s = batch[idx_map[i]]
+                        task = tasks[idx_map[i]]
+                        print(f"\n候选 #{i} (0分):")
+                        print(f"  Task: {task}")
+                        print(f"  Dataset: {s.meta.get('dataset', 'N/A')}")
+                        if task == "fairness":
+                            print(f"    Category: {s.meta.get('category', 'N/A')}")
+                            print(f"    Context: {s.meta.get('context_condition', 'N/A')}")
+                            print(f"    Correct label: {s.meta.get('label', 'N/A')}")
+                            print(f"    Unknown option: {s.meta.get('unknown_option', 'N/A')}")
+                        elif task == "hallucination":
+                            print(f"    Subset: {s.meta.get('subset', 'N/A')}")
+                            print(f"    Has hallucination: {s.meta.get('has_hallucination', 'N/A')}")
+                            print(f"    Right answer: {s.meta.get('right_answer', 'N/A')[:50]}...")
+                        print(f"  Prompt (前150字符): {s.prompt[:150].replace(chr(10), ' ')}...")
+                        print(f"  Response (前250字符): {all_resps[i][:250].replace(chr(10), ' ')}...")
+                        print(f"  Response length: {all_lengths[i]} tokens")
+                        print(f"  -" * 40)
+                print(f"{'='*80}\n")
 
         # 【优先级2：长度惩罚】对Fairness极短回答进行惩罚，防止熵塌陷导致的1-token生成
         task_list = [tasks[idx_map[i]] for i in range(len(idx_map))]
