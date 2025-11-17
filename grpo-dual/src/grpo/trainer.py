@@ -3280,6 +3280,16 @@ def generate_candidates_batch(
         candidates_truncated = []
         prompt_len = None  # 记录这个prompt的长度
 
+        # 【诊断】打印生成参数（每个prompt第一次，前3步）
+        if step is not None and step < 3 and prompt_idx < 2:
+            print(f"\n🔧 [生成参数诊断] Prompt{prompt_idx}:")
+            print(f"  temperature={config.TEMPERATURE_TRAIN}")
+            print(f"  top_k={config.TOP_K_TRAIN}")
+            print(f"  top_p={config.TOP_P_TRAIN}")
+            print(f"  min_new_tokens={config.MIN_NEW_TOKENS_TRAIN}")
+            print(f"  max_new_tokens={max_new_tokens}")
+            print(f"  do_sample=True")
+
         # 为这个prompt生成k个候选
         for candidate_idx in range(k):
             # 【去重机制】最多重试3次，如果新候选与已有candidates太相似就重新生成
@@ -3327,11 +3337,12 @@ def generate_candidates_batch(
 
                 # 【去重检查】计算与已有candidates的相似度
                 is_duplicate = False
+                max_jaccard = 0.0  # 【诊断】记录最大相似度
                 if len(candidates_texts) > 0:
                     # 使用Jaccard相似度（词汇集合的交集/并集）
                     new_words = set(decoded.lower().split())
 
-                    for existing_text in candidates_texts:
+                    for existing_idx, existing_text in enumerate(candidates_texts):
                         existing_words = set(existing_text.lower().split())
 
                         if len(new_words) == 0 or len(existing_words) == 0:
@@ -3340,11 +3351,19 @@ def generate_candidates_batch(
                         intersection = len(new_words & existing_words)
                         union = len(new_words | existing_words)
                         jaccard_sim = intersection / union if union > 0 else 0
+                        max_jaccard = max(max_jaccard, jaccard_sim)  # 【诊断】更新最大值
 
                         # 【超激进阈值】相似度>0.65就视为重复（强制多样性）
                         if jaccard_sim > 0.65:
                             is_duplicate = True
+                            # 【诊断】打印重复详情
+                            if step is not None and step < 5:
+                                print(f"  🔍 [去重检测] Prompt{prompt_idx} Candidate{candidate_idx} vs Candidate{existing_idx}: Jaccard={jaccard_sim:.3f} > 0.65 → 重复")
                             break
+
+                # 【诊断】即使不重复，也打印相似度（前5步）
+                if step is not None and step < 5 and len(candidates_texts) > 0:
+                    print(f"  📊 [相似度] Prompt{prompt_idx} Candidate{candidate_idx}: max_jaccard={max_jaccard:.3f}, is_duplicate={is_duplicate}, retry={retry_count}")
 
                 # 如果不重复，或已经重试max_retries次，接受这个candidate
                 if not is_duplicate or retry_count >= max_retries:
@@ -4561,7 +4580,7 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
         # 收集指标
         with torch.no_grad():
             loss_total = 0.5*(loss_fair + loss_halu)
-            
+
             def _safe_mean(x, mask):
                 if mask.any(): 
                     return x[mask].mean().item()
@@ -4607,7 +4626,42 @@ def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
             # 其他指标
             adv_abs_mean = adv.abs().mean().item()
             delta_mean = delta.mean().item()
-        
+
+            # 【诊断】打印loss组件详情（前5步）
+            if step < 5:
+                # 计算各个组件的值
+                entropy_f = _safe_mean(sample_entropy, task_mask_f)
+                entropy_h = _safe_mean(sample_entropy, task_mask_h)
+
+                # 计算每个组件在loss中的贡献
+                reward_term_f = -surr[task_mask_f].mean().item() if task_mask_f.any() else 0.0
+                reward_term_h = -surr[task_mask_h].mean().item() if task_mask_h.any() else 0.0
+                kl_term_f = beta_f * kl_f_val
+                kl_term_h = beta_h * kl_h_val
+                entropy_term_f = config.ENTROPY_COEF * entropy_f
+                entropy_term_h = config.ENTROPY_COEF * entropy_h
+
+                print(f"\n{'='*80}")
+                print(f"🔬 [Loss组件诊断 @step{step+1}]")
+                print(f"{'='*80}")
+                print(f"Fairness Loss组件:")
+                print(f"  Reward项(负surrogate): {reward_term_f:+.4f}")
+                print(f"  KL项(β={beta_f:.4f}): {kl_term_f:+.4f}  (raw_kl={kl_f_val:.4f})")
+                print(f"  Entropy项(coef={config.ENTROPY_COEF}): {-entropy_term_f:+.4f}  (raw_entropy={entropy_f:.4f})")
+                print(f"  → Total Fairness Loss: {loss_fair.item():.4f}")
+                print(f"")
+                print(f"Hallucination Loss组件:")
+                print(f"  Reward项(负surrogate): {reward_term_h:+.4f}")
+                print(f"  KL项(β={beta_h:.4f}): {kl_term_h:+.4f}  (raw_kl={kl_h_val:.4f})")
+                print(f"  Entropy项(coef={config.ENTROPY_COEF}): {-entropy_term_h:+.4f}  (raw_entropy={entropy_h:.4f})")
+                print(f"  → Total Hallucination Loss: {loss_halu.item():.4f}")
+                print(f"")
+                print(f"整体:")
+                print(f"  Overall Loss: {loss_total.item():.4f}")
+                print(f"  Entropy项占比(F): {abs(entropy_term_f)/(abs(reward_term_f)+abs(kl_term_f)+abs(entropy_term_f)+1e-8)*100:.1f}%")
+                print(f"  Entropy项占比(H): {abs(entropy_term_h)/(abs(reward_term_h)+abs(kl_term_h)+abs(entropy_term_h)+1e-8)*100:.1f}%")
+                print(f"{'='*80}\n")
+
         # §7: 更新分支化KL控制器
         kl_controller.update(kl_f_val, kl_h_val)
 
