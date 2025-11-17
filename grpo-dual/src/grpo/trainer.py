@@ -208,8 +208,9 @@ class Config:
     K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
     MU_UPDATES = 1
     GRADIENT_ACCUMULATION_STEPS = 2  # 【显存优化】提升到2，保持有效batch=4（性能不变）
-    ENTROPY_COEF = 1.0               # 【保守方案A】从5.0回退到1.0，5.0过于激进导致模型崩溃
-                                     # 温和的熵正则化，配合降低的温度和token限制
+    ENTROPY_COEF = 1.5               # 【模板崩溃修复】从1.0提升到1.5，对抗模板化输出
+                                     # 发现问题：Step 5所有回答完全相同，熵值0.017（极端确定）
+                                     # 需要更强的熵正则化鼓励探索，避免万能模板策略
 
     # Reward Scale（多目标平衡）
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
@@ -231,8 +232,9 @@ class Config:
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
-    MIN_NEW_TOKENS_TRAIN = 10      # 【保持】防止过短回答，鼓励推理
-                                   # 平衡点：不能太高（30会导致模板化），也不能太低（5缺乏推理）
+    MIN_NEW_TOKENS_TRAIN = 15      # 【模板崩溃修复】从10提升到15，强制更长reasoning
+                                   # Step 5发现19-token模板："insufficient information"
+                                   # 提高最小长度要求，迫使模型提供更多justification
 
     TEMPERATURE_TRAIN = 0.9        # 【保守方案A】从1.15回退到0.9，降低随机性避免崩溃
                                    # 温和的温度配合LLM Judge既保证质量又有一定多样性
