@@ -150,7 +150,7 @@ class Config:
 
     # 路径（增加 run_id 隔离）
     RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-    WORKSPACE = Path("/workspace")
+    WORKSPACE = Path("/home/ubuntu/workspace")
     DATA_DIR = WORKSPACE / "data"
     BBQ_DIR = DATA_DIR / "bbq"
     HALUEVAL_DIR = DATA_DIR / "halueval"
@@ -3495,10 +3495,7 @@ def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> s
         return formatted
     except Exception as e:
         # Base model没有chat_template，使用简单格式
-        # 只打印一次警告，避免刷屏
-        if not hasattr(apply_chat_template, '_warned'):
-            print(f"⚠️ Chat template不可用（Base model），使用简单格式")
-            apply_chat_template._warned = True
+        print(f"⚠️ Chat template不可用（Base model），使用简单格式")
         if system_message:
             return f"### System\n{system_message}\n\n### User\n{prompt}\n\n### Assistant\n"
         else:
@@ -3623,9 +3620,6 @@ def load_model_and_tokenizer():
     try:
         import flash_attn
         attn_kwargs["attn_implementation"] = "flash_attention_2"
-        # Flash Attention 2 需要模型直接在 GPU 上初始化
-        if torch.cuda.is_available():
-            attn_kwargs["device_map"] = "auto"
         print("✅ Flash Attention 2 可用，已启用")
     except ImportError:
         print("⚠️ Flash Attention 2 不可用，使用默认实现")
@@ -3639,11 +3633,9 @@ def load_model_and_tokenizer():
         model = get_peft_model(model, lcfg)
         model.print_trainable_parameters()
 
-    # 如果没有使用 device_map，手动移动到设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not attn_kwargs.get("device_map"):
-        model.to(device)
-        base_model.to(device)
+    model.to(device)
+    base_model.to(device)
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
