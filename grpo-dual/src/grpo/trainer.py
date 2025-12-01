@@ -3624,8 +3624,8 @@ def load_model_and_tokenizer():
     except ImportError:
         print("⚠️ Flash Attention 2 不可用，使用默认实现")
 
-    model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra, **attn_kwargs)
-    base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, dtype=dtype, **extra, **attn_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)
+    base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)
 
     if config.USE_LORA:
         lcfg = LoraConfig(task_type=TaskType.CAUSAL_LM, r=config.LORA_R, lora_alpha=config.LORA_ALPHA,
