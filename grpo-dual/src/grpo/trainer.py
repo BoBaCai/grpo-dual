@@ -150,7 +150,7 @@ class Config:
 
     # 路径（增加 run_id 隔离）
     RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-    WORKSPACE = Path("/workspace")
+    WORKSPACE = Path("/home/ubuntu/workspace")
     DATA_DIR = WORKSPACE / "data"
     BBQ_DIR = DATA_DIR / "bbq"
     HALUEVAL_DIR = DATA_DIR / "halueval"
