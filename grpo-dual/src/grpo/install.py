@@ -19,6 +19,7 @@ print("\n包含:")
 print("- PyTorch 2.x (最新可用版本)")
 print("- Transformers 4.44.2 (稳定版，兼容 peft)")
 print("- PEFT 0.9.0")
+print("- Jinja2 >= 3.1.0 (支持 chat template)")
 print("- 所有必要依赖")
 print("\n预计时间: 5-10分钟")
 print("="*80)
@@ -70,9 +71,10 @@ run(
     f"sentencepiece "
     f"protobuf "
     f"'requests>=2.32.2' "
+    f"'jinja2>=3.1.0' "
     f"scipy "
     f"tqdm",
-    "步骤 5/6: 安装其他依赖"
+    "步骤 5/6: 安装其他依赖（含 jinja2>=3.1.0 支持 chat template）"
 )
 
 # ============================================================================
