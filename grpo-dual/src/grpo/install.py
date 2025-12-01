@@ -16,7 +16,7 @@ print("Multi-Objective GRPO 完整安装 - 最终版")
 print("="*80)
 print("\n包含:")
 print("- PyTorch 2.x (最新可用版本)")
-print("- Transformers 4.43+ (支持 Llama 3.1)")
+print("- Transformers 4.44.2 (稳定版，兼容 peft)")
 print("- PEFT 0.9.0")
 print("- 所有必要依赖")
 print("\n预计时间: 5-10分钟")
@@ -48,11 +48,11 @@ run(
 )
 
 # ============================================================================
-# 步骤 4: 安装 Transformers (最新版，支持 Llama 3.1)
+# 步骤 4: 安装 Transformers (固定版本，确保与 peft 0.9.0 兼容)
 # ============================================================================
 run(
-    f"{sys.executable} -m pip install 'transformers>=4.43.0'",
-    "步骤 4/6: 安装 Transformers (>=4.43.0，支持 Llama 3.1)"
+    f"{sys.executable} -m pip install 'transformers==4.44.2'",
+    "步骤 4/6: 安装 Transformers (4.44.2，兼容 peft 0.9.0)"
 )
 
 # ============================================================================
@@ -178,10 +178,10 @@ print("""
    !python multi_objective_lora_grpo_llama.py
 
 注意:
-- 已安装 Transformers 4.43+，支持 Llama 3.1
+- 已安装 Transformers 4.44.2，确保与 peft 0.9.0 兼容
 - 如果 PyTorch 显示 2.8.0，这是正常的最新版本
-- 训练脚本已配置为使用 Llama 3（而非 3.1）避免兼容性问题
-- 如果想用 Llama 3.1，在脚本中改回 "Llama-3.1-8B-Instruct"
+- 训练脚本配置为使用 Llama 3 Instruct
+- 版本已固定以避免依赖冲突
 """)
 
 print("="*80)
