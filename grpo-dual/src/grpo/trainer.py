@@ -3623,6 +3623,9 @@ def load_model_and_tokenizer():
     try:
         import flash_attn
         attn_kwargs["attn_implementation"] = "flash_attention_2"
+        # Flash Attention 2 需要模型直接在 GPU 上初始化
+        if torch.cuda.is_available():
+            attn_kwargs["device_map"] = "auto"
         print("✅ Flash Attention 2 可用，已启用")
     except ImportError:
         print("⚠️ Flash Attention 2 不可用，使用默认实现")
@@ -3636,9 +3639,11 @@ def load_model_and_tokenizer():
         model = get_peft_model(model, lcfg)
         model.print_trainable_parameters()
 
+    # 如果没有使用 device_map，手动移动到设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    base_model.to(device)
+    if not attn_kwargs.get("device_map"):
+        model.to(device)
+        base_model.to(device)
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
