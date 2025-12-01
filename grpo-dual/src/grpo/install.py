@@ -1,6 +1,7 @@
-OPENAI_API_KEY = joijo1
-HF_TOKEN = jjoijoij1
-ANTHROPIC_API_KEY = jd2oijdd2
+import os
+os.environ["OPENAI_API_KEY"] = "joijo1"
+os.environ["HF_TOKEN"] = "jjoijoij1"
+os.environ["ANTHROPIC_API_KEY"] = "jd2oijdd2"
 import subprocess
 import sys
 
@@ -184,4 +185,3 @@ print("""
 """)
 
 print("="*80)
-pip install flash-attn --no-build-isolation
