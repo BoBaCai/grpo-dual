@@ -1,7 +1,8 @@
 import os
-os.environ["OPENAI_API_KEY"] = "joijo1"
-os.environ["HF_TOKEN"] = "jjoijoij1"
-os.environ["ANTHROPIC_API_KEY"] = "jd2oijdd2"
+# 注意：请在 Jupyter notebook 中设置这些环境变量，不要硬编码在代码中
+# os.environ["OPENAI_API_KEY"] = "your-key"
+# os.environ["HF_TOKEN"] = "your-hf-token"
+# os.environ["ANTHROPIC_API_KEY"] = "your-key"
 import subprocess
 import sys
 
