@@ -1,7 +1,8 @@
 import os
-os.environ["OPENAI_API_KEY"] = "joijo1"
-os.environ["HF_TOKEN"] = "jjoijoij1"
-os.environ["ANTHROPIC_API_KEY"] = "jd2oijdd2"
+# 注意：请在 Jupyter notebook 中设置这些环境变量，不要硬编码在代码中
+# os.environ["OPENAI_API_KEY"] = "your-key"
+# os.environ["HF_TOKEN"] = "TOKENTOKEN"
+# os.environ["ANTHROPIC_API_KEY"] = "your-key"
 import subprocess
 import sys
 
@@ -16,8 +17,9 @@ print("Multi-Objective GRPO 完整安装 - 最终版")
 print("="*80)
 print("\n包含:")
 print("- PyTorch 2.x (最新可用版本)")
-print("- Transformers 4.43+ (支持 Llama 3.1)")
+print("- Transformers 4.44.2 (稳定版，兼容 peft)")
 print("- PEFT 0.9.0")
+print("- Jinja2 >= 3.1.0 (支持 chat template)")
 print("- 所有必要依赖")
 print("\n预计时间: 5-10分钟")
 print("="*80)
@@ -48,11 +50,11 @@ run(
 )
 
 # ============================================================================
-# 步骤 4: 安装 Transformers (最新版，支持 Llama 3.1)
+# 步骤 4: 安装 Transformers (固定版本，确保与 peft 0.9.0 兼容)
 # ============================================================================
 run(
-    f"{sys.executable} -m pip install 'transformers>=4.43.0'",
-    "步骤 4/6: 安装 Transformers (>=4.43.0，支持 Llama 3.1)"
+    f"{sys.executable} -m pip install 'transformers==4.44.2'",
+    "步骤 4/6: 安装 Transformers (4.44.2，兼容 peft 0.9.0)"
 )
 
 # ============================================================================
@@ -69,9 +71,10 @@ run(
     f"sentencepiece "
     f"protobuf "
     f"'requests>=2.32.2' "
+    f"'jinja2>=3.1.0' "
     f"scipy "
     f"tqdm",
-    "步骤 5/6: 安装其他依赖"
+    "步骤 5/6: 安装其他依赖（含 jinja2>=3.1.0 支持 chat template）"
 )
 
 # ============================================================================
@@ -178,10 +181,10 @@ print("""
    !python multi_objective_lora_grpo_llama.py
 
 注意:
-- 已安装 Transformers 4.43+，支持 Llama 3.1
+- 已安装 Transformers 4.44.2，确保与 peft 0.9.0 兼容
 - 如果 PyTorch 显示 2.8.0，这是正常的最新版本
-- 训练脚本已配置为使用 Llama 3（而非 3.1）避免兼容性问题
-- 如果想用 Llama 3.1，在脚本中改回 "Llama-3.1-8B-Instruct"
+- 训练脚本配置为使用 Llama 3 Instruct
+- 版本已固定以避免依赖冲突
 """)
 
 print("="*80)
