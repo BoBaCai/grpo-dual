@@ -3495,7 +3495,10 @@ def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> s
         return formatted
     except Exception as e:
         # Base model没有chat_template，使用简单格式
-        print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+        # 只打印一次警告，避免刷屏影响进度条显示
+        if not hasattr(apply_chat_template, '_warned'):
+            print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+            apply_chat_template._warned = True
         if system_message:
             return f"### System\n{system_message}\n\n### User\n{prompt}\n\n### Assistant\n"
         else:
@@ -3620,6 +3623,9 @@ def load_model_and_tokenizer():
     try:
         import flash_attn
         attn_kwargs["attn_implementation"] = "flash_attention_2"
+        # Flash Attention 2 需要模型直接在 GPU 上初始化，使用 device_map 自动管理
+        if torch.cuda.is_available():
+            attn_kwargs["device_map"] = "auto"
         print("✅ Flash Attention 2 可用，已启用")
     except ImportError:
         print("⚠️ Flash Attention 2 不可用，使用默认实现")
@@ -3634,8 +3640,10 @@ def load_model_and_tokenizer():
         model.print_trainable_parameters()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    base_model.to(device)
+    # 如果使用了 device_map="auto"，模型已经在 GPU 上，不需要再手动移动
+    if not attn_kwargs.get("device_map"):
+        model.to(device)
+        base_model.to(device)
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
