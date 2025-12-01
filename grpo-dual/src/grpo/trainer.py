@@ -3495,7 +3495,10 @@ def apply_chat_template(tokenizer, prompt: str, system_message: str = None) -> s
         return formatted
     except Exception as e:
         # Base model没有chat_template，使用简单格式
-        print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+        # 只打印一次警告，避免刷屏
+        if not hasattr(apply_chat_template, '_warned'):
+            print(f"⚠️ Chat template不可用（Base model），使用简单格式")
+            apply_chat_template._warned = True
         if system_message:
             return f"### System\n{system_message}\n\n### User\n{prompt}\n\n### Assistant\n"
         else:
