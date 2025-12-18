@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 # 注意：请在 Jupyter notebook 中设置这些环境变量，不要硬编码在代码中
 # os.environ["OPENAI_API_KEY"] = "your-key"
