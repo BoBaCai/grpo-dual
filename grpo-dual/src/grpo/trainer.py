@@ -289,16 +289,28 @@ class Config:
     SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
     SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（单卡 A100 40GB 优化配置）
-    # 注意：Jupyter中只能用单GPU，双GPU需要torchrun启动
+    # GRPO（自适应配置：torchrun DDP 双GPU / Jupyter 单GPU）
+    # 检测是否是真正的 DDP 环境（torchrun 启动）
+    _is_ddp_env = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 2     # 【显存优化】适配单卡 A100 40GB
-    K_ROLLOUTS = 3          # 【显存优化】降低内存压力
-                            # 单步生成：2 × 3 = 6条候选
+
+    if _is_ddp_env:
+        # torchrun 双GPU DDP 模式
+        GRPO_BATCH_SIZE = 4     # 每卡2样本 × 2卡 = 4总样本
+        K_ROLLOUTS = 4          # 显存充足，恢复到4
+        GRADIENT_ACCUMULATION_STEPS = 2  # DDP自动聚合，降低到2
+        # 单步生成：4 × 4 = 16条候选（双卡并行）
+        # 有效batch：4 × 2 = 8
+    else:
+        # Jupyter 单GPU 模式
+        GRPO_BATCH_SIZE = 2     # 单卡 A100 40GB
+        K_ROLLOUTS = 3          # 降低内存压力
+        GRADIENT_ACCUMULATION_STEPS = 3  # 有效batch = 2×3 = 6
+        # 单步生成：2 × 3 = 6条候选
+
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 3  # 【补偿】有效batch = 2×3 = 6
-                                     # 如使用torchrun启动双GPU，会自动调整为更大配置
     ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
                                      # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
                                      # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
