@@ -232,7 +232,11 @@ class Config:
     USE_GRADIENT_CHECKPOINTING = True
     USE_TORCH_COMPILE = False    # 【已禁用】编译开销>收益（SFT动态shape多，首次编译慢）
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
-    
+
+    # Flash Attention 2（可选加速）
+    TRY_FLASH_ATTENTION_2 = True  # 是否尝试使用 Flash Attention 2（如果不可用会自动降级）
+    QUIET_FLASH_ATTENTION_WARNING = False  # 是否静默 Flash Attention 不可用的警告
+
     # 【修改】生成配置：平衡质量与性能
     MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
     MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
@@ -3748,15 +3752,21 @@ def load_model_and_tokenizer():
 
     # 【加速优化】启用 Flash Attention 2（如果可用）
     attn_kwargs = {}
-    try:
-        import flash_attn
-        attn_kwargs["attn_implementation"] = "flash_attention_2"
-        # Flash Attention 2 需要模型直接在 GPU 上初始化，使用 device_map 自动管理
-        if torch.cuda.is_available():
-            attn_kwargs["device_map"] = "auto"
-        print("✅ Flash Attention 2 可用，已启用")
-    except ImportError:
-        print("⚠️ Flash Attention 2 不可用，使用默认实现")
+    if config.TRY_FLASH_ATTENTION_2:
+        try:
+            import flash_attn
+            attn_kwargs["attn_implementation"] = "flash_attention_2"
+            # Flash Attention 2 需要模型直接在 GPU 上初始化，使用 device_map 自动管理
+            if torch.cuda.is_available():
+                attn_kwargs["device_map"] = "auto"
+            print("✅ Flash Attention 2 可用，已启用")
+            print(f"   版本: {flash_attn.__version__}")
+        except ImportError:
+            if not config.QUIET_FLASH_ATTENTION_WARNING:
+                print("⚠️ Flash Attention 2 未安装，使用默认实现")
+                print("   如需启用，请运行：pip install flash-attn --no-build-isolation")
+    else:
+        print("ℹ️ Flash Attention 2 已禁用（TRY_FLASH_ATTENTION_2=False）")
 
     model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)
     base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)

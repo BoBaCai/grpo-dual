@@ -60,33 +60,34 @@ print("- PyTorch 2.x (最新可用版本)")
 print("- Transformers 4.44.2 (稳定版，兼容 peft)")
 print("- PEFT 0.9.0")
 print("- Jinja2 >= 3.1.0 (支持 chat template)")
+print("- Flash Attention 2 (可选加速)")
 print("- 所有必要依赖")
-print("\n预计时间: 5-10分钟")
+print("\n预计时间: 10-15分钟 (包含 Flash Attention 2 编译)")
 print("="*80)
 
 # 步骤 1: 完全卸载
 run(
     f"{sys.executable} -m pip uninstall -y "
     f"torch torchvision torchaudio "
-    f"transformers peft accelerate bitsandbytes datasets",
-    "步骤 1/6: 卸载现有包"
+    f"transformers peft accelerate bitsandbytes datasets flash-attn",
+    "步骤 1/7: 卸载现有包"
 )
 
 # 步骤 2: 清理
-run(f"{sys.executable} -m pip cache purge", "步骤 2/6: 清理缓存")
+run(f"{sys.executable} -m pip cache purge", "步骤 2/7: 清理缓存")
 
 # 步骤 3: 安装 PyTorch (使用最新稳定版)
 run(
     f"{sys.executable} -m pip install "
     f"torch torchvision torchaudio "
     f"--index-url https://download.pytorch.org/whl/cu121",
-    "步骤 3/6: 安装 PyTorch (CUDA 12.1)"
+    "步骤 3/7: 安装 PyTorch (CUDA 12.1)"
 )
 
 # 步骤 4: 安装 Transformers (固定版本，确保与 peft 0.9.0 兼容)
 run(
     f"{sys.executable} -m pip install 'transformers==4.44.2'",
-    "步骤 4/6: 安装 Transformers (4.44.2，兼容 peft 0.9.0)"
+    "步骤 4/7: 安装 Transformers (4.44.2，兼容 peft 0.9.0)"
 )
 
 # 步骤 5: 安装其他核心包
@@ -104,16 +105,22 @@ run(
     f"'jinja2>=3.1.0' "
     f"scipy "
     f"tqdm",
-    "步骤 5/6: 安装其他依赖（含 jinja2>=3.1.0 支持 chat template）"
+    "步骤 5/7: 安装其他依赖（含 jinja2>=3.1.0 支持 chat template）"
 )
 
-# 步骤 6: 验证
+# 步骤 6: 安装 Flash Attention 2（可选，加速训练）
+run(
+    f"{sys.executable} -m pip install flash-attn --no-build-isolation",
+    "步骤 6/7: 安装 Flash Attention 2（可选加速，需要编译，可能需要几分钟）"
+)
+
+# 步骤 7: 验证
 print("\n" + "="*80)
-print("步骤 6/6: 验证安装")
+print("步骤 7/7: 验证安装")
 print("="*80)
 
 # 验证代码
-verify_code = "import sys\n\npackages = [\n    ('torch', 'PyTorch'),\n    ('transformers', 'Transformers'),\n    ('peft', 'PEFT'),\n    ('accelerate', 'Accelerate'),\n    ('google.generativeai', 'Google GenAI'),\n    ('hf_transfer', 'HF Transfer')\n]\n\nprint('\\nPackage Verification:')\nprint('-' * 60)\nall_ok = True\nfor module_name, display_name in packages:\n    try:\n        mod = __import__(module_name)\n        ver = getattr(mod, '__version__', 'OK')\n        print(f'OK {display_name:20s} {ver}')\n    except Exception as e:\n        print(f'FAIL {display_name:20s} {e}')\n        all_ok = False\n\ntry:\n    import bitsandbytes\n    print(f'OK {\"BitsAndBytes\":20s} (optional)')\nexcept:\n    print(f'WARN {\"BitsAndBytes\":20s} not installed (optional)')\n\ntry:\n    import torch\n    print(f'\\nCUDA Available: {torch.cuda.is_available()}')\n    if torch.cuda.is_available():\n        print(f'GPU: {torch.cuda.get_device_name(0)}')\n        print(f'Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')\nexcept:\n    pass\n\ntry:\n    import transformers\n    from packaging import version\n    if version.parse(transformers.__version__) >= version.parse('4.43.0'):\n        print(f'\\nTransformers version supports Llama 3.1')\n    else:\n        print(f'\\nTransformers version may not support Llama 3.1')\nexcept:\n    pass\n\nsys.exit(0 if all_ok else 1)\n"
+verify_code = "import sys\n\npackages = [\n    ('torch', 'PyTorch'),\n    ('transformers', 'Transformers'),\n    ('peft', 'PEFT'),\n    ('accelerate', 'Accelerate'),\n    ('google.generativeai', 'Google GenAI'),\n    ('hf_transfer', 'HF Transfer')\n]\n\nprint('\\nPackage Verification:')\nprint('-' * 60)\nall_ok = True\nfor module_name, display_name in packages:\n    try:\n        mod = __import__(module_name)\n        ver = getattr(mod, '__version__', 'OK')\n        print(f'OK {display_name:20s} {ver}')\n    except Exception as e:\n        print(f'FAIL {display_name:20s} {e}')\n        all_ok = False\n\ntry:\n    import bitsandbytes\n    print(f'OK {\"BitsAndBytes\":20s} (optional)')\nexcept:\n    print(f'WARN {\"BitsAndBytes\":20s} not installed (optional)')\n\ntry:\n    import flash_attn\n    print(f'OK {\"Flash Attention 2\":20s} {flash_attn.__version__} (可选加速)')\nexcept:\n    print(f'WARN {\"Flash Attention 2\":20s} not installed (optional)')\n\ntry:\n    import torch\n    print(f'\\nCUDA Available: {torch.cuda.is_available()}')\n    if torch.cuda.is_available():\n        print(f'GPU: {torch.cuda.get_device_name(0)}')\n        print(f'Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')\nexcept:\n    pass\n\ntry:\n    import transformers\n    from packaging import version\n    if version.parse(transformers.__version__) >= version.parse('4.43.0'):\n        print(f'\\nTransformers version supports Llama 3.1')\n    else:\n        print(f'\\nTransformers version may not support Llama 3.1')\nexcept:\n    pass\n\nsys.exit(0 if all_ok else 1)\n"
 
 # 保存到临时文件并执行
 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
