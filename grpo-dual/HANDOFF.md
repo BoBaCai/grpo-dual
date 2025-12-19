@@ -6385,18 +6385,7 @@ else:
 - ✅ 自动验证是否填写了真实值
 - ✅ 即时反馈设置状态
 - ✅ 删除了错误的 GEMINI_API_KEY 引用
-
-✅ **2. 改进 setup_api_keys.py**
-
-**代码位置**: `grpo-dual/src/grpo/setup_api_keys.py`
-
-**用途**: kernel 重启后快速加载 API keys，无需重新运行完整安装脚本
-
-**特性**:
-- 轻量级脚本（<100 行）
-- 只负责设置环境变量
-- 包含验证和反馈
-- 提供 API keys 获取链接
+- ✅ kernel 重启后重新运行即可加载 API keys（无需额外文件）
 
 ### 完整使用流程
 
@@ -6419,7 +6408,7 @@ else:
 # 菜单: Kernel -> Restart Kernel
 
 # Step 4: 重新加载 API keys（重要！）
-%run src/grpo/install_notebook.py  # 或者使用 setup_api_keys.py
+%run src/grpo/install_notebook.py
 
 # Step 5: 运行训练
 %run src/grpo/trainer.py
@@ -6428,8 +6417,8 @@ else:
 **后续使用**（kernel 重启后）:
 
 ```python
-# 不需要重新安装，只需加载 API keys
-%run src/grpo/setup_api_keys.py  # 或者 install_notebook.py
+# 重新运行安装脚本来加载 API keys（跳过已安装的包）
+%run src/grpo/install_notebook.py
 %run src/grpo/trainer.py
 ```
 
@@ -6461,7 +6450,7 @@ JUDGE_PROVIDERS = [
 ### 常见问题排查
 
 **Q1: 为什么 kernel 重启后 API keys 就失效了？**
-A: Jupyter kernel 重启会清空所有环境变量。需要重新运行 install_notebook.py 或 setup_api_keys.py 来重新加载。
+A: Jupyter kernel 重启会清空所有环境变量。需要重新运行 install_notebook.py 来重新加载 API keys。
 
 **Q2: 我填写了 API key，但训练时还是报错 "No OPENAI_API_KEY"**
 A: 检查以下几点：
@@ -6480,15 +6469,16 @@ os.environ["HF_TOKEN"] = "你的token"
 
 ### 代码修改总结
 
-**修改文件**:
+**修改文件**（只有两个核心文件）:
 1. `src/grpo/install_notebook.py`: 添加 API keys 输入区域（第 9-47 行）
-2. `src/grpo/setup_api_keys.py`: 改进为轻量级加载脚本
+2. `src/grpo/trainer.py`: 集成数据下载功能（第 1084-1209 行）
 
 **核心改进**:
-- ✅ 提供清晰的 API keys 填写位置
+- ✅ 提供清晰的 API keys 填写位置（install_notebook.py）
 - ✅ 自动验证和即时反馈
-- ✅ 优化 kernel 重启后的工作流程
-- ✅ 统一 API keys 命名规范
-- ✅ 提供详细的使用指引
+- ✅ kernel 重启后重新运行 install_notebook.py 即可
+- ✅ 统一 API keys 命名规范（OPENAI_API_KEY, HF_TOKEN）
+- ✅ 数据集自动下载（trainer.py）
+- ✅ 无需额外的辅助文件
 
 ---
