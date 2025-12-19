@@ -201,16 +201,15 @@ class Config:
     SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
     SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（显存优化配置）
+    # GRPO（显存优化配置 - 适配单卡 A100 40GB）
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 6     # 【BBQ数据分析修复】从2增到6，确保每步至少2-3个disambig fairness样本
-                            # 原因：BATCH_SIZE=2时每步只有1个fairness，如果是ambig→100%零梯度
-                            # 增到6后：3个fairness样本，即使1个ambig，还有2个disambig提供梯度
-    K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
+    GRPO_BATCH_SIZE = 2     # 【显存优化】从6降到2，避免 OOM（单卡 A100 40GB）
+    K_ROLLOUTS = 3          # 【显存优化】从4降到3，降低内存压力
+                            # 单步生成总数：2 × 3 = 6（vs 之前 6×4=24，降低 75% 内存）
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 1  # 【BBQ数据分析修复】从2降到1，因为BATCH_SIZE已从2增到6
-                                     # 有效batch保持=6（vs之前2×2=4），略有增加但可接受
+    GRADIENT_ACCUMULATION_STEPS = 3  # 【补偿】从1增到3，保持有效batch = 2×3 = 6
+                                     # 这样训练效果与之前相同，但显存使用大幅降低
     ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
                                      # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
                                      # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
@@ -220,10 +219,10 @@ class Config:
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
     HALLUCINATION_REWARD_SCALE = 1.0 # Hallucination保持不变
 
-    # LoRA
+    # LoRA（显存优化）
     USE_LORA = True
-    LORA_R = 8              # 【显存优化】从16降到8，减少参数量
-    LORA_ALPHA = 16         # 同步调整 (保持 alpha=2*r)
+    LORA_R = 4              # 【显存优化】从8降到4，大幅减少参数量（40GB 单卡优化）
+    LORA_ALPHA = 8          # 同步调整 (保持 alpha=2*r)
     LORA_DROPOUT = 0.1
     TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
 
@@ -237,9 +236,9 @@ class Config:
     TRY_FLASH_ATTENTION_2 = True  # 是否尝试使用 Flash Attention 2（如果不可用会自动降级）
     QUIET_FLASH_ATTENTION_WARNING = False  # 是否静默 Flash Attention 不可用的警告
 
-    # 【修改】生成配置：平衡质量与性能
-    MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
-    MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
+    # 【修改】生成配置：平衡质量与性能（显存优化）
+    MAX_NEW_TOKENS_TRAIN = 64      # 【显存优化】从96降到64，节省内存（正常回答20-50 tokens足够）
+    MAX_NEW_TOKENS_EVAL = 64       # 评测同步调整
     MIN_NEW_TOKENS_TRAIN = 5       # 【2025-11-17深度诊断修复】从30大幅降到5，避免强制冗长
                                    # Steps 1-5证据：MIN=30强制冗长→后半段垃圾生成→40%得0分
                                    # 案例："Answer: C... >(); he answer is The gay friend.; Was this helpful?"
