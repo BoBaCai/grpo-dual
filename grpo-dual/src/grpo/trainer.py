@@ -4926,6 +4926,16 @@ def main():
     print(f"输出目录: {config.OUTPUT_DIR}")
     print("="*80)
 
+    # 【新增】自动下载数据集（如果缺失）
+    try:
+        from .data_downloader import ensure_datasets
+        ensure_datasets(config.DATA_DIR, force_download=False)
+    except ImportError:
+        print("⚠️ data_downloader 模块未找到，跳过自动下载")
+    except Exception as e:
+        print(f"⚠️ 数据集下载失败: {e}")
+        print("将尝试使用本地数据...")
+
     bbq  = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
     halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
     if not bbq or not halu:
