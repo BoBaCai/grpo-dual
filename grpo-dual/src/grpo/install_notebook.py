@@ -24,19 +24,19 @@ HF_TOKEN = "hf_..."  # 👈 替换为你的 Hugging Face token
 ANTHROPIC_API_KEY = ""  # 可选，留空即可
 
 # 设置环境变量
-if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-..."):
+if OPENAI_API_KEY and OPENAI_API_KEY != "sk-...":
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     print("✓ OPENAI_API_KEY 已设置")
 else:
     print("⚠️ OPENAI_API_KEY 未设置或仍是占位符")
 
-if HF_TOKEN and not HF_TOKEN.startswith("hf_..."):
+if HF_TOKEN and HF_TOKEN != "hf_...":
     os.environ["HF_TOKEN"] = HF_TOKEN
     print("✓ HF_TOKEN 已设置")
 else:
     print("⚠️ HF_TOKEN 未设置或仍是占位符")
 
-if ANTHROPIC_API_KEY and not ANTHROPIC_API_KEY.startswith("sk-ant-"):
+if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "" and ANTHROPIC_API_KEY != "sk-ant-...":
     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
     print("✓ ANTHROPIC_API_KEY 已设置")
 
