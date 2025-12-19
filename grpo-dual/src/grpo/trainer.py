@@ -117,6 +117,11 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from json import JSONDecodeError
 
+# 分布式训练支持
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # =============================================================================
 # torch.compile() 配置优化（修复CUDAGraph动态shape警告）
 # =============================================================================
@@ -156,11 +161,51 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"显存(GB): {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}")
+    if torch.cuda.device_count() > 1:
+        print(f"检测到 {torch.cuda.device_count()} 张 GPU，将启用分布式训练（DDP）")
 else:
     print("⚠️ 无 GPU，将非常慢")
 
 # =============================================================================
-# 配置（v2.2 改进版）
+# 分布式训练辅助函数
+# =============================================================================
+def setup_ddp():
+    """初始化分布式训练环境"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # 从环境变量读取（torchrun 启动）
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif torch.cuda.device_count() > 1:
+        # 在 Jupyter notebook 中手动设置
+        rank = 0  # 主进程
+        world_size = torch.cuda.device_count()
+        local_rank = 0
+        os.environ['RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['LOCAL_RANK'] = str(local_rank)
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '29500'
+    else:
+        # 单卡训练
+        return None, None, None, False
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+    return rank, world_size, local_rank, True
+
+def cleanup_ddp():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process(rank):
+    """判断是否为主进程"""
+    return rank is None or rank == 0
+
+# =============================================================================
+# 配置（v2.2 改进版 + DDP 支持）
 # =============================================================================
 class Config:
     # 基础模型
@@ -229,15 +274,15 @@ class Config:
     SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
     SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（显存优化配置 - 适配单卡 A100 40GB）
+    # GRPO（双卡 A100 80GB 优化配置 - DDP 数据并行）
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 2     # 【显存优化】从6降到2，避免 OOM（单卡 A100 40GB）
-    K_ROLLOUTS = 3          # 【显存优化】从4降到3，降低内存压力
-                            # 单步生成总数：2 × 3 = 6（vs 之前 6×4=24，降低 75% 内存）
+    GRPO_BATCH_SIZE = 4     # 【双卡优化】每张卡2个样本 × 2卡 = 4总样本（DDP数据并行）
+    K_ROLLOUTS = 4          # 【双卡优化】恢复到4（显存充足）
+                            # 单卡生成：2 × 4 = 8条候选，双卡总计：4 × 4 = 16条（充分利用）
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 3  # 【补偿】从1增到3，保持有效batch = 2×3 = 6
-                                     # 这样训练效果与之前相同，但显存使用大幅降低
+    GRADIENT_ACCUMULATION_STEPS = 2  # 【双卡优化】降低到2，有效batch = 4×2 = 8
+                                     # DDP会自动聚合两卡梯度，无需过多累积
     ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
                                      # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
                                      # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
@@ -3733,12 +3778,15 @@ def get_eos_token_ids(tokenizer) -> List[int]:
 # =============================================================================
 # 模型加载（dtorch：用 dtype，不用 torch_dtype）
 # =============================================================================
-def load_model_and_tokenizer():
+def load_model_and_tokenizer(rank=None, world_size=None, local_rank=None):
     """
     🔥🔥🔥 版本检查点 #1 - 如果你能看到这个，说明用的是最新代码！🔥🔥🔥
+    支持DDP分布式训练
     """
     print("\n" + "="*80)
     print("加载模型")
+    if world_size and world_size > 1:
+        print(f"  分布式训练模式: Rank {rank}/{world_size-1}, Local Rank {local_rank}")
     print("="*80)
     from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
     from peft import LoraConfig, get_peft_model, TaskType
@@ -3802,13 +3850,20 @@ def load_model_and_tokenizer():
         try:
             import flash_attn
             attn_kwargs["attn_implementation"] = "flash_attention_2"
-            # 【修复】强制使用单张 GPU（cuda:0），避免多 GPU 设备不匹配
-            # 注意：即使有多张 GPU，这个训练代码只支持单卡
+            # 【DDP支持】根据是否分布式训练设置device_map
             if torch.cuda.is_available():
-                attn_kwargs["device_map"] = {"": 0}  # 强制所有层都在 cuda:0
+                if local_rank is not None:
+                    # DDP模式：每个进程使用对应的GPU
+                    attn_kwargs["device_map"] = {"": local_rank}
+                else:
+                    # 单卡模式：使用cuda:0
+                    attn_kwargs["device_map"] = {"": 0}
             print("✅ Flash Attention 2 可用，已启用")
             print(f"   版本: {flash_attn.__version__}")
-            print("   使用单张 GPU (cuda:0)")
+            if local_rank is not None:
+                print(f"   使用GPU: cuda:{local_rank}")
+            else:
+                print("   使用GPU: cuda:0")
         except ImportError:
             if not config.QUIET_FLASH_ATTENTION_WARNING:
                 print("⚠️ Flash Attention 2 未安装，使用默认实现")
@@ -3823,10 +3878,14 @@ def load_model_and_tokenizer():
         lcfg = LoraConfig(task_type=TaskType.CAUSAL_LM, r=config.LORA_R, lora_alpha=config.LORA_ALPHA,
                           lora_dropout=config.LORA_DROPOUT, target_modules=config.TARGET_MODULES, bias="none")
         model = get_peft_model(model, lcfg)
-        model.print_trainable_parameters()
+        if is_main_process(rank):
+            model.print_trainable_parameters()
 
-    # 【修复】明确使用 cuda:0（第一张 GPU），避免多 GPU 设备不匹配
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # 【DDP支持】设置正确的device
+    if local_rank is not None:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"✓ 设备: {device}")
 
     # 如果使用了 device_map，模型已经在 GPU 上，不需要再手动移动
@@ -3835,6 +3894,13 @@ def load_model_and_tokenizer():
         base_model.to(device)
     else:
         print("  模型已通过 device_map 加载到 GPU")
+
+    # 【DDP包装】在分布式训练时用DDP包装模型
+    if world_size and world_size > 1:
+        print(f"\n🚀 启用DDP (Distributed Data Parallel)...")
+        # 注意：base_model不需要DDP包装，因为它只用于推理
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        print(f"✅ 模型已用DDP包装 (GPU {local_rank})")
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
@@ -4142,9 +4208,10 @@ class MultiObjectiveDataset(torch.utils.data.Dataset):
 # =============================================================================
 # GRPO（含分段计时 + 批量生成 + ref_lp 复用 + provider 统计 + 完整指标记录）
 # =============================================================================
-def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
+def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto, rank=None):
     """
     🔥🔥🔥 版本检查点 #2 - 如果你能看到这个，说明用的是最新代码！🔥🔥🔥
+    【DDP支持】支持分布式数据并行训练
 
     Claude 理解：这个函数实现了 GRPO 多目标强化学习训练，核心是通过分支化 KL 控制器
     同时优化 Fluency 和 Hallucination 两个目标，使用 LoRA 进行参数高效微调，
@@ -5111,68 +5178,93 @@ def evaluate_objective(model, tokenizer, device, judge, dataset, task: str, n_sa
 # 主流程
 # =============================================================================
 def main():
-    # SDK 安装与自检
-    _bootstrap_sdks_and_check()
-    
-    # 【新增】统一种子设置
-    set_all_seeds(42)
-    
-    print("\n" + "="*80)
-    print(f"训练运行 ID: {config.RUN_ID}")
-    print(f"输出目录: {config.OUTPUT_DIR}")
-    print("="*80)
+    # 【DDP支持】初始化分布式训练环境
+    rank, world_size, local_rank, is_ddp = setup_ddp()
 
-    # 【新增】自动下载数据集（如果缺失）
     try:
-        ensure_datasets_available(config.DATA_DIR)
-    except Exception as e:
-        print(f"⚠️ 数据集下载失败: {e}")
-        print("将尝试使用本地数据...")
+        # SDK 安装与自检（仅主进程）
+        if is_main_process(rank):
+            _bootstrap_sdks_and_check()
 
-    bbq  = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
-    halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
-    if not bbq or not halu:
-        print("❌ 数据不足（BBQ/HaluEval 至少一类为空）")
-        return
-    dataset = MultiObjectiveDataset(bbq, halu)
+        # 【新增】统一种子设置（所有进程）
+        set_all_seeds(42 + (rank if rank else 0))  # 每个进程使用不同种子确保数据多样性
 
-    model, base_model, tokenizer, device = load_model_and_tokenizer()
-    judge = MultiCloudJudge()
-    pareto = ParetoFrontier(max_checkpoints=config.N_PARETO_CHECKPOINTS)
+        if is_main_process(rank):
+            print("\n" + "="*80)
+            print(f"训练运行 ID: {config.RUN_ID}")
+            print(f"输出目录: {config.OUTPUT_DIR}")
+            if is_ddp:
+                print(f"分布式训练: {world_size} GPUs")
+            print("="*80)
 
-    if config.DO_SFT_CONTINUE:
-        sft_continue(model, tokenizer, device, dataset)
+        # 【新增】自动下载数据集（如果缺失）- 仅主进程
+        if is_main_process(rank):
+            try:
+                ensure_datasets_available(config.DATA_DIR)
+            except Exception as e:
+                print(f"⚠️ 数据集下载失败: {e}")
+                print("将尝试使用本地数据...")
 
-    if config.DO_GRPO:
-        grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto)
+        # 等待主进程下载完成
+        if is_ddp:
+            dist.barrier()
 
-    print("\n保存最终模型...")
-    final_path = config.OUTPUT_DIR / "final_model"
-    final_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_path)
-    tokenizer.save_pretrained(final_path)
+        bbq  = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
+        halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
+        if not bbq or not halu:
+            if is_main_process(rank):
+                print("❌ 数据不足（BBQ/HaluEval 至少一类为空）")
+            return
+        dataset = MultiObjectiveDataset(bbq, halu)
 
-    best = pareto.get_best()
-    if best:
-        print("\n" + "="*80)
-        print("最佳 Pareto 点")
-        print(f"Step: {best.step}\nFairness: {best.fairness_score:.3f}\nHallucination: {best.hallucination_score:.3f}")
-        print("="*80)
+        model, base_model, tokenizer, device = load_model_and_tokenizer(rank, world_size, local_rank)
+        judge = MultiCloudJudge()
+        pareto = ParetoFrontier(max_checkpoints=config.N_PARETO_CHECKPOINTS)
 
-    report = {
-        "run_id": config.RUN_ID,
-        "timestamp": datetime.now().isoformat(),
-        "config": {"model": config.BASE_MODEL, "sft_steps": config.SFT_STEPS,
-                   "grpo_steps": config.GRPO_STEPS, "lora_r": config.LORA_R, "bf16": config.USE_BF16,
-                   "reward_normalize": config.REWARD_NORMALIZE,
-                   "max_new_tokens_train": config.MAX_NEW_TOKENS_TRAIN,
-                   "max_new_tokens_eval": config.MAX_NEW_TOKENS_EVAL},
-        "dataset_stats": {"n_fairness": len(bbq), "n_hallucination": len(halu)}
-    }
-    with open(config.OUTPUT_DIR/"final_report.json","w") as f:
-        json.dump(report, f, indent=2)
-    print("✅ 训练完成")
-    print(f"输出目录: {config.OUTPUT_DIR}")
+        if config.DO_SFT_CONTINUE:
+            sft_continue(model, tokenizer, device, dataset)
+
+        if config.DO_GRPO:
+            grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto, rank)
+
+        # 【DDP支持】只在主进程保存模型
+        if is_main_process(rank):
+            print("\n保存最终模型...")
+            final_path = config.OUTPUT_DIR / "final_model"
+            final_path.mkdir(parents=True, exist_ok=True)
+
+            # 保存DDP模型需要访问module属性
+            model_to_save = model.module if hasattr(model, 'module') else model
+            model_to_save.save_pretrained(final_path)
+            tokenizer.save_pretrained(final_path)
+
+            best = pareto.get_best()
+            if best:
+                print("\n" + "="*80)
+                print("最佳 Pareto 点")
+                print(f"Step: {best.step}\nFairness: {best.fairness_score:.3f}\nHallucination: {best.hallucination_score:.3f}")
+                print("="*80)
+
+            report = {
+                "run_id": config.RUN_ID,
+                "timestamp": datetime.now().isoformat(),
+                "config": {"model": config.BASE_MODEL, "sft_steps": config.SFT_STEPS,
+                           "grpo_steps": config.GRPO_STEPS, "lora_r": config.LORA_R, "bf16": config.USE_BF16,
+                           "reward_normalize": config.REWARD_NORMALIZE,
+                           "max_new_tokens_train": config.MAX_NEW_TOKENS_TRAIN,
+                           "max_new_tokens_eval": config.MAX_NEW_TOKENS_EVAL,
+                           "ddp_enabled": is_ddp,
+                           "world_size": world_size if is_ddp else 1},
+                "dataset_stats": {"n_fairness": len(bbq), "n_hallucination": len(halu)}
+            }
+            with open(config.OUTPUT_DIR/"final_report.json","w") as f:
+                json.dump(report, f, indent=2)
+            print("✅ 训练完成")
+            print(f"输出目录: {config.OUTPUT_DIR}")
+
+    finally:
+        # 【DDP支持】清理分布式环境
+        cleanup_ddp()
 
 if __name__ == "__main__":
     main()
