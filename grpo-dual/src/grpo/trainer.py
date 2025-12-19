@@ -18,9 +18,28 @@ Claude verified: This is the 2624-line trainer.py file
 """
 
 # =============================================================================
+# RunPod 路径配置（解决磁盘空间不足问题）
+# =============================================================================
+import os as _os
+import pathlib as _pathlib
+
+# 检测是否在 RunPod 环境（/workspace 存在）
+_workspace_path = _pathlib.Path("/workspace")
+if _workspace_path.exists() and _workspace_path.is_dir():
+    # 设置 HuggingFace 缓存到 /workspace（大容量磁盘）
+    _cache_dir = _workspace_path / ".cache" / "huggingface"
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _os.environ["HF_HOME"] = str(_cache_dir)
+    _os.environ["TRANSFORMERS_CACHE"] = str(_cache_dir / "transformers")
+    _os.environ["HF_DATASETS_CACHE"] = str(_cache_dir / "datasets")
+    print(f"✓ RunPod 环境检测到，HuggingFace 缓存目录设置为: {_cache_dir}")
+else:
+    print("ℹ️ 非 RunPod 环境，使用默认缓存目录")
+
+# =============================================================================
 # 一键安装 & 冒烟自检（当前内核）
 # =============================================================================
-import sys as _sys, subprocess as _sp, importlib as _il, os as _os
+import sys as _sys, subprocess as _sp, importlib as _il
 
 def _bootstrap_sdks_and_check():
     pkgs = []
@@ -148,9 +167,18 @@ class Config:
     BASE_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"  # 【实验结果：Base model表现更差，改回Instruct】
     HF_TOKEN = HF_TOKEN
 
-    # 路径（增加 run_id 隔离）
+    # 路径（自动检测环境：RunPod vs AWS Lambda）
     RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-    WORKSPACE = Path("/home/ubuntu/workspace")
+
+    # 自动选择 workspace 路径
+    if Path("/workspace").exists():
+        WORKSPACE = Path("/workspace")  # RunPod
+    elif Path("/home/ubuntu/workspace").exists():
+        WORKSPACE = Path("/home/ubuntu/workspace")  # AWS Lambda
+    else:
+        WORKSPACE = Path.cwd() / "workspace"  # 本地/其他环境
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+
     DATA_DIR = WORKSPACE / "data"
     BBQ_DIR = DATA_DIR / "bbq"
     HALUEVAL_DIR = DATA_DIR / "halueval"

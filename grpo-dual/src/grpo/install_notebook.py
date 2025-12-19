@@ -5,6 +5,25 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+# =============================================================================
+# RunPod 路径配置（解决磁盘空间不足问题）
+# =============================================================================
+# 检测是否在 RunPod 环境（/workspace 存在）
+workspace_path = Path("/workspace")
+if workspace_path.exists() and workspace_path.is_dir():
+    # 设置 HuggingFace 缓存到 /workspace（大容量磁盘）
+    cache_dir = workspace_path / ".cache" / "huggingface"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(cache_dir)
+    os.environ["TRANSFORMERS_CACHE"] = str(cache_dir / "transformers")
+    os.environ["HF_DATASETS_CACHE"] = str(cache_dir / "datasets")
+    print(f"✓ RunPod 环境检测到，HuggingFace 缓存目录设置为: {cache_dir}")
+else:
+    print("ℹ️ 非 RunPod 环境，使用默认缓存目录")
+
+print("")
 
 # =============================================================================
 # 👉 第一步：在这里设置你的 API Keys（先填写，再运行安装）
