@@ -6345,3 +6345,150 @@ def main():
 修改 `Config.DATA_DIR` 配置项
 
 ---
+
+## 🔧 问题10：API Keys 配置适配和使用流程优化（2025-12-19）
+
+**更新时间**: 2025-12-19
+**状态**: ✅ 已完成
+
+### 问题背景
+
+用户反馈：即使输入了 API keys 也用不了。原因分析：
+1. `install_notebook.py` 只打印了设置说明，没有实际提供输入 API keys 的地方
+2. API keys 命名不一致（提到 GEMINI_API_KEY，但训练不使用）
+3. kernel 重启后环境变量丢失，用户不清楚如何重新加载
+4. 缺少清晰的操作流程指引
+
+### 修复内容
+
+✅ **1. 修改 install_notebook.py**
+
+**代码位置**: `grpo-dual/src/grpo/install_notebook.py`
+
+**新增功能**（第 9-47 行）:
+```python
+# 脚本开头提供 API Keys 输入区域
+OPENAI_API_KEY = "sk-..."  # 👈 用户在这里填写
+HF_TOKEN = "hf_..."        # 👈 用户在这里填写
+ANTHROPIC_API_KEY = ""     # 可选
+
+# 自动验证并设置环境变量
+if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-..."):
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    print("✓ OPENAI_API_KEY 已设置")
+else:
+    print("⚠️ OPENAI_API_KEY 未设置或仍是占位符")
+```
+
+**优势**:
+- ✅ 用户直接在脚本开头填写 API keys
+- ✅ 自动验证是否填写了真实值
+- ✅ 即时反馈设置状态
+- ✅ 删除了错误的 GEMINI_API_KEY 引用
+
+✅ **2. 改进 setup_api_keys.py**
+
+**代码位置**: `grpo-dual/src/grpo/setup_api_keys.py`
+
+**用途**: kernel 重启后快速加载 API keys，无需重新运行完整安装脚本
+
+**特性**:
+- 轻量级脚本（<100 行）
+- 只负责设置环境变量
+- 包含验证和反馈
+- 提供 API keys 获取链接
+
+### 完整使用流程
+
+**首次安装和设置**:
+
+```python
+# Step 1: 编辑 install_notebook.py，填写 API keys
+# 将第 16、20 行的占位符替换为真实值：
+# OPENAI_API_KEY = "sk-proj-xxxxx"  # 你的真实 key
+# HF_TOKEN = "hf_xxxxx"              # 你的真实 token
+
+# Step 2: 运行安装脚本
+%run src/grpo/install_notebook.py
+# 输出：
+# ✓ OPENAI_API_KEY 已设置
+# ✓ HF_TOKEN 已设置
+# ... 安装过程 ...
+
+# Step 3: 重启 kernel
+# 菜单: Kernel -> Restart Kernel
+
+# Step 4: 重新加载 API keys（重要！）
+%run src/grpo/install_notebook.py  # 或者使用 setup_api_keys.py
+
+# Step 5: 运行训练
+%run src/grpo/trainer.py
+```
+
+**后续使用**（kernel 重启后）:
+
+```python
+# 不需要重新安装，只需加载 API keys
+%run src/grpo/setup_api_keys.py  # 或者 install_notebook.py
+%run src/grpo/trainer.py
+```
+
+### 必需的 API Keys
+
+| API Key | 用途 | 获取地址 | 必需 |
+|---------|------|---------|------|
+| OPENAI_API_KEY | LLM Judge (gpt-4o-mini) | https://platform.openai.com/api-keys | ✅ 是 |
+| HF_TOKEN | 下载 Llama-3-8B-Instruct | https://huggingface.co/settings/tokens | ✅ 是 |
+| ANTHROPIC_API_KEY | Claude Judge (可选) | https://console.anthropic.com/settings/keys | ⭕ 否 |
+
+### trainer.py 的 API 配置
+
+**当前配置**:
+```python
+# Config 类
+LLM_JUDGE_MODEL = "gpt-4o-mini"  # 使用 OpenAI
+JUDGE_PROVIDERS = [
+    {"name": "openai", "model": "gpt-4o-mini"}
+]
+```
+
+**检查点**:
+- trainer.py Line 38: 检查 OPENAI_API_KEY 是否设置
+- trainer.py Line 133: 打印环境变量状态
+- trainer.py Line 1728-1729: 调用 OpenAI API 前验证 key
+- trainer.py Line 1750-1751: 调用 Claude API 前验证 key
+
+### 常见问题排查
+
+**Q1: 为什么 kernel 重启后 API keys 就失效了？**
+A: Jupyter kernel 重启会清空所有环境变量。需要重新运行 install_notebook.py 或 setup_api_keys.py 来重新加载。
+
+**Q2: 我填写了 API key，但训练时还是报错 "No OPENAI_API_KEY"**
+A: 检查以下几点：
+1. 确认 key 不是占位符（不是 "sk-..." 或 "hf_..."）
+2. 确认看到了 "✓ OPENAI_API_KEY 已设置" 的提示
+3. kernel 重启后是否重新运行了设置脚本
+4. 在训练前运行 `print(os.environ.get("OPENAI_API_KEY"))` 验证
+
+**Q3: 可以在另一个 cell 中设置 API keys 吗？**
+A: 可以，但必须在运行训练脚本之前执行：
+```python
+import os
+os.environ["OPENAI_API_KEY"] = "你的key"
+os.environ["HF_TOKEN"] = "你的token"
+```
+
+### 代码修改总结
+
+**修改文件**:
+1. `src/grpo/install_notebook.py`: 添加 API keys 输入区域（第 9-47 行）
+2. `src/grpo/setup_api_keys.py`: 改进为轻量级加载脚本
+
+**核心改进**:
+- ✅ 提供清晰的 API keys 填写位置
+- ✅ 自动验证和即时反馈
+- ✅ 优化 kernel 重启后的工作流程
+- ✅ 统一 API keys 命名规范
+- ✅ 提供详细的使用指引
+
+---

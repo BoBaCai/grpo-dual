@@ -6,6 +6,46 @@ import subprocess
 import sys
 import tempfile
 
+# =============================================================================
+# 👉 第一步：在这里设置你的 API Keys（先填写，再运行安装）
+# =============================================================================
+# 请将下面的占位符替换为你的真实 API keys，然后运行这个 cell
+
+# OpenAI API Key（必需）- 用于 LLM Judge
+# 获取地址：https://platform.openai.com/api-keys
+OPENAI_API_KEY = "sk-..."  # 👈 替换为你的 OpenAI API key
+
+# Hugging Face Token（必需）- 用于下载 Llama 模型
+# 获取地址：https://huggingface.co/settings/tokens
+HF_TOKEN = "hf_..."  # 👈 替换为你的 Hugging Face token
+
+# Anthropic API Key（可选）- 如果使用 Claude 作为 Judge
+# 获取地址：https://console.anthropic.com/settings/keys
+ANTHROPIC_API_KEY = ""  # 可选，留空即可
+
+# 设置环境变量
+if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-..."):
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    print("✓ OPENAI_API_KEY 已设置")
+else:
+    print("⚠️ OPENAI_API_KEY 未设置或仍是占位符")
+
+if HF_TOKEN and not HF_TOKEN.startswith("hf_..."):
+    os.environ["HF_TOKEN"] = HF_TOKEN
+    print("✓ HF_TOKEN 已设置")
+else:
+    print("⚠️ HF_TOKEN 未设置或仍是占位符")
+
+if ANTHROPIC_API_KEY and not ANTHROPIC_API_KEY.startswith("sk-ant-"):
+    os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    print("✓ ANTHROPIC_API_KEY 已设置")
+
+print("")
+
+# =============================================================================
+# 安装开始
+# =============================================================================
+
 def run(cmd, desc=""):
     if desc:
         print(f"\n{'='*80}\n{desc}\n{'='*80}")
@@ -93,25 +133,20 @@ print("\n" + "="*80)
 print("安装完成")
 print("="*80)
 
-print("\n重要步骤:")
+print("\n下一步操作:")
 print("\n1. 立即重启 Jupyter Kernel")
 print("   菜单: Kernel -> Restart Kernel")
-print("\n2. 重启后验证:")
-print("   import torch")
-print("   import transformers")
-print("   print(f'PyTorch: {torch.__version__}')")
-print("   print(f'Transformers: {transformers.__version__}')")
-print("   print(f'CUDA: {torch.cuda.is_available()}')")
-print("\n3. 设置环境变量:")
-print("   import os")
-print("   os.environ['GEMINI_API_KEY'] = 'your-key'")
-print("   os.environ['HF_TOKEN'] = 'your-token'")
-print("\n4. 运行训练:")
-print("   !python multi_objective_lora_grpo_llama.py")
+print("   重启后才能使用新安装的包")
+print("\n2. 重启后，重新运行这个安装脚本")
+print("   这样 API Keys 会重新加载到环境变量中")
+print("\n3. 然后就可以运行训练了:")
+print("   %run src/grpo/trainer.py")
 print("\n注意:")
 print("- 已安装 Transformers 4.44.2，确保与 peft 0.9.0 兼容")
 print("- 如果 PyTorch 显示 2.8.0，这是正常的最新版本")
 print("- 训练脚本配置为使用 Llama 3 Instruct")
-print("- 版本已固定以避免依赖冲突")
+print("- LLM Judge 默认使用 gpt-4o-mini（需要 OPENAI_API_KEY）")
+print("- 数据集会自动从 GitHub 下载")
+print("\n⚠️ 重要：kernel 重启后，需要重新运行这个脚本来加载 API Keys")
 
 print("\n" + "="*80)
