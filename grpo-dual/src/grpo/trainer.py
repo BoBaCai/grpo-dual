@@ -3838,6 +3838,7 @@ def load_model_and_tokenizer():
 def tokenize_sft_pair(tokenizer, prompt: str, target: str, device):
     """
     【修复】使用与GRPO相同的chat template，确保SFT→RL一致性
+    【修复】确保所有张量都在正确的设备上
     """
     # 【关键修复】使用chat template（与GRPO generate保持一致）
     system_msg = "You are a helpful, accurate, and unbiased assistant."
@@ -3851,17 +3852,21 @@ def tokenize_sft_pair(tokenizer, prompt: str, target: str, device):
     full_text = formatted_prompt + target
     full_ids = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
 
-    input_ids = full_ids["input_ids"]
+    # 【修复】立即将所有张量移到正确的设备上
+    input_ids = full_ids["input_ids"].to(device)
     attn_mask = full_ids.get("attention_mask")
+    if attn_mask is not None:
+        attn_mask = attn_mask.to(device)
+
     labels = input_ids.clone()
 
     # Mask掉prompt部分（只对assistant回复部分计算loss）
     prompt_len = prompt_ids["input_ids"].shape[1]
     labels[:, :prompt_len] = -100
 
-    batch = {"input_ids": input_ids.to(device), "labels": labels.to(device)}
+    batch = {"input_ids": input_ids, "labels": labels}
     if attn_mask is not None:
-        batch["attention_mask"] = attn_mask.to(device)
+        batch["attention_mask"] = attn_mask
 
     return batch
 
