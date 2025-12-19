@@ -13,7 +13,9 @@ import tempfile
 
 # OpenAI API Key（必需）- 用于 LLM Judge
 # 获取地址：https://platform.openai.com/api-keys
-OPENAI_API_KEY = "sk-..."  # 👈 替换为你的 OpenAI API key
+# ⚠️ 重要：API key 必须是一行，不能有空格或换行符
+# 示例格式：sk-proj-... 或 sk-...
+OPENAI_API_KEY = "sk-..."  # 👈 替换为你的 OpenAI API key（确保没有多余空格）
 
 # Hugging Face Token（必需）- 用于下载 Llama 模型
 # 获取地址：https://huggingface.co/settings/tokens
@@ -23,22 +25,28 @@ HF_TOKEN = "hf_..."  # 👈 替换为你的 Hugging Face token
 # 获取地址：https://console.anthropic.com/settings/keys
 ANTHROPIC_API_KEY = ""  # 可选，留空即可
 
-# 设置环境变量
+# 设置环境变量（自动清理多余空格）
 if OPENAI_API_KEY and OPENAI_API_KEY != "sk-...":
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+    cleaned_key = OPENAI_API_KEY.strip()  # 清理首尾空格
+    os.environ["OPENAI_API_KEY"] = cleaned_key
     print("✓ OPENAI_API_KEY 已设置")
+    print(f"  格式: {cleaned_key[:10]}...{cleaned_key[-4:]}")  # 显示前10位和后4位以验证
 else:
     print("⚠️ OPENAI_API_KEY 未设置或仍是占位符")
 
 if HF_TOKEN and HF_TOKEN != "hf_...":
-    os.environ["HF_TOKEN"] = HF_TOKEN
+    cleaned_token = HF_TOKEN.strip()  # 清理首尾空格
+    os.environ["HF_TOKEN"] = cleaned_token
     print("✓ HF_TOKEN 已设置")
+    print(f"  格式: {cleaned_token[:10]}...{cleaned_token[-4:]}")
 else:
     print("⚠️ HF_TOKEN 未设置或仍是占位符")
 
 if ANTHROPIC_API_KEY and ANTHROPIC_API_KEY != "" and ANTHROPIC_API_KEY != "sk-ant-...":
-    os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    cleaned_anthropic = ANTHROPIC_API_KEY.strip()  # 清理首尾空格
+    os.environ["ANTHROPIC_API_KEY"] = cleaned_anthropic
     print("✓ ANTHROPIC_API_KEY 已设置")
+    print(f"  格式: {cleaned_anthropic[:10]}...{cleaned_anthropic[-4:]}")
 
 print("")
 
