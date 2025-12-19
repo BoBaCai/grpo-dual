@@ -169,31 +169,46 @@ else:
 # =============================================================================
 # 分布式训练辅助函数
 # =============================================================================
+def is_notebook():
+    """检测是否在Jupyter notebook环境中"""
+    try:
+        from IPython import get_ipython
+        if 'IPKernelApp' in get_ipython().config:
+            return True
+    except:
+        pass
+    return False
+
 def setup_ddp():
-    """初始化分布式训练环境"""
+    """
+    初始化分布式训练环境
+    注意：Jupyter notebook中无法使用真正的DDP（需要多进程）
+    在notebook中会自动降级为单GPU或DataParallel
+    """
+    # 检测Jupyter环境和多GPU情况
+    in_notebook = is_notebook()
+    num_gpus = torch.cuda.device_count()
+
+    if in_notebook and num_gpus > 1:
+        print("⚠️ 检测到Jupyter环境 + 多GPU")
+        print(f"   Jupyter中无法使用DDP（需要torchrun启动多进程）")
+        print(f"   将使用单GPU模式（GPU 0）")
+        print(f"   如需双GPU加速，请使用命令行: torchrun --nproc_per_node=2 src/grpo/trainer.py")
+        return None, None, None, False
+
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # 从环境变量读取（torchrun 启动）
+        # 从环境变量读取（torchrun 启动的真正DDP）
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ['LOCAL_RANK'])
-    elif torch.cuda.device_count() > 1:
-        # 在 Jupyter notebook 中手动设置
-        rank = 0  # 主进程
-        world_size = torch.cuda.device_count()
-        local_rank = 0
-        os.environ['RANK'] = str(rank)
-        os.environ['WORLD_SIZE'] = str(world_size)
-        os.environ['LOCAL_RANK'] = str(local_rank)
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '29500'
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')
+        print(f"✅ DDP已初始化: Rank {rank}/{world_size-1}")
+        return rank, world_size, local_rank, True
     else:
-        # 单卡训练
+        # 单卡训练或Jupyter环境
         return None, None, None, False
-
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://')
-
-    return rank, world_size, local_rank, True
 
 def cleanup_ddp():
     """清理分布式训练环境"""
@@ -274,15 +289,16 @@ class Config:
     SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
     SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（双卡 A100 80GB 优化配置 - DDP 数据并行）
+    # GRPO（单卡 A100 40GB 优化配置）
+    # 注意：Jupyter中只能用单GPU，双GPU需要torchrun启动
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 4     # 【双卡优化】每张卡2个样本 × 2卡 = 4总样本（DDP数据并行）
-    K_ROLLOUTS = 4          # 【双卡优化】恢复到4（显存充足）
-                            # 单卡生成：2 × 4 = 8条候选，双卡总计：4 × 4 = 16条（充分利用）
+    GRPO_BATCH_SIZE = 2     # 【显存优化】适配单卡 A100 40GB
+    K_ROLLOUTS = 3          # 【显存优化】降低内存压力
+                            # 单步生成：2 × 3 = 6条候选
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 2  # 【双卡优化】降低到2，有效batch = 4×2 = 8
-                                     # DDP会自动聚合两卡梯度，无需过多累积
+    GRADIENT_ACCUMULATION_STEPS = 3  # 【补偿】有效batch = 2×3 = 6
+                                     # 如使用torchrun启动双GPU，会自动调整为更大配置
     ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
                                      # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
                                      # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
