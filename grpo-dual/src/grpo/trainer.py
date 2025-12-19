@@ -3802,11 +3802,13 @@ def load_model_and_tokenizer():
         try:
             import flash_attn
             attn_kwargs["attn_implementation"] = "flash_attention_2"
-            # Flash Attention 2 需要模型直接在 GPU 上初始化，使用 device_map 自动管理
+            # 【修复】强制使用单张 GPU（cuda:0），避免多 GPU 设备不匹配
+            # 注意：即使有多张 GPU，这个训练代码只支持单卡
             if torch.cuda.is_available():
-                attn_kwargs["device_map"] = "auto"
+                attn_kwargs["device_map"] = {"": 0}  # 强制所有层都在 cuda:0
             print("✅ Flash Attention 2 可用，已启用")
             print(f"   版本: {flash_attn.__version__}")
+            print("   使用单张 GPU (cuda:0)")
         except ImportError:
             if not config.QUIET_FLASH_ATTENTION_WARNING:
                 print("⚠️ Flash Attention 2 未安装，使用默认实现")
@@ -3823,11 +3825,16 @@ def load_model_and_tokenizer():
         model = get_peft_model(model, lcfg)
         model.print_trainable_parameters()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 如果使用了 device_map="auto"，模型已经在 GPU 上，不需要再手动移动
+    # 【修复】明确使用 cuda:0（第一张 GPU），避免多 GPU 设备不匹配
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"✓ 设备: {device}")
+
+    # 如果使用了 device_map，模型已经在 GPU 上，不需要再手动移动
     if not attn_kwargs.get("device_map"):
         model.to(device)
         base_model.to(device)
+    else:
+        print("  模型已通过 device_map 加载到 GPU")
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
