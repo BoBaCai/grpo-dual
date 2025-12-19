@@ -318,12 +318,12 @@ class Config:
     PARETO_QUICK_EVAL_SAMPLES = 10   # 【新增】快速评估使用更少样本，仅看趋势
 
     # 评审器（judge）多云与限流
-    # 【性能优化】匹配当前 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
-    JUDGE_MAX_WORKERS = 8       # 【修复】从16降到8，避免触发OpenAI限流
-    JUDGE_TIMEOUT_SEC = 15      # 【修复】从7增到15秒，给API更多响应时间
-    JUDGE_MAX_RETRIES = 3       # 【修复】从1增到3次，提高成功率
-    RATE_LIMIT_RPS   = 20       # 提升到20，充分利用两家API吞吐
-    RATE_LIMIT_BURST = 20       # 提升到20，匹配并发数，避免限流等待
+    # 【性能优化】降低调用频率以避免触发 OpenAI Rate Limit (429)
+    JUDGE_MAX_WORKERS = 4       # 【修复】从8降到4，降低并发调用
+    JUDGE_TIMEOUT_SEC = 30      # 【修复】从15增到30秒，给API更多响应时间
+    JUDGE_MAX_RETRIES = 4       # 【修复】从3增到4次，提高成功率
+    RATE_LIMIT_RPS   = 3        # 【修复】从20降到3，避免触发 rate limit（适配 OpenAI 免费/基础账户）
+    RATE_LIMIT_BURST = 6        # 【修复】从20降到6，避免突发请求过多
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
@@ -1744,6 +1744,8 @@ class MultiCloudJudge:
             messages=[{"role": "user", "content": prompt}],
             timeout=timeout
         )
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
         txt = resp.choices[0].message.content
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
@@ -2329,6 +2331,17 @@ class MultiCloudJudge:
                 except Exception as e:
                     print(f"⚠️ [LLM Judge] {provider_name} 调用失败 (attempt {attempt+1}/{config.JUDGE_MAX_RETRIES+1}): {type(e).__name__}: {e}")
                     if attempt < config.JUDGE_MAX_RETRIES:
+                        # 使用指数退避 (exponential backoff)
+                        msg = str(e)
+                        m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
+                        if m:
+                            delay = int(m.group(1))
+                            print(f"  [重试] API 要求等待 {delay}s...")
+                            time.sleep(delay)
+                        else:
+                            delay = min(2 ** attempt, 60)
+                            print(f"  [重试] 等待 {delay}s 后重试...")
+                            time.sleep(delay)
                         continue
                     else:
                         # 失败后尝试下一个 provider
@@ -2687,13 +2700,19 @@ class MultiCloudJudge:
                     self._cache_put(key, out)
                     return out
                 except Exception as e:
-                    # 429/配额类：尝试解析 retry_delay seconds
+                    # 429/配额类：使用指数退避 (exponential backoff)
                     msg = str(e)
                     m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
                     if m:
-                        time.sleep(int(m.group(1)))
+                        # API 明确要求的延迟时间
+                        delay = int(m.group(1))
+                        print(f"  [重试] API 要求等待 {delay}s...")
+                        time.sleep(delay)
                     else:
-                        time.sleep(1.5 * (attempt + 1))
+                        # 指数退避：2^attempt 秒 (1s, 2s, 4s, 8s, 16s...)
+                        delay = min(2 ** attempt, 60)  # 最多等待60秒
+                        print(f"  [重试] 等待 {delay}s 后重试 (attempt {attempt+1}/{config.JUDGE_MAX_RETRIES+1})...")
+                        time.sleep(delay)
             # 当前 provider 放弃 → 换下一个
 
         # 全部失败 → 启发兜底（仅用于Hallucination任务）
