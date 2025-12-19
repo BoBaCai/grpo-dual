@@ -1082,6 +1082,134 @@ def monitor_zero_gradient_groups(
     }
 
 # =============================================================================
+# 数据集自动下载（从 GitHub）
+# =============================================================================
+def download_file_from_github(url: str, dest_path: Path, max_retries: int = 3) -> bool:
+    """
+    从 GitHub 下载文件，支持重试和进度显示
+
+    Args:
+        url: GitHub raw 文件 URL
+        dest_path: 目标路径
+        max_retries: 最大重试次数
+
+    Returns:
+        bool: 是否下载成功
+    """
+    import urllib.request
+    import urllib.error
+
+    for attempt in range(max_retries):
+        try:
+            print(f"  下载: {dest_path.name} ... ", end="", flush=True)
+            urllib.request.urlretrieve(url, dest_path)
+
+            # 验证文件
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                print(f"✓ ({dest_path.stat().st_size / 1024:.1f} KB)")
+                return True
+            else:
+                print(f"✗ (文件为空)")
+                dest_path.unlink(missing_ok=True)
+
+        except urllib.error.HTTPError as e:
+            print(f"✗ (HTTP {e.code})")
+            if e.code == 404:
+                return False
+        except Exception as e:
+            print(f"✗ ({type(e).__name__})")
+
+        # 重试前等待
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 指数退避
+            print(f"    等待 {wait_time}s 后重试...")
+            time.sleep(wait_time)
+
+    return False
+
+
+def ensure_datasets_available(data_dir: Path) -> bool:
+    """
+    确保数据集文件存在，缺失则从 GitHub 自动下载
+
+    Args:
+        data_dir: 数据根目录
+
+    Returns:
+        bool: 所有数据集是否准备就绪
+    """
+    GITHUB_RAW_BASE = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/main/grpo-dual/data"
+
+    # BBQ 数据集文件
+    BBQ_FILES = [
+        "Age.jsonl", "Disability_status.jsonl", "Gender_identity.jsonl",
+        "Nationality.jsonl", "Physical_appearance.jsonl", "Race_ethnicity.jsonl",
+        "Race_x_SES.jsonl", "Race_x_gender.jsonl", "Religion.jsonl",
+        "SES.jsonl", "Sexual_orientation.jsonl"
+    ]
+
+    # HaluEval 数据集文件
+    HALUEVAL_FILES = [
+        "dialogue_data.json", "general_data.json",
+        "qa_data.json", "summarization_data.json"
+    ]
+
+    bbq_dir = data_dir / "bbq"
+    halueval_dir = data_dir / "halueval"
+
+    # 创建目录
+    bbq_dir.mkdir(parents=True, exist_ok=True)
+    halueval_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*80}")
+    print(f"检查数据集文件...")
+    print(f"{'='*80}")
+
+    # 检查并下载 BBQ
+    bbq_missing = []
+    for filename in BBQ_FILES:
+        if not (bbq_dir / filename).exists():
+            bbq_missing.append(filename)
+
+    if bbq_missing:
+        print(f"\nBBQ 数据集: 需要下载 {len(bbq_missing)}/{len(BBQ_FILES)} 个文件")
+        for filename in bbq_missing:
+            url = f"{GITHUB_RAW_BASE}/bbq/{filename}"
+            dest_path = bbq_dir / filename
+            download_file_from_github(url, dest_path)
+    else:
+        print(f"\n✓ BBQ 数据集: {len(BBQ_FILES)}/{len(BBQ_FILES)} 个文件已存在")
+
+    # 检查并下载 HaluEval
+    halu_missing = []
+    for filename in HALUEVAL_FILES:
+        if not (halueval_dir / filename).exists():
+            halu_missing.append(filename)
+
+    if halu_missing:
+        print(f"\nHaluEval 数据集: 需要下载 {len(halu_missing)}/{len(HALUEVAL_FILES)} 个文件")
+        for filename in halu_missing:
+            url = f"{GITHUB_RAW_BASE}/halueval/{filename}"
+            dest_path = halueval_dir / filename
+            download_file_from_github(url, dest_path)
+    else:
+        print(f"\n✓ HaluEval 数据集: {len(HALUEVAL_FILES)}/{len(HALUEVAL_FILES)} 个文件已存在")
+
+    # 验证所有文件
+    all_exist = all((bbq_dir / f).exists() for f in BBQ_FILES) and \
+                all((halueval_dir / f).exists() for f in HALUEVAL_FILES)
+
+    print(f"\n{'='*80}")
+    if all_exist:
+        print(f"✓ 数据集准备完成")
+    else:
+        print(f"⚠️ 部分数据集文件缺失，将尝试使用现有文件")
+    print(f"{'='*80}\n")
+
+    return all_exist
+
+
+# =============================================================================
 # 更健壮的 JSON 读取（数组 / JSONL / 拼接对象）
 # =============================================================================
 def read_json_flex(path: Path) -> List[Dict]:
@@ -4928,10 +5056,7 @@ def main():
 
     # 【新增】自动下载数据集（如果缺失）
     try:
-        from .data_downloader import ensure_datasets
-        ensure_datasets(config.DATA_DIR, force_download=False)
-    except ImportError:
-        print("⚠️ data_downloader 模块未找到，跳过自动下载")
+        ensure_datasets_available(config.DATA_DIR)
     except Exception as e:
         print(f"⚠️ 数据集下载失败: {e}")
         print("将尝试使用本地数据...")

@@ -6194,3 +6194,154 @@ Entropy项占比(F): 26.6%  # 如果<5%说明被淹没，如果>20%说明在起�
 **结论**: 降温成功提升质量，但代价是熵塌陷加剧。**必须找到根本原因并实施更强的对抗措施。**
 
 ---
+
+## 🔧 问题9：数据集自动下载功能（2025-12-19）
+
+**更新时间**: 2025-12-19
+**状态**: ✅ 已完成
+
+### 问题背景
+
+用户在 Jupyter notebook 环境中运行训练代码时，需要手动准备数据集文件。为了简化部署流程，需要实现自动从 GitHub 下载数据集的功能。
+
+### 数据集信息
+
+**GitHub 数据源**:
+```
+https://github.com/BoBaCai/grpo-dual/tree/main/grpo-dual/data
+```
+
+**BBQ 数据集** (11 个文件):
+- Age.jsonl
+- Disability_status.jsonl
+- Gender_identity.jsonl
+- Nationality.jsonl
+- Physical_appearance.jsonl
+- Race_ethnicity.jsonl
+- Race_x_SES.jsonl
+- Race_x_gender.jsonl
+- Religion.jsonl
+- SES.jsonl
+- Sexual_orientation.jsonl
+
+**HaluEval 数据集** (4 个文件):
+- dialogue_data.json
+- general_data.json
+- qa_data.json
+- summarization_data.json
+
+### 实施方案
+
+✅ **在 trainer.py 中直接集成下载逻辑**
+
+**代码位置**: `grpo-dual/src/grpo/trainer.py`
+
+**新增函数**:
+1. `download_file_from_github()`: 下载单个文件，支持重试
+2. `ensure_datasets_available()`: 检查并下载缺失的数据集文件
+
+**集成点**: `main()` 函数中，数据加载前自动检查并下载
+
+**特性**:
+- ✅ 自动检测缺失文件
+- ✅ 从 GitHub raw URL 下载
+- ✅ 支持失败重试（最多3次，指数退避）
+- ✅ 跳过已存在的文件（断点续传）
+- ✅ 非阻塞式：下载失败不影响使用本地数据
+- ✅ 实时进度反馈
+
+### 使用方法
+
+**自动模式**（推荐）:
+```python
+# 直接运行训练脚本，会自动下载缺失的数据集
+%run src/grpo/trainer.py
+```
+
+**手动触发**:
+```python
+from pathlib import Path
+import sys
+sys.path.append('src/grpo')
+from trainer import ensure_datasets_available
+
+# 下载到指定目录
+data_dir = Path("./data")
+ensure_datasets_available(data_dir)
+```
+
+### 技术细节
+
+**下载 URL 格式**:
+```python
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/main/grpo-dual/data"
+
+# 示例
+bbq_file = f"{GITHUB_RAW_BASE}/bbq/Age.jsonl"
+halu_file = f"{GITHUB_RAW_BASE}/halueval/qa_data.json"
+```
+
+**重试机制**:
+```python
+for attempt in range(max_retries):
+    try:
+        urllib.request.urlretrieve(url, dest_path)
+        return True
+    except Exception as e:
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 指数退避: 2s, 4s, 8s
+            time.sleep(wait_time)
+```
+
+**文件验证**:
+- 检查文件是否存在
+- 检查文件大小 > 0
+- 下载失败的文件会被删除
+
+### 代码修改记录
+
+**修改内容**:
+```python
+# trainer.py 新增（约60行代码）
+
+def download_file_from_github(url: str, dest_path: Path, max_retries: int = 3) -> bool:
+    """从 GitHub 下载文件，支持重试"""
+    # ... 实现代码 ...
+
+def ensure_datasets_available(data_dir: Path) -> bool:
+    """确保数据集文件存在，缺失则自动下载"""
+    # ... 实现代码 ...
+
+def main():
+    # ... 原有代码 ...
+
+    # 【新增】自动下载数据集
+    ensure_datasets_available(config.DATA_DIR)
+
+    # 继续原有的数据加载流程
+    bbq = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
+    halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
+```
+
+### 优势
+
+✅ **零配置**: 用户无需手动下载数据集
+✅ **容错性强**: 下载失败不影响使用本地数据
+✅ **网络友好**: 已下载的文件不会重复下载
+✅ **进度可见**: 实时显示下载状态
+✅ **适合 Jupyter**: 专门优化了 notebook 环境的体验
+
+### 故障排除
+
+**下载失败**:
+- 检查网络连接
+- 确认可以访问 GitHub
+- 脚本会自动重试3次
+
+**文件损坏**:
+- 删除损坏的文件，重新运行即可自动下载
+
+**自定义数据目录**:
+修改 `Config.DATA_DIR` 配置项
+
+---
