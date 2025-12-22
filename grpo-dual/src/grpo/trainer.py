@@ -1875,6 +1875,9 @@ class MultiCloudJudge:
                 parts.append(blk.text)
             elif isinstance(blk, dict) and blk.get("type") == "text":
                 parts.append(blk.get("text", ""))
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
+
         txt = "".join(parts) if parts else str(resp)
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
@@ -1944,16 +1947,24 @@ class MultiCloudJudge:
             "max_output_tokens": 64,
         }
 
+        # Gemini SDK 不支持 request_options，timeout 通过客户端配置
+        # 如果需要 timeout，可以用 threading.Timer 或 signal 实现
         resp = model.generate_content(
             prompt,
-            generation_config=generation_config,
-            request_options={"timeout": timeout}
+            generation_config=generation_config
         )
 
         # 成功调用后添加小延迟，避免触发 rate limit
         time.sleep(0.3)
 
-        txt = resp.text if hasattr(resp, 'text') else str(resp)
+        # 处理 Gemini 响应（可能被安全过滤器阻止）
+        if hasattr(resp, 'text'):
+            txt = resp.text
+        elif hasattr(resp, 'parts') and resp.parts:
+            txt = resp.parts[0].text
+        else:
+            raise RuntimeError(f"Gemini response blocked or invalid: {resp}")
+
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
 
