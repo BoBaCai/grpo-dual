@@ -429,16 +429,19 @@ class Config:
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
     HEALTH_JUDGE_TIME_P95_WARN = 3.0    # judge_time p95 >3s 告警
 
-    # 只使用 OpenAI 作为 Judge（用户要求）
+    # 多 LLM Judge 集成：Claude 3.5 Haiku + Gemini 2.5 Flash + GPT-4o-mini
+    # 使用加权平均聚合，提高评分客观性
     JUDGE_PROVIDERS = [
-        {"name": "openai", "model": "gpt-4o-mini"}
-        # {"name": "claude", "model": "claude-3-5-haiku-latest"}  # 已禁用
+        {"name": "claude", "model": "claude-3-5-haiku-20241022", "weight": 0.35},
+        {"name": "gemini", "model": "gemini-2.0-flash-exp", "weight": 0.30},
+        {"name": "openai", "model": "gpt-4o-mini", "weight": 0.35}
     ]
 
-    # 线性刻度校准（确保两个 provider 评分一致）
+    # 线性刻度校准（确保三个 provider 评分一致）
     JUDGE_CALIBRATION = {
         "openai":    {"a": 1.0, "b": 0.0},
         "claude":    {"a": 1.0, "b": 0.0},
+        "gemini":    {"a": 1.0, "b": 0.0},
         "heuristic": {"a": 1.0, "b": 0.0},
     }
 
@@ -1752,17 +1755,13 @@ GLOBAL_JUDGE_BUCKET = TokenBucket(rate_per_sec=config.RATE_LIMIT_RPS, capacity=c
 
 class MultiCloudJudge:
     """
-    顺序尝试：OpenAI → Claude → 启发兜底；统一 JSON 抽取；统一校准口径。
-    完全移除 Gemini 依赖。
+    多 LLM Judge 集成：并行调用 Claude 3.5 Haiku, Gemini 2.5 Flash, GPT-4o-mini
+    使用加权平均聚合分数，提高评分客观性和鲁棒性。
     线程安全：单实例 + SQLite(check_same_thread=False) + Lock；每次调用前 GLOBAL_JUDGE_BUCKET.acquire()。
     """
     def __init__(self):
         self._setup_cache()
         self.providers = config.JUDGE_PROVIDERS
-        # 验证不包含 gemini
-        for p in self.providers:
-            if p["name"].lower() == "gemini":
-                raise ValueError("Gemini provider is not supported in this version")
         # 【调试】用于打印template_detector触发样本
         self.debug_step = 0
         # 【新增】缓存 LLM Judge prompt 函数（避免重复导入）
@@ -1880,7 +1879,85 @@ class MultiCloudJudge:
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
 
-    # --- 统一入口（完全移除 Gemini 逻辑）---
+    # --- 单个 provider 调用（含重试逻辑）---
+    def _call_provider_with_retry(self, provider_name: str, prompt: str, timeout: float, max_retries: int) -> Optional[float]:
+        """
+        调用单个 provider 并处理重试逻辑
+        返回 None 表示失败
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                if provider_name == "openai":
+                    s_raw = self._call_openai(prompt, timeout)
+                elif provider_name == "claude":
+                    s_raw = self._call_claude(prompt, timeout)
+                elif provider_name == "gemini":
+                    s_raw = self._call_gemini(prompt, timeout)
+                else:
+                    raise ValueError(f"Unknown provider: {provider_name}")
+
+                # 校准并返回
+                s_cal = self._calibrate(provider_name, s_raw)
+                return float(s_cal)
+            except Exception as e:
+                # 429/配额类：使用指数退避 (exponential backoff)
+                msg = str(e)
+                m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
+                if m:
+                    # API 明确要求的延迟时间
+                    delay = int(m.group(1))
+                    if attempt < max_retries:
+                        print(f"  [{provider_name}] API 要求等待 {delay}s...")
+                        time.sleep(delay)
+                else:
+                    # 指数退避：2^attempt 秒 (1s, 2s, 4s, 8s, 16s...)
+                    delay = min(2 ** attempt, 60)  # 最多等待60秒
+                    if attempt < max_retries:
+                        print(f"  [{provider_name}] 等待 {delay}s 后重试 (attempt {attempt+1}/{max_retries+1})...")
+                        time.sleep(delay)
+
+                # 最后一次重试失败，记录错误
+                if attempt == max_retries:
+                    print(f"  [{provider_name}] 所有重试失败: {e}")
+
+        return None
+
+    # --- Gemini 调用（统一接口）---
+    def _call_gemini(self, prompt: str, timeout: float) -> float:
+        import google.generativeai as genai
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("No GEMINI_API_KEY")
+        genai.configure(api_key=api_key)
+
+        model_name = None
+        for p in self.providers:
+            if p["name"] == "gemini":
+                model_name = p.get("model") or "gemini-2.0-flash-exp"
+                break
+
+        model = genai.GenerativeModel(model_name or "gemini-2.0-flash-exp")
+
+        # 配置生成参数
+        generation_config = {
+            "temperature": 0,
+            "max_output_tokens": 64,
+        }
+
+        resp = model.generate_content(
+            prompt,
+            generation_config=generation_config,
+            request_options={"timeout": timeout}
+        )
+
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
+
+        txt = resp.text if hasattr(resp, 'text') else str(resp)
+        obj = extract_json_strict(txt)
+        return float(obj.get("final"))
+
+    # --- 统一入口 ---
     def _evaluate_bbq_fairness(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         BBQ专用评估器：基于规则的准确性和公平性评分
@@ -2782,38 +2859,55 @@ class MultiCloudJudge:
 
         GLOBAL_JUDGE_BUCKET.acquire()  # 全局限流
 
-        # 按优先顺序尝试双云（OpenAI → Claude）；每家支持重试与退避
-        for p in self.providers:
-            provider_name = p["name"]
-            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
-                try:
-                    if provider_name == "openai":
-                        s_raw = self._call_openai(prompt, config.JUDGE_TIMEOUT_SEC)
-                    elif provider_name == "claude":
-                        s_raw = self._call_claude(prompt, config.JUDGE_TIMEOUT_SEC)
-                    else:
-                        # 不应该到这里，因为已经验证过 providers
-                        raise ValueError(f"Unknown provider: {provider_name}")
+        # 【多 LLM Judge 集成】并行调用所有 providers，使用加权平均聚合
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-                    s_cal = self._calibrate(provider_name, s_raw)
-                    out = {"final": float(s_cal), "provider": provider_name}
-                    self._cache_put(key, out)
-                    return out
+        # 并行调用所有 providers
+        scores = {}  # {provider_name: score}
+        with ThreadPoolExecutor(max_workers=len(self.providers)) as executor:
+            # 提交所有任务
+            future_to_provider = {
+                executor.submit(
+                    self._call_provider_with_retry,
+                    p["name"],
+                    prompt,
+                    config.JUDGE_TIMEOUT_SEC,
+                    config.JUDGE_MAX_RETRIES
+                ): p for p in self.providers
+            }
+
+            # 收集结果
+            for future in as_completed(future_to_provider):
+                provider_config = future_to_provider[future]
+                provider_name = provider_config["name"]
+                try:
+                    score = future.result()
+                    if score is not None:
+                        scores[provider_name] = score
+                        print(f"  [{provider_name}] 评分: {score:.3f}")
                 except Exception as e:
-                    # 429/配额类：使用指数退避 (exponential backoff)
-                    msg = str(e)
-                    m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
-                    if m:
-                        # API 明确要求的延迟时间
-                        delay = int(m.group(1))
-                        print(f"  [重试] API 要求等待 {delay}s...")
-                        time.sleep(delay)
-                    else:
-                        # 指数退避：2^attempt 秒 (1s, 2s, 4s, 8s, 16s...)
-                        delay = min(2 ** attempt, 60)  # 最多等待60秒
-                        print(f"  [重试] 等待 {delay}s 后重试 (attempt {attempt+1}/{config.JUDGE_MAX_RETRIES+1})...")
-                        time.sleep(delay)
-            # 当前 provider 放弃 → 换下一个
+                    print(f"  [{provider_name}] 调用失败: {e}")
+
+        # 如果至少有一个 judge 返回了结果，使用加权平均
+        if scores:
+            # 计算加权平均
+            total_weight = 0.0
+            weighted_sum = 0.0
+            for p in self.providers:
+                if p["name"] in scores:
+                    weight = p.get("weight", 1.0 / len(self.providers))  # 默认均分权重
+                    weighted_sum += scores[p["name"]] * weight
+                    total_weight += weight
+
+            # 归一化
+            final_score = weighted_sum / total_weight if total_weight > 0 else 0.5
+
+            # 记录使用的 providers
+            providers_used = "+".join(sorted(scores.keys()))
+            out = {"final": float(final_score), "provider": f"ensemble({providers_used})"}
+            self._cache_put(key, out)
+            print(f"  [集成评分] {final_score:.3f} (来自 {providers_used})")
+            return out
 
         # 全部失败 → 启发兜底（仅用于Hallucination任务）
         score = 0.5
