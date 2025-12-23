@@ -18,9 +18,28 @@ Claude verified: This is the 2624-line trainer.py file
 """
 
 # =============================================================================
+# RunPod 路径配置（解决磁盘空间不足问题）
+# =============================================================================
+import os as _os
+import pathlib as _pathlib
+
+# 检测是否在 RunPod 环境（/workspace 存在）
+_workspace_path = _pathlib.Path("/workspace")
+if _workspace_path.exists() and _workspace_path.is_dir():
+    # 设置 HuggingFace 缓存到 /workspace（大容量磁盘）
+    _cache_dir = _workspace_path / ".cache" / "huggingface"
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+    _os.environ["HF_HOME"] = str(_cache_dir)
+    _os.environ["TRANSFORMERS_CACHE"] = str(_cache_dir / "transformers")
+    _os.environ["HF_DATASETS_CACHE"] = str(_cache_dir / "datasets")
+    print(f"✓ RunPod 环境检测到，HuggingFace 缓存目录设置为: {_cache_dir}")
+else:
+    print("ℹ️ 非 RunPod 环境，使用默认缓存目录")
+
+# =============================================================================
 # 一键安装 & 冒烟自检（当前内核）
 # =============================================================================
-import sys as _sys, subprocess as _sp, importlib as _il, os as _os
+import sys as _sys, subprocess as _sp, importlib as _il
 
 def _bootstrap_sdks_and_check():
     pkgs = []
@@ -98,6 +117,11 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from json import JSONDecodeError
 
+# 分布式训练支持
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # =============================================================================
 # torch.compile() 配置优化（修复CUDAGraph动态shape警告）
 # =============================================================================
@@ -137,20 +161,84 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"显存(GB): {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}")
+    if torch.cuda.device_count() > 1:
+        print(f"检测到 {torch.cuda.device_count()} 张 GPU，将启用分布式训练（DDP）")
 else:
     print("⚠️ 无 GPU，将非常慢")
 
 # =============================================================================
-# 配置（v2.2 改进版）
+# 分布式训练辅助函数
+# =============================================================================
+def is_notebook():
+    """检测是否在Jupyter notebook环境中"""
+    try:
+        from IPython import get_ipython
+        if 'IPKernelApp' in get_ipython().config:
+            return True
+    except:
+        pass
+    return False
+
+def setup_ddp():
+    """
+    初始化分布式训练环境
+    注意：Jupyter notebook中无法使用真正的DDP（需要多进程）
+    在notebook中会自动降级为单GPU或DataParallel
+    """
+    # 检测Jupyter环境和多GPU情况
+    in_notebook = is_notebook()
+    num_gpus = torch.cuda.device_count()
+
+    if in_notebook and num_gpus > 1:
+        print("⚠️ 检测到Jupyter环境 + 多GPU")
+        print(f"   Jupyter中无法使用DDP（需要torchrun启动多进程）")
+        print(f"   将使用单GPU模式（GPU 0）")
+        print(f"   如需双GPU加速，请使用命令行: torchrun --nproc_per_node=2 src/grpo/trainer.py")
+        return None, None, None, False
+
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # 从环境变量读取（torchrun 启动的真正DDP）
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend='nccl', init_method='env://')
+        print(f"✅ DDP已初始化: Rank {rank}/{world_size-1}")
+        return rank, world_size, local_rank, True
+    else:
+        # 单卡训练或Jupyter环境
+        return None, None, None, False
+
+def cleanup_ddp():
+    """清理分布式训练环境"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process(rank):
+    """判断是否为主进程"""
+    return rank is None or rank == 0
+
+# =============================================================================
+# 配置（v2.2 改进版 + DDP 支持）
 # =============================================================================
 class Config:
     # 基础模型
     BASE_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"  # 【实验结果：Base model表现更差，改回Instruct】
     HF_TOKEN = HF_TOKEN
 
-    # 路径（增加 run_id 隔离）
+    # 路径（自动检测环境：RunPod vs AWS Lambda）
     RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
-    WORKSPACE = Path("/home/ubuntu/workspace")
+
+    # 自动选择 workspace 路径
+    if Path("/workspace").exists():
+        WORKSPACE = Path("/workspace")  # RunPod
+    elif Path("/home/ubuntu/workspace").exists():
+        WORKSPACE = Path("/home/ubuntu/workspace")  # AWS Lambda
+    else:
+        WORKSPACE = Path.cwd() / "workspace"  # 本地/其他环境
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+
     DATA_DIR = WORKSPACE / "data"
     BBQ_DIR = DATA_DIR / "bbq"
     HALUEVAL_DIR = DATA_DIR / "halueval"
@@ -201,16 +289,28 @@ class Config:
     SFT_BATCH_SIZE = 2      # 【显存优化】从4降到2
     SFT_MAXLEN = 896        # 【显存优化】从1024降到896
 
-    # GRPO（显存优化配置）
+    # GRPO（自适应配置：torchrun DDP 双GPU / Jupyter 单GPU）
+    # 检测是否是真正的 DDP 环境（torchrun 启动）
+    _is_ddp_env = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+
     GRPO_STEPS = 500
     GRPO_LR = 3e-6          # 【平衡方案】40%降低（vs 5e-6），配合β=0.30控制KL
-    GRPO_BATCH_SIZE = 6     # 【BBQ数据分析修复】从2增到6，确保每步至少2-3个disambig fairness样本
-                            # 原因：BATCH_SIZE=2时每步只有1个fairness，如果是ambig→100%零梯度
-                            # 增到6后：3个fairness样本，即使1个ambig，还有2个disambig提供梯度
-    K_ROLLOUTS = 4          # 保持4（每个样本4条候选）
+
+    if _is_ddp_env:
+        # torchrun 双GPU DDP 模式
+        GRPO_BATCH_SIZE = 4     # 每卡2样本 × 2卡 = 4总样本
+        K_ROLLOUTS = 4          # 显存充足，恢复到4
+        GRADIENT_ACCUMULATION_STEPS = 2  # DDP自动聚合，降低到2
+        # 单步生成：4 × 4 = 16条候选（双卡并行）
+        # 有效batch：4 × 2 = 8
+    else:
+        # Jupyter 单GPU 模式
+        GRPO_BATCH_SIZE = 2     # 单卡 A100 40GB
+        K_ROLLOUTS = 3          # 降低内存压力
+        GRADIENT_ACCUMULATION_STEPS = 3  # 有效batch = 2×3 = 6
+        # 单步生成：2 × 3 = 6条候选
+
     MU_UPDATES = 1
-    GRADIENT_ACCUMULATION_STEPS = 1  # 【BBQ数据分析修复】从2降到1，因为BATCH_SIZE已从2增到6
-                                     # 有效batch保持=6（vs之前2×2=4），略有增加但可接受
     ENTROPY_COEF = 6.0               # 【2025-11-17深度诊断修复】从2.5提升到6.0，对抗熵塌陷
                                      # Steps 1-5实测：熵值0.206-0.473（正常应>1.5），极度塌陷导致零梯度组16.7%
                                      # 机制：熵=0.2时top-1概率≈100%，即使串行生成仍产生相同候选→std=0
@@ -220,10 +320,10 @@ class Config:
     FAIRNESS_REWARD_SCALE = 0.7      # 【修正】从0.5调整到0.7，0.5降得过多导致F信号过弱（F/H=0.09-0.33）
     HALLUCINATION_REWARD_SCALE = 1.0 # Hallucination保持不变
 
-    # LoRA
+    # LoRA（显存优化）
     USE_LORA = True
-    LORA_R = 8              # 【显存优化】从16降到8，减少参数量
-    LORA_ALPHA = 16         # 同步调整 (保持 alpha=2*r)
+    LORA_R = 4              # 【显存优化】从8降到4，大幅减少参数量（40GB 单卡优化）
+    LORA_ALPHA = 8          # 同步调整 (保持 alpha=2*r)
     LORA_DROPOUT = 0.1
     TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
 
@@ -232,10 +332,14 @@ class Config:
     USE_GRADIENT_CHECKPOINTING = True
     USE_TORCH_COMPILE = False    # 【已禁用】编译开销>收益（SFT动态shape多，首次编译慢）
     COMPILE_MODE = "reduce-overhead"  # 选项: "default", "reduce-overhead", "max-autotune"
-    
-    # 【修改】生成配置：平衡质量与性能
-    MAX_NEW_TOKENS_TRAIN = 96      # 【保守方案A】从192回退到96，正常回答20-70 tokens足够
-    MAX_NEW_TOKENS_EVAL = 96       # 评测同步调整
+
+    # Flash Attention 2（可选加速）
+    TRY_FLASH_ATTENTION_2 = True  # 是否尝试使用 Flash Attention 2（如果不可用会自动降级）
+    QUIET_FLASH_ATTENTION_WARNING = False  # 是否静默 Flash Attention 不可用的警告
+
+    # 【修改】生成配置：平衡质量与性能（显存优化）
+    MAX_NEW_TOKENS_TRAIN = 64      # 【显存优化】从96降到64，节省内存（正常回答20-50 tokens足够）
+    MAX_NEW_TOKENS_EVAL = 64       # 评测同步调整
     MIN_NEW_TOKENS_TRAIN = 5       # 【2025-11-17深度诊断修复】从30大幅降到5，避免强制冗长
                                    # Steps 1-5证据：MIN=30强制冗长→后半段垃圾生成→40%得0分
                                    # 案例："Answer: C... >(); he answer is The gay friend.; Was this helpful?"
@@ -314,27 +418,30 @@ class Config:
     PARETO_QUICK_EVAL_SAMPLES = 10   # 【新增】快速评估使用更少样本，仅看趋势
 
     # 评审器（judge）多云与限流
-    # 【性能优化】匹配当前 GRPO_BATCH_SIZE×K_ROLLOUTS=16 的并发需求
-    JUDGE_MAX_WORKERS = 8       # 【修复】从16降到8，避免触发OpenAI限流
-    JUDGE_TIMEOUT_SEC = 15      # 【修复】从7增到15秒，给API更多响应时间
-    JUDGE_MAX_RETRIES = 3       # 【修复】从1增到3次，提高成功率
-    RATE_LIMIT_RPS   = 20       # 提升到20，充分利用两家API吞吐
-    RATE_LIMIT_BURST = 20       # 提升到20，匹配并发数，避免限流等待
+    # 【性能优化】降低调用频率以避免触发 OpenAI Rate Limit (429)
+    JUDGE_MAX_WORKERS = 4       # 【修复】从8降到4，降低并发调用
+    JUDGE_TIMEOUT_SEC = 30      # 【修复】从15增到30秒，给API更多响应时间
+    JUDGE_MAX_RETRIES = 4       # 【修复】从3增到4次，提高成功率
+    RATE_LIMIT_RPS   = 3        # 【修复】从20降到3，避免触发 rate limit（适配 OpenAI 免费/基础账户）
+    RATE_LIMIT_BURST = 6        # 【修复】从20降到6，避免突发请求过多
     
     # 【新增】评审健康度告警阈值
     HEALTH_HEURISTIC_RATIO_WARN = 0.10  # 启发式占比 >10% 告警
     HEALTH_JUDGE_TIME_P95_WARN = 3.0    # judge_time p95 >3s 告警
 
-    # 只使用 OpenAI 作为 Judge（用户要求）
+    # 多 LLM Judge 集成：Claude 3.5 Haiku + Gemini 2.5 Flash + GPT-4o-mini
+    # 使用加权平均聚合，提高评分客观性
     JUDGE_PROVIDERS = [
-        {"name": "openai", "model": "gpt-4o-mini"}
-        # {"name": "claude", "model": "claude-3-5-haiku-latest"}  # 已禁用
+        {"name": "claude", "model": "claude-3-5-haiku-20241022", "weight": 0.35},
+        {"name": "gemini", "model": "gemini-2.0-flash-exp", "weight": 0.30},
+        {"name": "openai", "model": "gpt-4o-mini", "weight": 0.35}
     ]
 
-    # 线性刻度校准（确保两个 provider 评分一致）
+    # 线性刻度校准（确保三个 provider 评分一致）
     JUDGE_CALIBRATION = {
         "openai":    {"a": 1.0, "b": 0.0},
         "claude":    {"a": 1.0, "b": 0.0},
+        "gemini":    {"a": 1.0, "b": 0.0},
         "heuristic": {"a": 1.0, "b": 0.0},
     }
 
@@ -1082,6 +1189,134 @@ def monitor_zero_gradient_groups(
     }
 
 # =============================================================================
+# 数据集自动下载（从 GitHub）
+# =============================================================================
+def download_file_from_github(url: str, dest_path: Path, max_retries: int = 3) -> bool:
+    """
+    从 GitHub 下载文件，支持重试和进度显示
+
+    Args:
+        url: GitHub raw 文件 URL
+        dest_path: 目标路径
+        max_retries: 最大重试次数
+
+    Returns:
+        bool: 是否下载成功
+    """
+    import urllib.request
+    import urllib.error
+
+    for attempt in range(max_retries):
+        try:
+            print(f"  下载: {dest_path.name} ... ", end="", flush=True)
+            urllib.request.urlretrieve(url, dest_path)
+
+            # 验证文件
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                print(f"✓ ({dest_path.stat().st_size / 1024:.1f} KB)")
+                return True
+            else:
+                print(f"✗ (文件为空)")
+                dest_path.unlink(missing_ok=True)
+
+        except urllib.error.HTTPError as e:
+            print(f"✗ (HTTP {e.code})")
+            if e.code == 404:
+                return False
+        except Exception as e:
+            print(f"✗ ({type(e).__name__})")
+
+        # 重试前等待
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 指数退避
+            print(f"    等待 {wait_time}s 后重试...")
+            time.sleep(wait_time)
+
+    return False
+
+
+def ensure_datasets_available(data_dir: Path) -> bool:
+    """
+    确保数据集文件存在，缺失则从 GitHub 自动下载
+
+    Args:
+        data_dir: 数据根目录
+
+    Returns:
+        bool: 所有数据集是否准备就绪
+    """
+    GITHUB_RAW_BASE = "https://raw.githubusercontent.com/BoBaCai/grpo-dual/main/grpo-dual/data"
+
+    # BBQ 数据集文件
+    BBQ_FILES = [
+        "Age.jsonl", "Disability_status.jsonl", "Gender_identity.jsonl",
+        "Nationality.jsonl", "Physical_appearance.jsonl", "Race_ethnicity.jsonl",
+        "Race_x_SES.jsonl", "Race_x_gender.jsonl", "Religion.jsonl",
+        "SES.jsonl", "Sexual_orientation.jsonl"
+    ]
+
+    # HaluEval 数据集文件
+    HALUEVAL_FILES = [
+        "dialogue_data.json", "general_data.json",
+        "qa_data.json", "summarization_data.json"
+    ]
+
+    bbq_dir = data_dir / "bbq"
+    halueval_dir = data_dir / "halueval"
+
+    # 创建目录
+    bbq_dir.mkdir(parents=True, exist_ok=True)
+    halueval_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*80}")
+    print(f"检查数据集文件...")
+    print(f"{'='*80}")
+
+    # 检查并下载 BBQ
+    bbq_missing = []
+    for filename in BBQ_FILES:
+        if not (bbq_dir / filename).exists():
+            bbq_missing.append(filename)
+
+    if bbq_missing:
+        print(f"\nBBQ 数据集: 需要下载 {len(bbq_missing)}/{len(BBQ_FILES)} 个文件")
+        for filename in bbq_missing:
+            url = f"{GITHUB_RAW_BASE}/bbq/{filename}"
+            dest_path = bbq_dir / filename
+            download_file_from_github(url, dest_path)
+    else:
+        print(f"\n✓ BBQ 数据集: {len(BBQ_FILES)}/{len(BBQ_FILES)} 个文件已存在")
+
+    # 检查并下载 HaluEval
+    halu_missing = []
+    for filename in HALUEVAL_FILES:
+        if not (halueval_dir / filename).exists():
+            halu_missing.append(filename)
+
+    if halu_missing:
+        print(f"\nHaluEval 数据集: 需要下载 {len(halu_missing)}/{len(HALUEVAL_FILES)} 个文件")
+        for filename in halu_missing:
+            url = f"{GITHUB_RAW_BASE}/halueval/{filename}"
+            dest_path = halueval_dir / filename
+            download_file_from_github(url, dest_path)
+    else:
+        print(f"\n✓ HaluEval 数据集: {len(HALUEVAL_FILES)}/{len(HALUEVAL_FILES)} 个文件已存在")
+
+    # 验证所有文件
+    all_exist = all((bbq_dir / f).exists() for f in BBQ_FILES) and \
+                all((halueval_dir / f).exists() for f in HALUEVAL_FILES)
+
+    print(f"\n{'='*80}")
+    if all_exist:
+        print(f"✓ 数据集准备完成")
+    else:
+        print(f"⚠️ 部分数据集文件缺失，将尝试使用现有文件")
+    print(f"{'='*80}\n")
+
+    return all_exist
+
+
+# =============================================================================
 # 更健壮的 JSON 读取（数组 / JSONL / 拼接对象）
 # =============================================================================
 def read_json_flex(path: Path) -> List[Dict]:
@@ -1520,17 +1755,13 @@ GLOBAL_JUDGE_BUCKET = TokenBucket(rate_per_sec=config.RATE_LIMIT_RPS, capacity=c
 
 class MultiCloudJudge:
     """
-    顺序尝试：OpenAI → Claude → 启发兜底；统一 JSON 抽取；统一校准口径。
-    完全移除 Gemini 依赖。
+    多 LLM Judge 集成：并行调用 Claude 3.5 Haiku, Gemini 2.5 Flash, GPT-4o-mini
+    使用加权平均聚合分数，提高评分客观性和鲁棒性。
     线程安全：单实例 + SQLite(check_same_thread=False) + Lock；每次调用前 GLOBAL_JUDGE_BUCKET.acquire()。
     """
     def __init__(self):
         self._setup_cache()
         self.providers = config.JUDGE_PROVIDERS
-        # 验证不包含 gemini
-        for p in self.providers:
-            if p["name"].lower() == "gemini":
-                raise ValueError("Gemini provider is not supported in this version")
         # 【调试】用于打印template_detector触发样本
         self.debug_step = 0
         # 【新增】缓存 LLM Judge prompt 函数（避免重复导入）
@@ -1612,6 +1843,8 @@ class MultiCloudJudge:
             messages=[{"role": "user", "content": prompt}],
             timeout=timeout
         )
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
         txt = resp.choices[0].message.content
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
@@ -1642,11 +1875,100 @@ class MultiCloudJudge:
                 parts.append(blk.text)
             elif isinstance(blk, dict) and blk.get("type") == "text":
                 parts.append(blk.get("text", ""))
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
+
         txt = "".join(parts) if parts else str(resp)
         obj = extract_json_strict(txt)
         return float(obj.get("final"))
 
-    # --- 统一入口（完全移除 Gemini 逻辑）---
+    # --- 单个 provider 调用（含重试逻辑）---
+    def _call_provider_with_retry(self, provider_name: str, prompt: str, timeout: float, max_retries: int) -> Optional[float]:
+        """
+        调用单个 provider 并处理重试逻辑
+        返回 None 表示失败
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                if provider_name == "openai":
+                    s_raw = self._call_openai(prompt, timeout)
+                elif provider_name == "claude":
+                    s_raw = self._call_claude(prompt, timeout)
+                elif provider_name == "gemini":
+                    s_raw = self._call_gemini(prompt, timeout)
+                else:
+                    raise ValueError(f"Unknown provider: {provider_name}")
+
+                # 校准并返回
+                s_cal = self._calibrate(provider_name, s_raw)
+                return float(s_cal)
+            except Exception as e:
+                # 429/配额类：使用指数退避 (exponential backoff)
+                msg = str(e)
+                m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
+                if m:
+                    # API 明确要求的延迟时间
+                    delay = int(m.group(1))
+                    if attempt < max_retries:
+                        print(f"  [{provider_name}] API 要求等待 {delay}s...")
+                        time.sleep(delay)
+                else:
+                    # 指数退避：2^attempt 秒 (1s, 2s, 4s, 8s, 16s...)
+                    delay = min(2 ** attempt, 60)  # 最多等待60秒
+                    if attempt < max_retries:
+                        print(f"  [{provider_name}] 等待 {delay}s 后重试 (attempt {attempt+1}/{max_retries+1})...")
+                        time.sleep(delay)
+
+                # 最后一次重试失败，记录错误
+                if attempt == max_retries:
+                    print(f"  [{provider_name}] 所有重试失败: {e}")
+
+        return None
+
+    # --- Gemini 调用（统一接口）---
+    def _call_gemini(self, prompt: str, timeout: float) -> float:
+        import google.generativeai as genai
+        api_key = os.environ.get("GEMINI_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("No GEMINI_API_KEY")
+        genai.configure(api_key=api_key)
+
+        model_name = None
+        for p in self.providers:
+            if p["name"] == "gemini":
+                model_name = p.get("model") or "gemini-2.0-flash-exp"
+                break
+
+        model = genai.GenerativeModel(model_name or "gemini-2.0-flash-exp")
+
+        # 配置生成参数
+        generation_config = {
+            "temperature": 0,
+            "max_output_tokens": 64,
+        }
+
+        # Gemini SDK 不支持 request_options，timeout 通过客户端配置
+        # 如果需要 timeout，可以用 threading.Timer 或 signal 实现
+        resp = model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+
+        # 成功调用后添加小延迟，避免触发 rate limit
+        time.sleep(0.3)
+
+        # 处理 Gemini 响应（可能被安全过滤器阻止）
+        if hasattr(resp, 'text'):
+            txt = resp.text
+        elif hasattr(resp, 'parts') and resp.parts:
+            txt = resp.parts[0].text
+        else:
+            raise RuntimeError(f"Gemini response blocked or invalid: {resp}")
+
+        obj = extract_json_strict(txt)
+        return float(obj.get("final"))
+
+    # --- 统一入口 ---
     def _evaluate_bbq_fairness(self, sample: Sample, response: str) -> Dict[str, float]:
         """
         BBQ专用评估器：基于规则的准确性和公平性评分
@@ -2070,18 +2392,19 @@ class MultiCloudJudge:
 
     def _evaluate_with_llm_judge(self, sample: Sample, response: str) -> Dict[str, float]:
         """
-        使用 LLM Judge 进行评分
+        使用多 LLM Judge 集成进行评分（V2 自适应 prompt + 三 LLM 并行 + 加权平均）
 
         优势：
-        1. 更全面理解 reasoning 质量（不只是形式特征）
-        2. 可以检测微妙的逃避策略和 hallucination
-        3. 通过精心设计的 prompt 产生细粒度评分
+        1. V2 自适应 prompt：根据问题复杂度、类别、子集动态调整评分标准
+        2. 三 LLM 并行评分：Claude 3.5 Haiku + Gemini 2.5 Flash + GPT-4o-mini
+        3. 加权平均聚合：提高评分客观性和鲁棒性
+        4. Ground truth 对比学习：充分利用 right_answer 和 hallucinated_answer
 
         注意：
         - 使用缓存避免重复调用
-        - 支持 OpenAI 和 Claude 双云
-        - 支持 V1 (固定prompt) 和 V2 (自适应prompt)
+        - 并行调用（ThreadPoolExecutor）提高效率
         - 函数已在 __init__ 中预加载，避免多线程竞态
+        - Rule-based 作为最终 fallback
         """
         # 构建 prompt（使用预加载的函数）
         if sample.task == "fairness" and sample.meta.get("dataset") == "BBQ":
@@ -2142,29 +2465,33 @@ class MultiCloudJudge:
                    else self._evaluate_halueval(sample, response)
 
         # 缓存检查
-        key = hashlib.sha256(f"llm_judge::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
+        key = hashlib.sha256(f"llm_judge_v2::{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
         cached = self._cache_get(key)
         if cached:
             return cached
 
-        # 调用 LLM Judge API
-        GLOBAL_JUDGE_BUCKET.acquire()
+        # 【多 LLM Judge 集成】并行调用所有 providers，使用加权平均聚合
+        GLOBAL_JUDGE_BUCKET.acquire()  # 全局限流
 
-        for p in self.providers:
-            provider_name = p["name"]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 定义单个 judge 的调用函数（用于并行执行）
+        def call_single_judge(provider_name: str, prompt: str) -> Optional[float]:
+            """调用单个 judge 并返回分数，失败返回 None"""
             for attempt in range(config.JUDGE_MAX_RETRIES + 1):
                 try:
                     if provider_name == "openai":
                         from openai import OpenAI
                         client = OpenAI()
                         resp = client.chat.completions.create(
-                            model=config.LLM_JUDGE_MODEL if config.LLM_JUDGE_MODEL.startswith("gpt") else "gpt-4o-mini",
+                            model="gpt-4o-mini",
                             temperature=config.LLM_JUDGE_TEMPERATURE,
                             response_format={"type": "json_object"},
-                            messages=[{"role": "user", "content": prompt_text}],
+                            messages=[{"role": "user", "content": prompt}],
                             max_tokens=config.LLM_JUDGE_MAX_TOKENS,
                             timeout=config.JUDGE_TIMEOUT_SEC
                         )
+                        time.sleep(0.3)  # Rate limit 延迟
                         content = resp.choices[0].message.content
                     elif provider_name == "claude":
                         import anthropic, inspect
@@ -2172,14 +2499,40 @@ class MultiCloudJudge:
                         sig = inspect.signature(client.messages.create)
                         length_kw = "max_output_tokens" if "max_output_tokens" in sig.parameters else "max_tokens"
                         resp = client.messages.create(
-                            model=config.LLM_JUDGE_MODEL if not config.LLM_JUDGE_MODEL.startswith("gpt") else "claude-3-5-haiku-latest",
+                            model="claude-3-5-haiku-20241022",
                             temperature=config.LLM_JUDGE_TEMPERATURE,
-                            messages=[{"role": "user", "content": prompt_text}],
+                            messages=[{"role": "user", "content": prompt}],
                             **{length_kw: config.LLM_JUDGE_MAX_TOKENS}
                         )
-                        content = resp.content[0].text
+                        time.sleep(0.3)  # Rate limit 延迟
+                        parts = []
+                        for blk in getattr(resp, "content", []) or []:
+                            if hasattr(blk, "text"):
+                                parts.append(blk.text)
+                            elif isinstance(blk, dict) and blk.get("type") == "text":
+                                parts.append(blk.get("text", ""))
+                        content = "".join(parts) if parts else str(resp)
+                    elif provider_name == "gemini":
+                        import google.generativeai as genai
+                        api_key = os.environ.get("GEMINI_API_KEY", "")
+                        if not api_key:
+                            raise RuntimeError("No GEMINI_API_KEY")
+                        genai.configure(api_key=api_key)
+                        model = genai.GenerativeModel("gemini-2.0-flash-exp")
+                        generation_config = {
+                            "temperature": config.LLM_JUDGE_TEMPERATURE,
+                            "max_output_tokens": config.LLM_JUDGE_MAX_TOKENS,
+                        }
+                        resp = model.generate_content(prompt, generation_config=generation_config)
+                        time.sleep(0.3)  # Rate limit 延迟
+                        if hasattr(resp, 'text'):
+                            content = resp.text
+                        elif hasattr(resp, 'parts') and resp.parts:
+                            content = resp.parts[0].text
+                        else:
+                            raise RuntimeError(f"Gemini response blocked or invalid: {resp}")
                     else:
-                        continue
+                        return None
 
                     # 解析 JSON 响应
                     import json
@@ -2190,21 +2543,69 @@ class MultiCloudJudge:
                     calibration = config.JUDGE_CALIBRATION.get(provider_name, {"a": 1.0, "b": 0.0})
                     score = calibration["a"] * score + calibration["b"]
 
-                    result_dict = {"final": np.clip(score, -1.0, 1.0), "provider": provider_name}
-                    self._cache_put(key, result_dict)
-                    return result_dict
+                    return float(np.clip(score, -1.0, 1.0))
 
                 except Exception as e:
-                    print(f"⚠️ [LLM Judge] {provider_name} 调用失败 (attempt {attempt+1}/{config.JUDGE_MAX_RETRIES+1}): {type(e).__name__}: {e}")
                     if attempt < config.JUDGE_MAX_RETRIES:
+                        # 指数退避
+                        msg = str(e)
+                        m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
+                        if m:
+                            delay = int(m.group(1))
+                        else:
+                            delay = min(2 ** attempt, 60)
+                        time.sleep(delay)
                         continue
                     else:
-                        # 失败后尝试下一个 provider
-                        print(f"❌ [LLM Judge] {provider_name} 所有重试失败，尝试下一个 provider...")
-                        break
+                        # 最后一次失败，返回 None
+                        return None
 
-        # 所有 provider 都失败，使用规则评分兜底
-        print(f"⚠️ [LLM Judge] 所有 LLM providers 失败，fallback 到规则评分 (task={sample.task})")
+            return None
+
+        # 并行调用所有 judges
+        scores = {}  # {provider_name: score}
+        with ThreadPoolExecutor(max_workers=len(self.providers)) as executor:
+            # 提交所有任务
+            future_to_provider = {
+                executor.submit(call_single_judge, p["name"], prompt_text): p
+                for p in self.providers
+            }
+
+            # 收集结果
+            for future in as_completed(future_to_provider):
+                provider_config = future_to_provider[future]
+                provider_name = provider_config["name"]
+                try:
+                    score = future.result()
+                    if score is not None:
+                        scores[provider_name] = score
+                        print(f"  [{provider_name}] 评分: {score:.3f}")
+                except Exception as e:
+                    print(f"  [{provider_name}] 调用失败: {e}")
+
+        # 如果至少有一个 judge 返回了结果，使用加权平均
+        if scores:
+            # 计算加权平均
+            total_weight = 0.0
+            weighted_sum = 0.0
+            for p in self.providers:
+                if p["name"] in scores:
+                    weight = p.get("weight", 1.0 / len(self.providers))  # 默认均分权重
+                    weighted_sum += scores[p["name"]] * weight
+                    total_weight += weight
+
+            # 归一化
+            final_score = weighted_sum / total_weight if total_weight > 0 else 0.5
+
+            # 记录使用的 providers
+            providers_used = "+".join(sorted(scores.keys()))
+            result_dict = {"final": float(final_score), "provider": f"llm_ensemble({providers_used})"}
+            self._cache_put(key, result_dict)
+            print(f"  [LLM集成评分] {final_score:.3f} (来自 {providers_used})")
+            return result_dict
+
+        # 所有 LLM judges 都失败，使用规则评分兜底
+        print(f"⚠️ [LLM Judge] 所有 judges 失败，fallback 到规则评分 (task={sample.task})")
         return self._evaluate_bbq_fairness(sample, response) if sample.task == "fairness" \
                else self._evaluate_halueval(sample, response)
 
@@ -2526,53 +2927,14 @@ class MultiCloudJudge:
         if sample.task == "hallucination" and sample.meta.get("dataset") == "HaluEval":
             return self._evaluate_halueval(sample, response)
 
-        # Hallucination任务：使用LLM judge
-        rubric = 'You are a strict grader. Evaluate the response quality on a scale of 0.0 to 1.0. Return ONLY a JSON object like {"final": 0.0..1.0}.'
-        prompt = f"{rubric}\nTASK: {sample.task}\nPROMPT:\n{sample.prompt}\n\nRESPONSE:\n{response}\n"
-
-        key = hashlib.sha256(f"{sample.task}::{sample.prompt}::{response}".encode()).hexdigest()
-        cached = self._cache_get(key)
-        if cached:
-            return cached
-
-        GLOBAL_JUDGE_BUCKET.acquire()  # 全局限流
-
-        # 按优先顺序尝试双云（OpenAI → Claude）；每家支持重试与退避
-        for p in self.providers:
-            provider_name = p["name"]
-            for attempt in range(config.JUDGE_MAX_RETRIES + 1):
-                try:
-                    if provider_name == "openai":
-                        s_raw = self._call_openai(prompt, config.JUDGE_TIMEOUT_SEC)
-                    elif provider_name == "claude":
-                        s_raw = self._call_claude(prompt, config.JUDGE_TIMEOUT_SEC)
-                    else:
-                        # 不应该到这里，因为已经验证过 providers
-                        raise ValueError(f"Unknown provider: {provider_name}")
-
-                    s_cal = self._calibrate(provider_name, s_raw)
-                    out = {"final": float(s_cal), "provider": provider_name}
-                    self._cache_put(key, out)
-                    return out
-                except Exception as e:
-                    # 429/配额类：尝试解析 retry_delay seconds
-                    msg = str(e)
-                    m = re.search(r"retry(?:_delay)?\s*{?\s*seconds:\s*([0-9]+)", msg)
-                    if m:
-                        time.sleep(int(m.group(1)))
-                    else:
-                        time.sleep(1.5 * (attempt + 1))
-            # 当前 provider 放弃 → 换下一个
-
-        # 全部失败 → 启发兜底（仅用于Hallucination任务）
+        # 如果不是 BBQ 或 HaluEval，使用简单的 heuristic fallback
+        # （这种情况不应该发生，因为 USE_LLM_JUDGE=True 会走 _evaluate_with_llm_judge）
         score = 0.5
         txt = response.lower()
         score += 0.1 if "evidence:" in txt or '"' in response else -0.1
-        score += 0.1 if len(response) > 20 else -0.1  # 修复：奖励合理长度而非"insufficient"
+        score += 0.1 if len(response) > 20 else -0.1
         score = float(min(1.0, max(0.0, score)))
-        out = {"final": score, "provider": "heuristic"}
-        self._cache_put(key, out)
-        return out
+        return {"final": score, "provider": "heuristic_fallback"}
 
 # =============================================================================
 # 遗忘监控（Forgetting Monitor）
@@ -3555,12 +3917,15 @@ def get_eos_token_ids(tokenizer) -> List[int]:
 # =============================================================================
 # 模型加载（dtorch：用 dtype，不用 torch_dtype）
 # =============================================================================
-def load_model_and_tokenizer():
+def load_model_and_tokenizer(rank=None, world_size=None, local_rank=None):
     """
     🔥🔥🔥 版本检查点 #1 - 如果你能看到这个，说明用的是最新代码！🔥🔥🔥
+    支持DDP分布式训练
     """
     print("\n" + "="*80)
     print("加载模型")
+    if world_size and world_size > 1:
+        print(f"  分布式训练模式: Rank {rank}/{world_size-1}, Local Rank {local_rank}")
     print("="*80)
     from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
     from peft import LoraConfig, get_peft_model, TaskType
@@ -3620,15 +3985,30 @@ def load_model_and_tokenizer():
 
     # 【加速优化】启用 Flash Attention 2（如果可用）
     attn_kwargs = {}
-    try:
-        import flash_attn
-        attn_kwargs["attn_implementation"] = "flash_attention_2"
-        # Flash Attention 2 需要模型直接在 GPU 上初始化，使用 device_map 自动管理
-        if torch.cuda.is_available():
-            attn_kwargs["device_map"] = "auto"
-        print("✅ Flash Attention 2 可用，已启用")
-    except ImportError:
-        print("⚠️ Flash Attention 2 不可用，使用默认实现")
+    if config.TRY_FLASH_ATTENTION_2:
+        try:
+            import flash_attn
+            attn_kwargs["attn_implementation"] = "flash_attention_2"
+            # 【DDP支持】根据是否分布式训练设置device_map
+            if torch.cuda.is_available():
+                if local_rank is not None:
+                    # DDP模式：每个进程使用对应的GPU
+                    attn_kwargs["device_map"] = {"": local_rank}
+                else:
+                    # 单卡模式：使用cuda:0
+                    attn_kwargs["device_map"] = {"": 0}
+            print("✅ Flash Attention 2 可用，已启用")
+            print(f"   版本: {flash_attn.__version__}")
+            if local_rank is not None:
+                print(f"   使用GPU: cuda:{local_rank}")
+            else:
+                print("   使用GPU: cuda:0")
+        except ImportError:
+            if not config.QUIET_FLASH_ATTENTION_WARNING:
+                print("⚠️ Flash Attention 2 未安装，使用默认实现")
+                print("   如需启用，请运行：pip install flash-attn --no-build-isolation")
+    else:
+        print("ℹ️ Flash Attention 2 已禁用（TRY_FLASH_ATTENTION_2=False）")
 
     model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)
     base_model = AutoModelForCausalLM.from_pretrained(config.BASE_MODEL, trust_remote_code=True, torch_dtype=dtype, **extra, **attn_kwargs)
@@ -3637,13 +4017,29 @@ def load_model_and_tokenizer():
         lcfg = LoraConfig(task_type=TaskType.CAUSAL_LM, r=config.LORA_R, lora_alpha=config.LORA_ALPHA,
                           lora_dropout=config.LORA_DROPOUT, target_modules=config.TARGET_MODULES, bias="none")
         model = get_peft_model(model, lcfg)
-        model.print_trainable_parameters()
+        if is_main_process(rank):
+            model.print_trainable_parameters()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 如果使用了 device_map="auto"，模型已经在 GPU 上，不需要再手动移动
+    # 【DDP支持】设置正确的device
+    if local_rank is not None:
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"✓ 设备: {device}")
+
+    # 如果使用了 device_map，模型已经在 GPU 上，不需要再手动移动
     if not attn_kwargs.get("device_map"):
         model.to(device)
         base_model.to(device)
+    else:
+        print("  模型已通过 device_map 加载到 GPU")
+
+    # 【DDP包装】在分布式训练时用DDP包装模型
+    if world_size and world_size > 1:
+        print(f"\n🚀 启用DDP (Distributed Data Parallel)...")
+        # 注意：base_model不需要DDP包装，因为它只用于推理
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        print(f"✅ 模型已用DDP包装 (GPU {local_rank})")
 
     if config.USE_GRADIENT_CHECKPOINTING:
         model.gradient_checkpointing_enable()
@@ -3681,6 +4077,7 @@ def load_model_and_tokenizer():
 def tokenize_sft_pair(tokenizer, prompt: str, target: str, device):
     """
     【修复】使用与GRPO相同的chat template，确保SFT→RL一致性
+    【修复】确保所有张量都在正确的设备上
     """
     # 【关键修复】使用chat template（与GRPO generate保持一致）
     system_msg = "You are a helpful, accurate, and unbiased assistant."
@@ -3694,17 +4091,21 @@ def tokenize_sft_pair(tokenizer, prompt: str, target: str, device):
     full_text = formatted_prompt + target
     full_ids = tokenizer(full_text, return_tensors="pt", truncation=True, max_length=config.SFT_MAXLEN)
 
-    input_ids = full_ids["input_ids"]
+    # 【修复】立即将所有张量移到正确的设备上
+    input_ids = full_ids["input_ids"].to(device)
     attn_mask = full_ids.get("attention_mask")
+    if attn_mask is not None:
+        attn_mask = attn_mask.to(device)
+
     labels = input_ids.clone()
 
     # Mask掉prompt部分（只对assistant回复部分计算loss）
     prompt_len = prompt_ids["input_ids"].shape[1]
     labels[:, :prompt_len] = -100
 
-    batch = {"input_ids": input_ids.to(device), "labels": labels.to(device)}
+    batch = {"input_ids": input_ids, "labels": labels}
     if attn_mask is not None:
-        batch["attention_mask"] = attn_mask.to(device)
+        batch["attention_mask"] = attn_mask
 
     return batch
 
@@ -3946,9 +4347,10 @@ class MultiObjectiveDataset(torch.utils.data.Dataset):
 # =============================================================================
 # GRPO（含分段计时 + 批量生成 + ref_lp 复用 + provider 统计 + 完整指标记录）
 # =============================================================================
-def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto):
+def grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto, rank=None):
     """
     🔥🔥🔥 版本检查点 #2 - 如果你能看到这个，说明用的是最新代码！🔥🔥🔥
+    【DDP支持】支持分布式数据并行训练
 
     Claude 理解：这个函数实现了 GRPO 多目标强化学习训练，核心是通过分支化 KL 控制器
     同时优化 Fluency 和 Hallucination 两个目标，使用 LoRA 进行参数高效微调，
@@ -4915,61 +5317,93 @@ def evaluate_objective(model, tokenizer, device, judge, dataset, task: str, n_sa
 # 主流程
 # =============================================================================
 def main():
-    # SDK 安装与自检
-    _bootstrap_sdks_and_check()
-    
-    # 【新增】统一种子设置
-    set_all_seeds(42)
-    
-    print("\n" + "="*80)
-    print(f"训练运行 ID: {config.RUN_ID}")
-    print(f"输出目录: {config.OUTPUT_DIR}")
-    print("="*80)
+    # 【DDP支持】初始化分布式训练环境
+    rank, world_size, local_rank, is_ddp = setup_ddp()
 
-    bbq  = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
-    halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
-    if not bbq or not halu:
-        print("❌ 数据不足（BBQ/HaluEval 至少一类为空）")
-        return
-    dataset = MultiObjectiveDataset(bbq, halu)
+    try:
+        # SDK 安装与自检（仅主进程）
+        if is_main_process(rank):
+            _bootstrap_sdks_and_check()
 
-    model, base_model, tokenizer, device = load_model_and_tokenizer()
-    judge = MultiCloudJudge()
-    pareto = ParetoFrontier(max_checkpoints=config.N_PARETO_CHECKPOINTS)
+        # 【新增】统一种子设置（所有进程）
+        set_all_seeds(42 + (rank if rank else 0))  # 每个进程使用不同种子确保数据多样性
 
-    if config.DO_SFT_CONTINUE:
-        sft_continue(model, tokenizer, device, dataset)
+        if is_main_process(rank):
+            print("\n" + "="*80)
+            print(f"训练运行 ID: {config.RUN_ID}")
+            print(f"输出目录: {config.OUTPUT_DIR}")
+            if is_ddp:
+                print(f"分布式训练: {world_size} GPUs")
+            print("="*80)
 
-    if config.DO_GRPO:
-        grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto)
+        # 【新增】自动下载数据集（如果缺失）- 仅主进程
+        if is_main_process(rank):
+            try:
+                ensure_datasets_available(config.DATA_DIR)
+            except Exception as e:
+                print(f"⚠️ 数据集下载失败: {e}")
+                print("将尝试使用本地数据...")
 
-    print("\n保存最终模型...")
-    final_path = config.OUTPUT_DIR / "final_model"
-    final_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(final_path)
-    tokenizer.save_pretrained(final_path)
+        # 等待主进程下载完成
+        if is_ddp:
+            dist.barrier()
 
-    best = pareto.get_best()
-    if best:
-        print("\n" + "="*80)
-        print("最佳 Pareto 点")
-        print(f"Step: {best.step}\nFairness: {best.fairness_score:.3f}\nHallucination: {best.hallucination_score:.3f}")
-        print("="*80)
+        bbq  = BBQAdapter().load_samples(config.N_BBQ_TRAIN)
+        halu = HaluEvalAdapter().load_samples(config.N_HALU_TRAIN)
+        if not bbq or not halu:
+            if is_main_process(rank):
+                print("❌ 数据不足（BBQ/HaluEval 至少一类为空）")
+            return
+        dataset = MultiObjectiveDataset(bbq, halu)
 
-    report = {
-        "run_id": config.RUN_ID,
-        "timestamp": datetime.now().isoformat(),
-        "config": {"model": config.BASE_MODEL, "sft_steps": config.SFT_STEPS,
-                   "grpo_steps": config.GRPO_STEPS, "lora_r": config.LORA_R, "bf16": config.USE_BF16,
-                   "reward_normalize": config.REWARD_NORMALIZE,
-                   "max_new_tokens_train": config.MAX_NEW_TOKENS_TRAIN,
-                   "max_new_tokens_eval": config.MAX_NEW_TOKENS_EVAL},
-        "dataset_stats": {"n_fairness": len(bbq), "n_hallucination": len(halu)}
-    }
-    with open(config.OUTPUT_DIR/"final_report.json","w") as f:
-        json.dump(report, f, indent=2)
-    print("✅ 训练完成")
-    print(f"输出目录: {config.OUTPUT_DIR}")
+        model, base_model, tokenizer, device = load_model_and_tokenizer(rank, world_size, local_rank)
+        judge = MultiCloudJudge()
+        pareto = ParetoFrontier(max_checkpoints=config.N_PARETO_CHECKPOINTS)
+
+        if config.DO_SFT_CONTINUE:
+            sft_continue(model, tokenizer, device, dataset)
+
+        if config.DO_GRPO:
+            grpo_train(model, base_model, tokenizer, device, dataset, judge, pareto, rank)
+
+        # 【DDP支持】只在主进程保存模型
+        if is_main_process(rank):
+            print("\n保存最终模型...")
+            final_path = config.OUTPUT_DIR / "final_model"
+            final_path.mkdir(parents=True, exist_ok=True)
+
+            # 保存DDP模型需要访问module属性
+            model_to_save = model.module if hasattr(model, 'module') else model
+            model_to_save.save_pretrained(final_path)
+            tokenizer.save_pretrained(final_path)
+
+            best = pareto.get_best()
+            if best:
+                print("\n" + "="*80)
+                print("最佳 Pareto 点")
+                print(f"Step: {best.step}\nFairness: {best.fairness_score:.3f}\nHallucination: {best.hallucination_score:.3f}")
+                print("="*80)
+
+            report = {
+                "run_id": config.RUN_ID,
+                "timestamp": datetime.now().isoformat(),
+                "config": {"model": config.BASE_MODEL, "sft_steps": config.SFT_STEPS,
+                           "grpo_steps": config.GRPO_STEPS, "lora_r": config.LORA_R, "bf16": config.USE_BF16,
+                           "reward_normalize": config.REWARD_NORMALIZE,
+                           "max_new_tokens_train": config.MAX_NEW_TOKENS_TRAIN,
+                           "max_new_tokens_eval": config.MAX_NEW_TOKENS_EVAL,
+                           "ddp_enabled": is_ddp,
+                           "world_size": world_size if is_ddp else 1},
+                "dataset_stats": {"n_fairness": len(bbq), "n_hallucination": len(halu)}
+            }
+            with open(config.OUTPUT_DIR/"final_report.json","w") as f:
+                json.dump(report, f, indent=2)
+            print("✅ 训练完成")
+            print(f"输出目录: {config.OUTPUT_DIR}")
+
+    finally:
+        # 【DDP支持】清理分布式环境
+        cleanup_ddp()
 
 if __name__ == "__main__":
     main()
